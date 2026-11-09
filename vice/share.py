@@ -80,6 +80,16 @@ PLAYLIST_TAG_WRITE_PAUSE = 1.0
 PLAYLIST_TAG_IDLE_SECONDS = 10.0
 PLAYLIST_TAG_MEDIA_IDLE_SECONDS = 90.0
 
+# A thumbnail frame is read from the clip's own file. After boot the grid can
+# ask for dozens of them at once, which uses up the network share's read
+# throughput and leaves a video opening at the same time starved (the player
+# shows the first frame and duration, then waits). Thumbnail work therefore
+# stops as soon as playback starts and resumes when the player is gone.
+# A thumbnail request must never sit on one of the browser's six connections
+# per host while another thumbnail runs: the click that follows would wait
+# behind it. Wait only long enough to pick up a slot that is already free.
+THUMB_SLOT_WAIT_SECONDS = 0.05
+
 
 def _is_transient_clip_name(name: str) -> bool:
     """Whether a filename is an edit/remux temp rather than a real clip.
@@ -306,8 +316,16 @@ def _save_app_state(state: dict) -> None:
     APP_STATE_PATH.write_text(json.dumps(state))
 
 
-def _thumb_path(path: Path) -> Path:
-    """Return cache path unique to this clip file content/version."""
+def _thumb_path(path: Path, identity: tuple[int, int] | None = None) -> Path:
+    """Return cache path unique to this clip file content/version.
+
+    *identity* is a known ``(size, mtime_ns)`` from the library index. Pass it
+    on request paths: ``stat()`` on a network clip folder can block the event
+    loop, and the scan has already read the same values.
+    """
+    if identity is not None:
+        size, mtime_ns = identity
+        return THUMB_DIR / f"{path.stem}_{size}_{mtime_ns}.jpg"
     try:
         st = path.stat()
         key = f"{path.stem}_{st.st_size}_{st.st_mtime_ns}"
@@ -1166,16 +1184,36 @@ def _unreadable_meta(reason: str) -> dict:
     return meta
 
 
-async def _make_thumb(path: Path, duration: float = 0.0) -> Path:
+# Thumbnail ffmpegs that are reading a clip file right now. Playback kills
+# them so the share's bandwidth belongs to the player; _make_thumb removes
+# each process from the set as soon as it is reaped.
+_THUMB_PROCS: set[asyncio.subprocess.Process] = set()
+
+
+def _stop_thumb_processes() -> None:
+    """Abandon any thumbnail frame that is being read for a player."""
+    for proc in list(_THUMB_PROCS):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+async def _make_thumb(path: Path, duration: float = 0.0,
+                      thumb: Path | None = None) -> Path:
     """Lazily generate a 640px-wide JPEG thumbnail stored in THUMB_DIR.
 
     Short clips (< 1 s) used to come back blank because `-ss 0.75` seeks
     past EOF and `-vf thumbnail` needs a 100-frame lookahead. Now we seek
     to `min(duration/2, 0.75)` and use a plain scale filter, which works
     on sub-second clips too.
+
+    *thumb* may be supplied by the caller when the library index already
+    knows the file's identity, which avoids a stat on a network mount.
     """
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    thumb = _thumb_path(path)
+    if thumb is None:
+        thumb = _thumb_path(path)
     if thumb.exists() and thumb.stat().st_size > 0:
         return thumb
     if duration and duration > 0:
@@ -1200,9 +1238,13 @@ async def _make_thumb(path: Path, duration: float = 0.0) -> Path:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await communicate_with_timeout(proc, timeout=20)
-        if proc.returncode == 0 and tmp.stat().st_size > 0:
-            tmp.replace(thumb)
+        _THUMB_PROCS.add(proc)
+        try:
+            await communicate_with_timeout(proc, timeout=20)
+            if proc.returncode == 0 and tmp.stat().st_size > 0:
+                tmp.replace(thumb)
+        finally:
+            _THUMB_PROCS.discard(proc)
     except Exception as exc:
         log.debug("Thumbnail generation failed for %s: %s", path.name, exc)
     finally:
@@ -1290,6 +1332,28 @@ def _quick_tunnel_url(line: str) -> Optional[str]:
 
 # ── share server ─────────────────────────────────────────────────────────────
 
+class _TrackedFileResponse(web.FileResponse):
+    """A FileResponse that reports its whole body-sending lifetime.
+
+    ``FileResponse.prepare`` does not return until the file has been sent (or
+    the client disconnects), so wrapping it is what lets the server tell a
+    player apart from a request that merely looked at a video URL.
+    """
+
+    def __init__(self, path, *, on_start: Callable[[], None],
+                 on_finish: Callable[[], None], **kwargs) -> None:
+        super().__init__(path, **kwargs)
+        self._on_start = on_start
+        self._on_finish = on_finish
+
+    async def prepare(self, request):
+        self._on_start()
+        try:
+            return await super().prepare(request)
+        finally:
+            self._on_finish()
+
+
 class ShareServer:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
@@ -1298,6 +1362,15 @@ class ShareServer:
         # a player or a grid of thumbnails on a slow network folder.
         self._last_activity = 0.0
         self._last_media_activity = 0.0
+        # Video responses that are still sending their body. This stays above
+        # zero for the whole of playback, not just while the request handler
+        # runs, which is what thumbnail work needs to watch.
+        self._media_streams = 0
+        # Video handlers that have been entered but have not returned their
+        # response yet. A range response can spend a while on its first stat
+        # when a thumbnail ffmpeg is still winding down, and no thumbnail may
+        # slip into that gap.
+        self._media_pending = 0
         self._local_app = web.Application(middlewares=[self._note_activity])
         self._public_app = web.Application(middlewares=[self._note_activity])
         self._local_runner: Optional[web.AppRunner] = None
@@ -1402,9 +1475,46 @@ class ShareServer:
         """Mark the app busy, and remember when a video was last opened."""
         now = time.monotonic()
         self._last_activity = now
-        if request.path.startswith("/v/"):
+        is_video = request.path.startswith("/v/")
+        if is_video:
             self._last_media_activity = now
-        return await handler(request)
+            self._media_pending += 1
+            # A click can arrive while the grid is still making thumbnails.
+            # Abandon those reads now; they can be made again later, but the
+            # player cannot wait for them on a slow network folder.
+            _stop_thumb_processes()
+        try:
+            return await handler(request)
+        finally:
+            if is_video:
+                self._media_pending = max(0, self._media_pending - 1)
+
+    def _media_busy(self) -> bool:
+        """Whether a clip is streaming, or is about to start streaming."""
+        return (self._media_pending > 0 or self._media_streams > 0
+                or bool(self._proxy_tasks))
+
+    def _video_stream_started(self) -> None:
+        self._media_streams += 1
+        self._last_media_activity = time.monotonic()
+        _stop_thumb_processes()
+
+    def _video_stream_finished(self) -> None:
+        self._media_streams = max(0, self._media_streams - 1)
+        self._last_media_activity = time.monotonic()
+
+    def _video_response(self, path: Path, *, content_type: str) -> web.Response:
+        """Serve a clip and keep thumbnail work away until it finishes."""
+        return _TrackedFileResponse(
+            path,
+            on_start=self._video_stream_started,
+            on_finish=self._video_stream_finished,
+            headers={
+                "Content-Type": content_type,
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-cache",
+            },
+        )
 
     def _setup_local_routes(self) -> None:
         r = self._local_app.router
@@ -1591,6 +1701,13 @@ class ShareServer:
         else:
             self._clip_stats[slug] = info
         return info
+
+    def _known_thumb_path(self, slug: str, path: Path) -> Optional[Path]:
+        """Thumbnail path from the scan's identity, without touching the mount."""
+        info = getattr(self, "_clip_stats", {}).get(slug)
+        if info is None or info[0] != path:
+            return None
+        return _thumb_path(path, identity=(info[1], info[2]))
 
     def _remember_clip(self, slug: str, path: Path) -> None:
         info = self._file_info(path)
@@ -2568,7 +2685,7 @@ class ShareServer:
             # match first so slugs that themselves contain dots keep working.
             slug = self._slug_for_ref(ref.rsplit(".", 1)[0], allow_slug=not public)
         path = self._clips.get(slug) if slug else None
-        if not path or not path.exists():
+        if not path or not await asyncio.to_thread(path.exists):
             raise web.HTTPNotFound()
 
         # The UI asks for proxy=1 when the clip's codec (H.265) can't play in
@@ -2587,14 +2704,7 @@ class ShareServer:
         # currently names.
         content_type = ("video/x-matroska" if path.suffix.lower() == ".mkv"
                         else "video/mp4")
-        return web.FileResponse(
-            path,
-            headers={
-                "Content-Type": content_type,
-                "Accept-Ranges": "bytes",
-                "Cache-Control": "no-cache",
-            },
-        )
+        return self._video_response(path, content_type=content_type)
 
     async def _serve_preview_proxy(self, slug: str, path: Path):
         """Return a FileResponse for the clip's H.264 preview proxy, or None to
@@ -2613,14 +2723,7 @@ class ShareServer:
             self._proxy_tasks.discard(task)
         if proxy is None or not proxy.exists():
             return None
-        return web.FileResponse(
-            proxy,
-            headers={
-                "Content-Type": "video/mp4",
-                "Accept-Ranges": "bytes",
-                "Cache-Control": "no-cache",
-            },
-        )
+        return self._video_response(proxy, content_type="video/mp4")
 
     async def _prepare_discord_copy(self, slug: str, path: Path) -> Optional[Path]:
         """The clip's Discord-sized file, transcoding it once if needed.
@@ -2683,13 +2786,44 @@ class ShareServer:
         return await self._serve_thumb(req, public=True)
 
     async def _serve_thumb(self, req: web.Request, *, public: bool) -> web.Response:
-        slug, path = self._clip_for_ref(req.match_info["ref"], public=public)
-        meta = await self._get_meta(slug, path)
-        async with self._thumb_sem:
-            t = await _make_thumb(path, duration=meta.get("duration", 0))
+        slug = self._slug_for_ref(req.match_info["ref"], allow_slug=not public)
+        path = self._clips.get(slug) if slug else None
+        if path is None:
+            raise web.HTTPNotFound()
+        # Answer from the local thumbnail cache first, using the identity the
+        # scan already recorded. The clip folder is not touched here: stats on
+        # a busy network mount block the event loop, which is what used to
+        # delay a player behind a grid of thumbnails.
+        thumb = self._known_thumb_path(slug, path)
+        if thumb is not None and thumb.exists() and thumb.stat().st_size > 0:
+            return web.FileResponse(thumb, headers={"Content-Type": "image/jpeg"})
+        # The grid asks for a dozen of these at once, but a video opening at
+        # the same time comes first. Answer without waiting so the browser can
+        # reuse the connection for the player; the card asks again later.
+        if self._media_busy() or not await self._take_thumb_slot():
+            raise web.HTTPNotFound()
+        try:
+            if self._media_busy():
+                raise web.HTTPNotFound()
+            if thumb is None:
+                thumb = _thumb_path(path)
+            meta = await self._get_meta(slug, path)
+            t = await _make_thumb(path, duration=meta.get("duration", 0),
+                                  thumb=thumb)
+        finally:
+            self._thumb_sem.release()
         if not t.exists() or t.stat().st_size == 0:
             raise web.HTTPNotFound()
         return web.FileResponse(t, headers={"Content-Type": "image/jpeg"})
+
+    async def _take_thumb_slot(self) -> bool:
+        """Take a free thumbnail slot without holding a request open for one."""
+        try:
+            await asyncio.wait_for(self._thumb_sem.acquire(),
+                                   THUMB_SLOT_WAIT_SECONDS)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     # ── REST handlers ─────────────────────────────────────────────────────────
 

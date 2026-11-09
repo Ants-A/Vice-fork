@@ -18,6 +18,13 @@ import {InlineRename} from './InlineRename';
  */
 const PREVIEW_RELEASE_MS = 4000;
 
+/**
+ * Missing thumbnails are generated lazily, but the server deliberately drops
+ * those requests while a clip is playing so playback gets the network share
+ * to itself. The card then asks again, backing off, until the frame is ready.
+ */
+const THUMB_RETRY_MS = [2000, 5000, 10000, 20000, 30000];
+
 export interface ClipActions {
   onOpen?: (clip: Clip) => void;
   onTrim?: (clip: Clip) => void;
@@ -55,8 +62,12 @@ export const ClipCard = memo(function ClipCard({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const releaseTimer = useRef<number | undefined>(undefined);
+  const thumbTimer = useRef<number | undefined>(undefined);
+  const thumbAttempts = useRef(0);
   const [previewFailed, setPreviewFailed] = useState(false);
   const [renamingHere, setRenamingHere] = useState(false);
+  const [thumbUrl, setThumbUrl] = useState(clip.thumb_url);
+  const [thumbFailed, setThumbFailed] = useState(false);
   const renaming = renamingHere || actions.renamingSlug === clip.slug;
 
   const stopRenaming = () => {
@@ -68,6 +79,32 @@ export const ClipCard = memo(function ClipCard({
   const canPreview = H264_SUPPORTED && !broken && !previewFailed && Boolean(clip.thumb_url);
 
   useEffect(() => () => window.clearTimeout(releaseTimer.current), []);
+
+  useEffect(() => {
+    // A rename or a trim gives the clip a new thumbnail revision. Start over,
+    // but leave the existing image in place until React swaps it.
+    window.clearTimeout(thumbTimer.current);
+    thumbTimer.current = undefined;
+    thumbAttempts.current = 0;
+    setThumbUrl(clip.thumb_url);
+    setThumbFailed(false);
+  }, [clip.thumb_url]);
+
+  useEffect(() => () => window.clearTimeout(thumbTimer.current), []);
+
+  const retryThumb = () => {
+    setThumbFailed(true);
+    if (broken || !clip.thumb_url || thumbTimer.current !== undefined) return;
+    const attempt = thumbAttempts.current;
+    const delay = THUMB_RETRY_MS[Math.min(attempt, THUMB_RETRY_MS.length - 1)];
+    thumbAttempts.current = attempt + 1;
+    thumbTimer.current = window.setTimeout(() => {
+      thumbTimer.current = undefined;
+      const separator = clip.thumb_url.includes('?') ? '&' : '?';
+      setThumbFailed(false);
+      setThumbUrl(`${clip.thumb_url}${separator}retry=${thumbAttempts.current}`);
+    }, delay);
+  };
 
   const attachPreview = () => {
     const video = videoRef.current;
@@ -142,8 +179,14 @@ export const ClipCard = memo(function ClipCard({
         onPointerEnter={attachPreview}
         onPointerLeave={releasePreview}
         aria-label={t('card.openTitle', {name: clipTitle(clip)})}>
-        {clip.thumb_url ? (
-          <img src={clip.thumb_url} loading="lazy" alt="" draggable={false} />
+        {thumbUrl && !thumbFailed ? (
+          <img
+            src={thumbUrl}
+            loading="lazy"
+            alt=""
+            draggable={false}
+            onError={retryThumb}
+          />
         ) : (
           <span className="clip-thumb-empty" aria-hidden="true" />
         )}

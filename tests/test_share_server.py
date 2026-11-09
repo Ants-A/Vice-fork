@@ -89,7 +89,8 @@ class ShareServerSecurityTests(unittest.IsolatedAsyncioTestCase):
         while self.public_port == self.local_port:
             self.public_port = _free_port()
 
-        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+        async def _stub_make_thumb(_: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
             return self.thumb_path
 
         self.triggered = asyncio.Event()
@@ -329,6 +330,65 @@ class ShareServerSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.clip_path.exists())
 
+    async def test_thumbnail_requests_yield_while_a_clip_is_playing(self) -> None:
+        # After boot the grid asks for many missing thumbnails at once. A clip
+        # opened in that window must not wait behind their ffmpeg reads, so
+        # the thumbnail route says "not yet" and the card asks again later.
+        base = self.server.local_base_url()
+        made: list[Path] = []
+
+        async def _recording_thumb(path: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
+            made.append(path)
+            return self.thumb_path
+
+        with mock.patch("vice.share._make_thumb", new=_recording_thumb):
+            self.server._video_stream_started()
+            try:
+                async with self.client.get(f"{base}/t/test_clip") as resp:
+                    self.assertEqual(resp.status, 404)
+            finally:
+                self.server._video_stream_finished()
+            self.assertEqual(made, [])
+
+            # Once the player is gone the card can fill in its thumbnail.
+            async with self.client.get(f"{base}/t/test_clip") as resp:
+                self.assertEqual(resp.status, 200)
+        self.assertEqual(made, [self.clip_path])
+
+    async def test_a_missing_thumbnail_does_not_wait_behind_other_thumbs(self) -> None:
+        # Browsers allow six connections per host. If thumbnail requests park
+        # on the semaphore, the player's request has nowhere to go.
+        base = self.server.local_base_url()
+        for _ in range(3):
+            await self.server._thumb_sem.acquire()
+        try:
+            started = time.monotonic()
+            async with self.client.get(f"{base}/t/test_clip") as resp:
+                self.assertEqual(resp.status, 404)
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            for _ in range(3):
+                self.server._thumb_sem.release()
+
+    async def test_playback_abandons_running_thumbnail_reads(self) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "sleep", "30",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        _share._THUMB_PROCS.add(proc)
+        try:
+            self.server._video_stream_started()
+            await asyncio.wait_for(proc.wait(), 5)
+        finally:
+            _share._THUMB_PROCS.discard(proc)
+            self.server._video_stream_finished()
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+        self.assertIsNotNone(proc.returncode)
+
 
 @unittest.skipUnless(ShareServer is not None and ClientSession is not None, "aiohttp is not installed")
 class ClipCountTests(unittest.IsolatedAsyncioTestCase):
@@ -410,7 +470,8 @@ class PlaylistApiTests(unittest.IsolatedAsyncioTestCase):
         while self.public_port == self.local_port:
             self.public_port = _free_port()
 
-        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+        async def _stub_make_thumb(_: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
             return self.thumb_path
 
         self.patchers = [
@@ -676,7 +737,8 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
             self.writes.append((path, dict(tags)))
             return True
 
-        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+        async def _stub_make_thumb(_: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
             thumb = self.thumb_dir / "thumb.jpg"
             thumb.write_bytes(b"jpeg")
             return thumb
@@ -1019,7 +1081,8 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
         await server.start()
         made: list[Path] = []
 
-        async def _fake_thumb(path: Path, duration: float = 0.0) -> Path:
+        async def _fake_thumb(path: Path, duration: float = 0.0,
+                              thumb: Path | None = None) -> Path:
             made.append(path)
             thumb = self.thumb_dir / "lazy.jpg"
             thumb.write_bytes(b"jpeg")
@@ -2335,7 +2398,8 @@ class ShareServerLegacyUrlCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         while self.public_port == self.local_port:
             self.public_port = _free_port()
 
-        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+        async def _stub_make_thumb(_: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
             return self.thumb_path
 
         self.patchers = [
@@ -2554,7 +2618,8 @@ class ShareServerClipBroadcastTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.05)
                 return {"width": 1920, "height": 1080, "duration": 6.5}
 
-            async def _fake_thumb(_path: Path, duration: float = 0.0) -> Path:
+            async def _fake_thumb(_path: Path, duration: float = 0.0,
+                                  thumb: Path | None = None) -> Path:
                 return Path(tmp) / "thumb.jpg"
 
             with mock.patch.object(server, "broadcast", side_effect=_fake_broadcast):
@@ -2589,7 +2654,8 @@ class EditorApiTests(unittest.IsolatedAsyncioTestCase):
         while self.public_port == self.local_port:
             self.public_port = _free_port()
 
-        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+        async def _stub_make_thumb(_: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
             return self.thumb_path
 
         self.patchers = [
@@ -3221,7 +3287,8 @@ class ImageApiTests(unittest.IsolatedAsyncioTestCase):
         thumb = self.thumb_dir / "stub.jpg"
         thumb.write_bytes(b"jpeg")
 
-        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+        async def _stub_make_thumb(_: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
             return thumb
 
         self.patchers = [
@@ -3463,7 +3530,8 @@ class ShareTokenTests(unittest.IsolatedAsyncioTestCase):
         for number in (1, 2, 3):
             (self.output_dir / f"Vice_Clip_{number}.mp4").write_bytes(b"not-a-real-mp4")
 
-        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+        async def _stub_make_thumb(_: Path, duration: float = 0.0,
+                                   thumb: Path | None = None) -> Path:
             return self.thumb
 
         for patcher in (
