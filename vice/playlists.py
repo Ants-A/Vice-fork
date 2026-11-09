@@ -219,7 +219,19 @@ class PlaylistStore:
     # ── queries ──────────────────────────────────────────────────────────────
 
     def list_playlists(self) -> list[dict]:
-        return [dict(p, clip_slugs=list(p.get("clip_slugs", []))) for p in self._playlists]
+        """Playlists ordered by how many clips each one holds, largest first.
+
+        The sidebar badge and the Home chips both show that count, so sorting
+        by it puts the categories the library actually uses at the top. The
+        sort is stable: playlists with the same count keep their creation
+        order instead of shuffling between requests.
+        """
+        playlists = [
+            dict(p, clip_slugs=list(p.get("clip_slugs", [])))
+            for p in self._playlists
+        ]
+        playlists.sort(key=lambda p: len(p["clip_slugs"]), reverse=True)
+        return playlists
 
     def get(self, pid: str) -> Optional[dict]:
         for p in self._playlists:

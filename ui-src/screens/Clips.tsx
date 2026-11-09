@@ -1,4 +1,4 @@
-import {useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 
 import {useStore} from '../state/store';
 import {useClipActions} from '../state/clipActions';
@@ -11,6 +11,9 @@ import {ContextMenu} from '../components/ContextMenu';
 import {PlaylistModal, type PlaylistDraft} from '../components/PlaylistModal';
 import {Modal} from '../components/Modal';
 import {IconMore, IconRefresh, IconWarning} from '../components/Icons';
+
+/** How many cards the gallery builds before waiting for the scroll sentinel. */
+const CLIP_PAGE = 96;
 
 export function Clips() {
   const {
@@ -39,6 +42,32 @@ export function Clips() {
   const [confirmPlaylistDelete, setConfirmPlaylistDelete] = useState(false);
   const [playlistMenu, setPlaylistMenu] = useState<{x: number; y: number} | null>(null);
   const [rescanning, setRescanning] = useState(false);
+
+  // A big library is over a thousand cards. Building them all at once is what
+  // made entering this screen stall for a second; start with a screenful and
+  // extend the window as the sentinel below the grid comes into view.
+  const [clipLimit, setClipLimit] = useState(CLIP_PAGE);
+  const loadMoreRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setClipLimit(CLIP_PAGE);
+  }, [currentPlaylistId, searchQuery]);
+
+  useEffect(() => {
+    const node = loadMoreRef.current;
+    if (!node) return;
+    const root = node.closest('.frame-content');
+    const observer = new IntersectionObserver(
+      entries => {
+        if (entries.some(entry => entry.isIntersecting)) {
+          setClipLimit(limit => limit + CLIP_PAGE);
+        }
+      },
+      {root, rootMargin: '1200px 0px'},
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [clipLimit, visibleClips.length]);
 
   const fail = (title: string) => (err: Error) =>
     notify({kind: 'error', title, detail: err.message, tone: 'error', holdMs: 7000});
@@ -181,17 +210,22 @@ export function Clips() {
       ) : null}
 
       {count > 0 ? (
-        <div className="clip-grid">
-          {visibleClips.map(clip => (
-            <ClipCard
-              key={clip.slug}
-              clip={clip}
-              draggable
-              isNew={recentNew.includes(clip.slug)}
-              actions={actions}
-            />
-          ))}
-        </div>
+        <>
+          <div className="clip-grid">
+            {visibleClips.slice(0, clipLimit).map(clip => (
+              <ClipCard
+                key={clip.slug}
+                clip={clip}
+                draggable
+                isNew={recentNew.includes(clip.slug)}
+                actions={actions}
+              />
+            ))}
+          </div>
+          {clipLimit < visibleClips.length ? (
+            <div className="clip-load-more" ref={loadMoreRef} aria-hidden="true" />
+          ) : null}
+        </>
       ) : null}
 
       {images.length > 0 ? (

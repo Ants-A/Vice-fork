@@ -86,12 +86,30 @@ function App() {
 }
 
 function Screen({view}: {view: string}) {
-  if (view === 'home') return <Home />;
-  if (view === 'clips') return <Clips />;
-  if (view === 'images') return <Images />;
-  if (view === 'settings') return <Settings />;
-  if (view === 'editor') return <Editor />;
-  return <About />;
+  // Building the clip grid is by far the most expensive screen change in the
+  // app: a large library is over a thousand cards. Keep the gallery mounted
+  // once it has been opened, so moving between Clips, Home and Settings does
+  // not throw the whole grid away and build it again on every visit.
+  const [clipsMounted, setClipsMounted] = useState(view === 'clips');
+  useEffect(() => {
+    if (view === 'clips') setClipsMounted(true);
+  }, [view]);
+
+  const known = ['home', 'clips', 'images', 'settings', 'editor'];
+  return (
+    <>
+      {view === 'home' ? <Home /> : null}
+      {clipsMounted || view === 'clips' ? (
+        <div className="screen-keepalive" hidden={view !== 'clips'}>
+          <Clips />
+        </div>
+      ) : null}
+      {view === 'images' ? <Images /> : null}
+      {view === 'settings' ? <Settings /> : null}
+      {view === 'editor' ? <Editor /> : null}
+      {!known.includes(view) ? <About /> : null}
+    </>
+  );
 }
 
 // Before the first render, so no screen paints in English and then switches.

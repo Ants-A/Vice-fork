@@ -1,4 +1,4 @@
-import {useCallback, useMemo, useState, type ReactNode} from 'react';
+import {useCallback, useMemo, useRef, useState, type ReactNode} from 'react';
 
 import {api} from '../lib/api';
 import {copyShareLink, shareButtonLabel, shareClip} from '../lib/share';
@@ -68,6 +68,18 @@ export function useClipActions(): {actions: ClipActions; overlays: ReactNode} {
   const [manualCopy, setManualCopy] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
 
+  // The handlers need the freshest clip (a rename or metadata update may have
+  // landed), but depending on state.clips would rebuild every action on every
+  // broadcast and make all cards re-render. A ref gives them the current list
+  // without changing their identity.
+  const clipsRef = useRef(state.clips);
+  clipsRef.current = state.clips;
+
+  const freshest = useCallback(
+    (clip: Clip) => clipsRef.current.find(candidate => candidate.slug === clip.slug) ?? clip,
+    [],
+  );
+
   const fail = useCallback(
     (title: string) => (err: Error) =>
       notify({kind: 'error', title, detail: err.message, tone: 'error', holdMs: 7000}),
@@ -82,19 +94,17 @@ export function useClipActions(): {actions: ClipActions; overlays: ReactNode} {
 
   const copyLink = useCallback(
     (clip: Clip) => {
-      const currentClip = state.clips.find(candidate => candidate.slug === clip.slug) ?? clip;
-      void copyShareLink(currentClip, notify, setManualCopy);
+      void copyShareLink(freshest(clip), notify, setManualCopy);
     },
-    [notify, state.clips],
+    [freshest, notify],
   );
 
   const discordFile = Boolean(state.config?.sharing?.share_discord_file);
   const share = useCallback(
     (clip: Clip) => {
-      const currentClip = state.clips.find(candidate => candidate.slug === clip.slug) ?? clip;
-      void shareClip(currentClip, discordFile, notify, setManualCopy);
+      void shareClip(freshest(clip), discordFile, notify, setManualCopy);
     },
-    [discordFile, notify, state.clips],
+    [discordFile, freshest, notify],
   );
 
   const reveal = useCallback(

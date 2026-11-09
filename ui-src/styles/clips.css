@@ -67,6 +67,22 @@
   gap: var(--spacing-3);
 }
 
+/* The sentinel that asks for another batch of cards. It sits after the grid,
+   so it does not occupy a cell. */
+.clip-load-more {
+  height: 1px;
+}
+
+/* A library is easily a thousand cards. Without this, entering the gallery
+   makes the browser style, lay out and paint every card, which is the one
+   second of stall between the click and the grid. content-visibility lets it
+   skip the cards below the fold; contain-intrinsic-size keeps their estimated
+   height so the scrollbar does not jump as they come into view. */
+.clip-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 300px;
+}
+
 /* Four columns is the default even on a wide window: the cards are meant to
    be readable previews, not a wall of thumbnails. Drop one column at a time
    before the cards get narrower than their metadata. */

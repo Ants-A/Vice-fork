@@ -27,6 +27,21 @@ class PlaylistStoreTests(unittest.TestCase):
         store = PlaylistStore(self.path)
         self.assertEqual(store.list_playlists(), [])
 
+    def test_list_playlists_orders_by_clip_count(self) -> None:
+        store = PlaylistStore(self.path)
+        small = store.create_custom("Small")
+        large = store.create_custom("Large")
+        medium = store.create_custom("Medium")
+        store.add_clip(large["id"], "clip-a")
+        store.add_clip(large["id"], "clip-b")
+        store.add_clip(medium["id"], "clip-c")
+
+        order = [p["id"] for p in store.list_playlists()]
+
+        self.assertEqual(order, [large["id"], medium["id"], small["id"]])
+        # The stored order is untouched, so tags and playlists.json stay put.
+        self.assertEqual(store.get(large["id"])["clip_slugs"], ["clip-a", "clip-b"])
+
     def test_game_key_matches_recorder_filename_sanitizing(self) -> None:
         self.assertEqual(game_key("Overwatch 2"), "overwatch-2")
         self.assertEqual(game_key("Overwatch-2"), "overwatch-2")

@@ -270,6 +270,17 @@
   gap: var(--spacing-5);
 }
 
+/* The gallery stays mounted after its first visit (Screen in main.tsx), so
+   coming back to it does not rebuild a thousand cards. display: contents
+   keeps this wrapper out of the frame's flex layout while it is visible. */
+.screen-keepalive {
+  display: contents;
+}
+
+.screen-keepalive[hidden] {
+  display: none;
+}
+
 /* ── status island ──────────────────────────────────────────────── */
 
 .island {

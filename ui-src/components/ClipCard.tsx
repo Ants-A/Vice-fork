@@ -1,4 +1,4 @@
-import {useEffect, useRef, useState} from 'react';
+import {memo, useEffect, useRef, useState} from 'react';
 
 import {endClipDrag, startClipDrag} from '../lib/clipDrag';
 import {formatBytes, formatDuration} from '../lib/format';
@@ -36,7 +36,13 @@ export interface ClipActions {
   onRenameDone?: () => void;
 }
 
-export function ClipCard({
+/**
+ * The grid can hold a thousand instances. They are memoised because a clip
+ * update (or any other store change that leaves this clip alone) must not
+ * re-render every card: the clip object is replaced only for the card that
+ * changed, and the action bag is stable.
+ */
+export const ClipCard = memo(function ClipCard({
   clip,
   isNew,
   actions = {},
@@ -235,7 +241,7 @@ export function ClipCard({
       </div>
     </article>
   );
-}
+});
 
 const hasActions = (a: ClipActions) =>
   Boolean(a.onTrim || a.onCopyFile || a.onShare || a.onReveal || a.onDelete);
