@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 import subprocess
 import tempfile
@@ -11,7 +12,9 @@ try:
 except ModuleNotFoundError:
     from tests import _sandbox  # noqa: F401
 
-from vice.media import cleanup_temp_files, get_duration, probe_media
+from vice.media import (cleanup_temp_files, get_duration, probe_container_tags,
+                        probe_media, probe_media_detailed,
+                        write_metadata_tags)
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
@@ -64,6 +67,51 @@ class ProbeMediaTests(unittest.IsolatedAsyncioTestCase):
             meta = await probe_media(junk)
 
         self.assertIsNone(meta)
+
+    async def test_container_tags_survive_a_remux_in_mp4_and_mkv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mp4 = root / "clip.mp4"
+            _make_video(mp4, fragmented=False)
+            mkv = root / "clip.mkv"
+            subprocess.run(
+                [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(mp4), "-c", "copy", str(mkv)],
+                check=True, timeout=60,
+            )
+
+            tag = json.dumps({
+                "v": 1,
+                "playlists": [{"id": "pl-1", "name": "Fails", "rev": 1}],
+            })
+            for clip in (mp4, mkv):
+                before = clip.stat()
+                self.assertTrue(
+                    await write_metadata_tags(clip, {"vice_playlists": tag}),
+                )
+                after = clip.stat()
+                self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+
+                tags = await probe_container_tags(clip)
+                self.assertEqual(tags.get("vice_playlists"), tag)
+                # Repeated remuxes must not accumulate the input's derived
+                # MP4 brand fields inside the metadata atoms.
+                self.assertNotIn(";", tags.get("major_brand", ""))
+                self.assertNotIn(";", tags.get("compatible_brands", ""))
+
+                meta, error = await probe_media_detailed(clip)
+                self.assertEqual(error, "")
+                self.assertEqual(meta["width"], 128)
+                self.assertEqual(meta["height"], 72)
+                self.assertEqual(meta["tags"].get("vice_playlists"), tag)
+
+    async def test_metadata_writer_rejects_other_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.avi"
+            clip.write_bytes(b"not a real avi")
+            self.assertFalse(
+                await write_metadata_tags(clip, {"vice_playlists": "{}"}),
+            )
 
 
 class CleanupTempFilesTests(unittest.TestCase):

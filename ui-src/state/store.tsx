@@ -137,6 +137,13 @@ type Action =
   | {type: 'setClips'; clips: Clip[]}
   | {type: 'setImages'; images: Image[]}
   | {type: 'setPlaylists'; playlists: Playlist[]}
+  | {
+      type: 'libraryReloaded';
+      clips: Clip[];
+      images: Image[];
+      playlists: Playlist[];
+      status: Status;
+    }
   | {type: 'event'; event: Omit<IslandEvent, 'id'>}
   | {type: 'clearEvent'; id: number}
   | {type: 'dismiss'; banner: BannerId}
@@ -212,6 +219,17 @@ function reduce(state: State, action: Action): State {
 
     case 'setPlaylists':
       return {...state, playlists: action.playlists};
+
+    case 'libraryReloaded':
+      return {
+        ...state,
+        clips: action.clips,
+        images: action.images,
+        playlists: action.playlists,
+        status: action.status,
+        tunnelUrl: action.status.public_url ?? state.tunnelUrl,
+        update: action.status.update ?? state.update,
+      };
 
     case 'event':
       return withEvent(state, action.event);
@@ -313,6 +331,13 @@ function reduceWs(state: State, msg: WsMessage): State {
 
     case 'playlists_changed':
       return {...state, playlists: msg.playlists ?? []};
+
+    // Handled in the socket listener: it refetches the lists rather than
+    // trusting a delta, because a late-mounted drive can bring hundreds of
+    // clips, images and playlists at once.
+    case 'library_recovered':
+    case 'library_changed':
+      return state;
 
     case 'clip_saving':
       return withEvent(state, {
@@ -525,8 +550,35 @@ export function StoreProvider({children}: {children: ReactNode}) {
         .then(config => dispatch({type: 'setConfig', config}))
         .catch(err => console.debug('Reloading the config failed', err));
     }
+    if (msg.type === 'library_recovered' || msg.type === 'library_changed') {
+      // The clip drive mounted after the window opened. Fetch the lists the
+      // daemon just discovered; the alternative was an empty gallery until
+      // the app was restarted.
+      void Promise.all([api.clips(), api.images(), api.playlists(), api.status()])
+        .then(([clips, images, playlists, status]) =>
+          dispatch({type: 'libraryReloaded', clips, images, playlists, status}),
+        )
+        .catch(err => console.debug('Reloading the clip library failed', err));
+    }
     dispatch({type: 'ws', msg});
   }), []);
+
+  // A WebSocket can miss the one recovery broadcast if the drive mounts while
+  // the daemon is restarting. An empty gallery is cheap to re-check, and this
+  // stops it staying empty forever in that case.
+  useEffect(() => {
+    if (!state.ready || state.clips.length > 0) return;
+    const timer = window.setInterval(() => {
+      void Promise.all([api.clips(), api.images(), api.playlists(), api.status()])
+        .then(([clips, images, playlists, status]) => {
+          if (clips.length) {
+            dispatch({type: 'libraryReloaded', clips, images, playlists, status});
+          }
+        })
+        .catch(err => console.debug('Checking for recovered clips failed', err));
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [state.ready, state.clips.length]);
 
   // Transient island events expire on their own.
   useEffect(() => {

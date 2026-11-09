@@ -5,6 +5,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +19,8 @@ from vice import __version__
 from vice.config import Config, HotkeyConfig, OutputConfig, RecordingConfig, SharingConfig
 from vice.editor import (DISCORD_AUDIO_KBPS, DISCORD_MAX_MB,
                          DISCORD_MIN_VIDEO_KBPS, DiscordTooLarge)
+from vice.playlists import (PLAYLIST_TAG, PlaylistStore,
+                            decode_playlist_metadata, encode_playlist_metadata)
 
 try:
     from aiohttp import ClientSession
@@ -635,6 +638,358 @@ class PlaylistApiTests(unittest.IsolatedAsyncioTestCase):
         changed = [m for m in messages if m["type"] == "playlists_changed"]
         self.assertEqual(len(changed), 1)
         self.assertIn("Fails", [p["name"] for p in changed[0]["playlists"]])
+
+
+@unittest.skipUnless(ShareServer is not None and ClientSession is not None, "aiohttp is not installed")
+class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
+    """Playlist membership lives in the clips, and a late drive is recovered."""
+
+    async def asyncSetUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.root = Path(self.tmpdir.name)
+        self.output_dir = self.root / "clips"
+        self.output_dir.mkdir()
+        self.thumb_dir = self.root / "thumbs"
+        self.thumb_dir.mkdir()
+        self.highlights_dir = self.root / "highlights"
+        self.highlights_dir.mkdir()
+        self.image_dir = self.root / "pictures"
+        self.image_dir.mkdir()
+        self.playlists_path = self.root / "playlists.json"
+        self.media_cache_path = self.root / "media.json"
+        self.tags: dict[str, dict[str, str]] = {}
+        self.writes: list[tuple[Path, dict]] = []
+
+        async def _fake_tags(path: Path) -> dict[str, str]:
+            return dict(self.tags.get(path.name, {}))
+
+        async def _fake_write(path: Path, tags: dict[str, str],
+                              timeout: float = 120) -> bool:
+            self.writes.append((path, dict(tags)))
+            return True
+
+        async def _stub_make_thumb(_: Path, duration: float = 0.0) -> Path:
+            thumb = self.thumb_dir / "thumb.jpg"
+            thumb.write_bytes(b"jpeg")
+            return thumb
+
+        self.patchers = [
+            mock.patch("vice.share._local_ip", return_value="127.0.0.1"),
+            mock.patch("vice.share.THUMB_DIR", self.thumb_dir),
+            mock.patch("vice.share.HIGHLIGHTS_DIR", self.highlights_dir),
+            mock.patch("vice.share.MEDIA_CACHE_PATH", self.media_cache_path),
+            mock.patch("vice.share.SHARE_TOKENS_PATH", self.root / "tokens.json"),
+            mock.patch("vice.playlists.PLAYLISTS_PATH", self.playlists_path),
+            mock.patch("vice.share.VIEWS_PATH", self.root / "views.json"),
+            mock.patch("vice.share._ffprobe", new=_stub_ffprobe),
+            mock.patch("vice.share._make_thumb", new=_stub_make_thumb),
+            mock.patch("vice.share.probe_container_tags", new=_fake_tags),
+            mock.patch("vice.share.write_metadata_tags", new=_fake_write),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.servers: list[ShareServer] = []
+        self.client = ClientSession()
+
+    async def asyncTearDown(self) -> None:
+        await self.client.close()
+        for server in reversed(self.servers):
+            await server.stop()
+
+    def _make_server(self, output_dir: Path | None = None) -> ShareServer:
+        local_port = _free_port()
+        public_port = _free_port()
+        while public_port == local_port:
+            public_port = _free_port()
+        cfg = Config(
+            output=OutputConfig(
+                directory=str(output_dir or self.output_dir),
+                image_directory=str(self.image_dir),
+            ),
+            sharing=SharingConfig(
+                port=local_port,
+                public_port=public_port,
+                cloudflare_tunnel=False,
+            ),
+        )
+        server = ShareServer(cfg)
+        self.servers.append(server)
+        return server
+
+    async def _drain_background(self, server: ShareServer) -> None:
+        for _ in range(10):
+            pending = [task for task in list(server._background_tasks)
+                       if not task.done()]
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _written_playlist_tags(self, path: Path) -> list[dict]:
+        return [
+            tags for written, tags in self.writes
+            if written.name == path.name and PLAYLIST_TAG in tags
+        ]
+
+    async def test_missing_playlists_json_is_rebuilt_from_clip_tags(self) -> None:
+        source = PlaylistStore(self.root / "source.json")
+        custom = source.create_custom(
+            "Best", emoji="🔥", color1="#123456", color2="#654321",
+        )
+        source.add_clip(custom["id"], "Vice_Clip_1_Minecraft")
+        source.record_auto("Minecraft", "Vice_Clip_1_Minecraft")
+
+        clip = self.output_dir / "Vice_Clip_1_Minecraft.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        self.tags[clip.name] = {PLAYLIST_TAG: source.metadata_for(clip.stem)}
+        self.assertFalse(self.playlists_path.exists())
+
+        server = self._make_server()
+        await server.start()
+
+        self.assertTrue(self.playlists_path.exists())
+        playlists = {p["id"]: p for p in server.playlists.list_playlists()}
+        self.assertEqual(playlists[custom["id"]]["name"], "Best")
+        self.assertEqual(playlists[custom["id"]]["emoji"], "🔥")
+        self.assertEqual(playlists[custom["id"]]["color1"], "#123456")
+        self.assertEqual(playlists[custom["id"]]["clip_slugs"],
+                         ["Vice_Clip_1_Minecraft"])
+        self.assertEqual(playlists["auto:minecraft"]["kind"], "auto")
+        self.assertEqual(playlists["auto:minecraft"]["clip_slugs"],
+                         ["Vice_Clip_1_Minecraft"])
+
+        # The rebuilt JSON is now the source of truth, so it survives even a
+        # launch where the drive is not mounted.
+        reloaded = PlaylistStore(self.playlists_path)
+        self.assertTrue(reloaded.loaded_from_disk)
+        self.assertEqual(reloaded.get(custom["id"])["name"], "Best")
+
+    async def test_startup_without_the_clip_drive_keeps_membership(self) -> None:
+        store = PlaylistStore(self.playlists_path)
+        custom = store.create_custom("Keep")
+        store.add_clip(custom["id"], "clip_on_the_drive")
+
+        missing_dir = self.root / "not-mounted-yet"
+        self.assertFalse(missing_dir.exists())
+        server = self._make_server(missing_dir)
+        await server.start()
+
+        self.assertEqual(
+            server.playlists.get(custom["id"])["clip_slugs"],
+            ["clip_on_the_drive"],
+        )
+
+    async def test_a_disappearing_drive_does_not_prune_playlists(self) -> None:
+        clip = self.output_dir / "Vice_Clip_1_Minecraft.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+
+        auto = server.playlists.get("auto:minecraft")
+        self.assertEqual(auto["clip_slugs"], ["Vice_Clip_1_Minecraft"])
+
+        clip.unlink()
+        self.assertEqual(await server.rescan_clips(), 0)
+        self.assertEqual(server._clips, {})
+        self.assertEqual(
+            server.playlists.get("auto:minecraft")["clip_slugs"],
+            ["Vice_Clip_1_Minecraft"],
+        )
+
+        # The drive is back: the retained membership still matches the clip.
+        clip.write_bytes(b"not-a-real-mp4")
+        self.assertEqual(await server.rescan_clips(), 1)
+        self.assertEqual(
+            server.playlists.get("auto:minecraft")["clip_slugs"],
+            ["Vice_Clip_1_Minecraft"],
+        )
+
+    async def test_late_mount_merges_tags_and_broadcasts_recovery(self) -> None:
+        store = PlaylistStore(self.playlists_path)
+        keep = store.create_custom("Keep", emoji="🎯")
+
+        server = self._make_server()
+        await server.start()
+        self.assertEqual([p["id"] for p in server.playlists.list_playlists()],
+                         [keep["id"]])
+
+        # The drive appears. Its clips carry an older name for the playlist
+        # already in JSON, plus a playlist this machine has never seen.
+        stale = dict(keep, name="Stale", emoji="🕰️")
+        stale["clip_slugs"] = ["LateClip"]
+        mounted = {
+            "id": "pl-mounted",
+            "kind": "custom",
+            "name": "Mounted",
+            "emoji": "💾",
+            "color1": "#abcdef",
+            "color2": "#123456",
+            "clip_slugs": ["LateClip"],
+        }
+        clip = self.output_dir / "LateClip.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        self.tags[clip.name] = {
+            PLAYLIST_TAG: encode_playlist_metadata([stale, mounted], "LateClip"),
+        }
+
+        messages: list[dict] = []
+
+        async def _fake_broadcast(msg: dict) -> None:
+            messages.append(msg)
+
+        with mock.patch.object(server, "broadcast",
+                               side_effect=_fake_broadcast):
+            added = await server.rescan_clips()
+
+        self.assertEqual(added, 1)
+        self.assertEqual(server.playlists.get(keep["id"])["name"], "Keep")
+        self.assertEqual(server.playlists.get(keep["id"])["emoji"], "🎯")
+        self.assertEqual(server.playlists.get(keep["id"])["clip_slugs"],
+                         ["LateClip"])
+        self.assertEqual(server.playlists.get("pl-mounted")["name"], "Mounted")
+        self.assertEqual(server.playlists.get("pl-mounted")["emoji"], "💾")
+        self.assertEqual(server.playlists.get("pl-mounted")["clip_slugs"],
+                         ["LateClip"])
+
+        recovered = [m for m in messages if m["type"] == "library_recovered"]
+        self.assertEqual(recovered, [{
+            "type": "library_recovered", "added": 1, "clips": 1,
+        }])
+
+    async def test_playlist_changes_are_written_into_the_clip(self) -> None:
+        clip = self.output_dir / "SomeClip.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+        base = server.local_base_url()
+        self.writes.clear()
+
+        async with self.client.post(f"{base}/api/playlists",
+                                    json={"name": "Best", "emoji": "🔥"}) as resp:
+            self.assertEqual(resp.status, 200)
+            pid = (await resp.json())["playlist"]["id"]
+
+        async with self.client.post(f"{base}/api/playlists/{pid}/clips",
+                                    json={"slug": "SomeClip"}) as resp:
+            self.assertEqual(resp.status, 200)
+
+        written = self._written_playlist_tags(clip)
+        self.assertTrue(written)
+        records = {r["id"]: r for r in
+                   decode_playlist_metadata(written[-1][PLAYLIST_TAG])}
+        self.assertEqual(records[pid]["name"], "Best")
+        self.assertEqual(records[pid]["emoji"], "🔥")
+
+        # Renaming the playlist updates the copy on its member video.
+        async with self.client.patch(f"{base}/api/playlists/{pid}",
+                                     json={"name": "Bangers"}) as resp:
+            self.assertEqual(resp.status, 200)
+        written = self._written_playlist_tags(clip)
+        records = {r["id"]: r for r in
+                   decode_playlist_metadata(written[-1][PLAYLIST_TAG])}
+        self.assertEqual(records[pid]["name"], "Bangers")
+
+        # Removing the clip clears its membership in the file too.
+        async with self.client.delete(
+                f"{base}/api/playlists/{pid}/clips/SomeClip") as resp:
+            self.assertEqual(resp.status, 200)
+        written = self._written_playlist_tags(clip)
+        self.assertEqual(decode_playlist_metadata(written[-1][PLAYLIST_TAG]), [])
+
+    async def test_new_game_clip_writes_its_auto_playlist_tag(self) -> None:
+        server = self._make_server()
+        await server.start()
+        self.writes.clear()
+
+        clip = self.output_dir / "Vice_Clip_9.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server.add_clip(clip, game="Overwatch 2")
+        await self._drain_background(server)
+
+        written = self._written_playlist_tags(clip)
+        self.assertTrue(written)
+        records = {r["id"]: r for r in
+                   decode_playlist_metadata(written[-1][PLAYLIST_TAG])}
+        self.assertEqual(records["auto:overwatch-2"]["name"], "Overwatch 2")
+        self.assertEqual(records["auto:overwatch-2"]["game"], "Overwatch 2")
+
+    async def test_list_advertises_a_thumbnail_without_making_it(self) -> None:
+        clip = self.output_dir / "Lazy.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+        made: list[Path] = []
+
+        async def _fake_thumb(path: Path, duration: float = 0.0) -> Path:
+            made.append(path)
+            thumb = self.thumb_dir / "lazy.jpg"
+            thumb.write_bytes(b"jpeg")
+            return thumb
+
+        with mock.patch("vice.share._make_thumb", new=_fake_thumb):
+            async with self.client.get(
+                    f"{server.local_base_url()}/api/clips") as resp:
+                payload = await resp.json()
+            self.assertEqual(made, [])
+            self.assertIn("/t/Lazy", payload["clips"][0]["thumb_url"])
+            async with self.client.get(
+                    f"{server.local_base_url()}/t/Lazy") as resp:
+                self.assertEqual(resp.status, 200)
+        self.assertEqual(made, [clip])
+
+    async def test_cached_probes_survive_a_restart(self) -> None:
+        clip = self.output_dir / "Cached.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        calls: list[Path] = []
+
+        async def _counting_probe(path: Path) -> dict:
+            calls.append(path)
+            return {"width": 1280, "height": 720, "duration": 2.0}
+
+        with mock.patch("vice.share._ffprobe", new=_counting_probe):
+            first = self._make_server()
+            await first.start()
+            async with self.client.get(
+                    f"{first.local_base_url()}/api/clips") as resp:
+                payload = await resp.json()
+            self.assertEqual(payload["clips"][0]["duration"], 2.0)
+            self.assertEqual(len(calls), 1)
+            await first.stop()
+
+            second = self._make_server()
+            await second.start()
+            async with self.client.get(
+                    f"{second.local_base_url()}/api/clips") as resp:
+                payload = await resp.json()
+
+        self.assertEqual(payload["clips"][0]["duration"], 2.0)
+        self.assertEqual(len(calls), 1)
+
+    async def test_clip_list_answers_before_cold_probes_finish(self) -> None:
+        clip = self.output_dir / "Slow.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+        started = asyncio.Event()
+
+        async def _slow_probe(_: Path) -> dict:
+            started.set()
+            await asyncio.Event().wait()
+            return {}
+
+        with mock.patch("vice.share._ffprobe", new=_slow_probe):
+            began = time.monotonic()
+            async with self.client.get(
+                    f"{server.local_base_url()}/api/clips") as resp:
+                payload = await resp.json()
+            elapsed = time.monotonic() - began
+
+        self.assertTrue(started.is_set())
+        self.assertEqual([c["slug"] for c in payload["clips"]], ["Slow"])
+        self.assertEqual(payload["clips"][0]["duration"], 0)
+        self.assertLess(elapsed, 3.0)
 
 
 @unittest.skipUnless(ShareServer is not None, "aiohttp is not installed")

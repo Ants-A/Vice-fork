@@ -24,7 +24,7 @@ import time
 import zlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from importlib.resources import files as _pkg_files
 
@@ -54,6 +54,91 @@ _TAGGED_CLIP_RE = re.compile(r"^(?:img:)?Vice_(?:Clip|Session|Shot)_\d+_(?P<tag>
 # always been a list of opaque strings, so the only thing needed to keep the
 # two apart is a prefix that cannot occur in a filename stem.
 IMAGE_PREFIX = "img:"
+
+# Container tag carrying the playlists a video belongs to. The definition is
+# copied into every member clip, so deleting playlists.json does not lose the
+# names, colours or membership of playlists whose clips still exist.
+PLAYLIST_TAG = "vice_playlists"
+PLAYLIST_METADATA_VERSION = 1
+
+
+def _metadata_record(playlist: dict, rev: int) -> dict:
+    """The subset of a playlist that belongs on one of its member videos."""
+    return {
+        "id": str(playlist.get("id", "")),
+        "kind": playlist.get("kind", "custom"),
+        "name": str(playlist.get("name", "")),
+        "game": playlist.get("game") or "",
+        "emoji": str(playlist.get("emoji", "") or ""),
+        "color1": str(playlist.get("color1", "") or ""),
+        "color2": str(playlist.get("color2", "") or ""),
+        "created_at": str(playlist.get("created_at", "") or ""),
+        "edited": bool(playlist.get("edited")),
+        "rev": int(rev),
+    }
+
+
+def encode_playlist_metadata(playlists: Iterable[dict], slug: str,
+                             rev: Optional[int] = None) -> str:
+    """Serialise the playlists containing *slug* for a video's metadata tag."""
+    rev = int(rev if rev is not None else time.time() * 1000)
+    records = [
+        _metadata_record(p, rev)
+        for p in playlists
+        if slug in p.get("clip_slugs", [])
+    ]
+    return json.dumps(
+        {"v": PLAYLIST_METADATA_VERSION, "playlists": records},
+        separators=(",", ":"), ensure_ascii=True,
+    )
+
+
+def decode_playlist_metadata(raw) -> list[dict]:
+    """Read a playlist metadata tag, ignoring anything malformed.
+
+    A tag comes from a user-visible file and may have been edited by another
+    tool, so every field is treated as untrusted. A bad record is skipped
+    rather than losing the rest of the tag.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("playlists")
+    if not isinstance(items, list):
+        return []
+    records: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("id", "") or "").strip()
+        if not pid:
+            continue
+        kind = str(item.get("kind", "custom") or "custom")
+        if kind not in {"auto", "custom"}:
+            kind = "custom"
+        emoji = str(item.get("emoji", "") or "")[:4]
+        color1, color2 = (str(item.get(k, "") or "") for k in ("color1", "color2"))
+        try:
+            rev = int(item.get("rev", 0) or 0)
+        except (TypeError, ValueError):
+            rev = 0
+        records.append({
+            "id": pid,
+            "kind": kind,
+            "name": str(item.get("name", "") or pid).strip() or pid,
+            "game": str(item.get("game", "") or "").strip(),
+            "emoji": emoji,
+            "color1": color1 if _COLOR_RE.fullmatch(color1) else "",
+            "color2": color2 if _COLOR_RE.fullmatch(color2) else "",
+            "created_at": str(item.get("created_at", "") or ""),
+            "edited": bool(item.get("edited")),
+            "rev": rev,
+        })
+    return records
 
 
 def image_slug(stem: str) -> str:
@@ -96,6 +181,10 @@ class PlaylistStore:
         # playlist doesn't get rebuilt from tagged clips on the next restart; a
         # fresh clip of that game revives it.
         self._dismissed_auto: set[str] = set()
+        # False when there is no usable playlists.json. The share server scans
+        # clip metadata and rebuilds the store in that case.
+        self.loaded_from_disk = False
+        self.load_error = ""
         self.load()
 
     # ── persistence ──────────────────────────────────────────────────────────
@@ -103,6 +192,8 @@ class PlaylistStore:
     def load(self) -> None:
         self._playlists = []
         self._dismissed_auto = set()
+        self.loaded_from_disk = False
+        self.load_error = ""
         if not self.path.exists():
             return
         try:
@@ -110,7 +201,9 @@ class PlaylistStore:
             items = data.get("playlists", [])
             self._playlists = [p for p in items if isinstance(p, dict) and p.get("id")]
             self._dismissed_auto = {str(k) for k in data.get("dismissed_auto", []) if k}
+            self.loaded_from_disk = True
         except Exception as exc:
+            self.load_error = str(exc)
             log.warning("Playlists file %s is unreadable: %s", self.path, exc)
 
     def save(self) -> None:
@@ -139,6 +232,106 @@ class PlaylistStore:
             if p.get("kind") == "auto" and slug in p.get("clip_slugs", []):
                 return p.get("game") or p.get("name")
         return None
+
+    # ── video metadata ───────────────────────────────────────────────────────
+
+    def metadata_for(self, slug: str, rev: Optional[int] = None) -> str:
+        """The ``vice_playlists`` tag value for a video with this slug."""
+        return encode_playlist_metadata(self._playlists, slug, rev=rev)
+
+    @staticmethod
+    def _metadata_entries(entries: Iterable[tuple[str, object]]
+                          ) -> list[tuple[str, list[dict]]]:
+        decoded: list[tuple[str, list[dict]]] = []
+        for slug, raw in entries:
+            if not slug:
+                continue
+            records = raw if isinstance(raw, list) else decode_playlist_metadata(raw)
+            if records:
+                decoded.append((str(slug), records))
+        return decoded
+
+    @staticmethod
+    def _record_to_playlist(record: dict) -> dict:
+        return {
+            "id": record["id"],
+            "kind": record.get("kind", "custom"),
+            "name": record.get("name") or record["id"],
+            "game": record.get("game") or "",
+            "emoji": record.get("emoji") or "",
+            "color1": record.get("color1") or "",
+            "color2": record.get("color2") or "",
+            "clip_slugs": [],
+            "created_at": record.get("created_at") or "",
+            **({"edited": True} if record.get("edited") else {}),
+        }
+
+    def restore_from_metadata(self, entries: Iterable[tuple[str, object]]) -> bool:
+        """Rebuild the store from the tags found on clip files.
+
+        Used when playlists.json is missing or corrupt. Every playlist
+        definition is copied onto each of its member videos, so the union of
+        those tags is enough to reconstruct the whole rail: names, colours,
+        emoji, edited auto playlists, and membership.
+        """
+        decoded = self._metadata_entries(entries)
+        by_id: dict[str, dict] = {}
+        revisions: dict[str, int] = {}
+        order: list[str] = []
+        for slug, records in decoded:
+            for record in records:
+                pid = record["id"]
+                revised = int(record.get("rev", 0) or 0)
+                playlist = by_id.get(pid)
+                if playlist is None:
+                    playlist = self._record_to_playlist(record)
+                    by_id[pid] = playlist
+                    revisions[pid] = revised
+                    order.append(pid)
+                elif revised >= revisions.get(pid, 0):
+                    # A newer definition wins, but membership is a union
+                    # across every tag that still names this playlist.
+                    slugs = playlist["clip_slugs"]
+                    playlist.update(self._record_to_playlist(record))
+                    playlist["clip_slugs"] = slugs
+                    revisions[pid] = revised
+                slugs = playlist["clip_slugs"]
+                if slug not in slugs:
+                    slugs.append(slug)
+        self._playlists = [by_id[pid] for pid in order]
+        self._dismissed_auto = set()
+        self.save()
+        return bool(self._playlists)
+
+    def merge_metadata(self, entries: Iterable[tuple[str, object]]) -> bool:
+        """Add playlists and memberships discovered on disk to a loaded store.
+
+        Definitions already in playlists.json win: the JSON is the current
+        source of truth when it exists, while a tag may have been left behind
+        by a failed or older write. This is what restores custom membership
+        when a drive is mounted after the server started.
+        """
+        changed = False
+        for slug, records in self._metadata_entries(entries):
+            for record in records:
+                if record["kind"] == "auto":
+                    key = (record["id"][len("auto:"):]
+                           if record["id"].startswith("auto:")
+                           else game_key(record.get("game", "")))
+                    if key in self._dismissed_auto:
+                        continue
+                playlist = self.get(record["id"])
+                if playlist is None:
+                    playlist = self._record_to_playlist(record)
+                    self._playlists.append(playlist)
+                    changed = True
+                slugs = playlist.setdefault("clip_slugs", [])
+                if slug not in slugs:
+                    slugs.append(slug)
+                    changed = True
+        if changed:
+            self.save()
+        return changed
 
     # ── custom playlist CRUD ─────────────────────────────────────────────────
 

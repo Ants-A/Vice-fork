@@ -8,7 +8,9 @@ try:
 except ModuleNotFoundError:
     from tests import _sandbox  # noqa: F401
 
-from vice.playlists import PlaylistStore, build_tag_index, game_key
+from vice.playlists import (PlaylistStore, build_tag_index,
+                            decode_playlist_metadata, encode_playlist_metadata,
+                            game_key)
 
 
 class PlaylistStoreTests(unittest.TestCase):
@@ -190,6 +192,186 @@ class PlaylistStoreTests(unittest.TestCase):
         data = json.loads(self.path.read_text())
         self.assertEqual(data["version"], 1)
         self.assertEqual(len(data["playlists"]), 1)
+
+    def test_load_reports_whether_the_file_was_usable(self) -> None:
+        missing = PlaylistStore(self.path)
+        self.assertFalse(missing.loaded_from_disk)
+        self.assertEqual(missing.load_error, "")
+
+        self.path.write_text("{not json")
+        corrupt = PlaylistStore(self.path)
+        self.assertFalse(corrupt.loaded_from_disk)
+        self.assertTrue(corrupt.load_error)
+
+        PlaylistStore(self.path).create_custom("Usable")
+        usable = PlaylistStore(self.path)
+        self.assertTrue(usable.loaded_from_disk)
+        self.assertEqual(usable.load_error, "")
+
+    def test_playlist_metadata_round_trips_every_definition(self) -> None:
+        store = PlaylistStore(self.path)
+        custom = store.create_custom(
+            "Fails", emoji="🔥", color1="#112233", color2="#445566",
+        )
+        store.add_clip(custom["id"], "clip_a")
+        store.record_auto("Minecraft", "clip_a")
+        store.update_playlist("auto:minecraft", {"name": "MC"})
+
+        raw = store.metadata_for("clip_a")
+        records = {r["id"]: r for r in decode_playlist_metadata(raw)}
+        self.assertEqual(set(records), {custom["id"], "auto:minecraft"})
+
+        saved = records[custom["id"]]
+        self.assertEqual(saved["name"], "Fails")
+        self.assertEqual(saved["emoji"], "🔥")
+        self.assertEqual(saved["color1"], "#112233")
+        self.assertEqual(saved["color2"], "#445566")
+        self.assertNotIn("clip_slugs", saved)
+
+        auto = records["auto:minecraft"]
+        self.assertEqual(auto["kind"], "auto")
+        self.assertEqual(auto["name"], "MC")
+        self.assertEqual(auto["game"], "Minecraft")
+        self.assertTrue(auto["edited"])
+
+        # A video outside the playlist gets an empty definition list.
+        self.assertEqual(
+            decode_playlist_metadata(store.metadata_for("other_clip")), [],
+        )
+
+    def test_metadata_decoding_ignores_untrusted_fields(self) -> None:
+        raw = json.dumps({"v": 1, "playlists": [
+            "junk",
+            {},
+            {"id": ""},
+            {
+                "id": "p1",
+                "kind": "not-a-kind",
+                "name": "",
+                "emoji": "abcdefgh",
+                "color1": "javascript:x",
+                "color2": "#ABCDEF",
+                "rev": "not-a-number",
+            },
+        ]})
+
+        records = decode_playlist_metadata(raw)
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["id"], "p1")
+        self.assertEqual(record["kind"], "custom")
+        self.assertEqual(record["name"], "p1")
+        self.assertEqual(record["emoji"], "abcd")
+        self.assertEqual(record["color1"], "")
+        self.assertEqual(record["color2"], "#ABCDEF")
+        self.assertEqual(record["rev"], 0)
+
+        for bad in ("not json", None, [], {"playlists": "no"}, {"playlists": [1]}):
+            self.assertEqual(decode_playlist_metadata(bad), [])
+
+    def test_restore_from_metadata_rebuilds_definitions_and_membership(self) -> None:
+        source = PlaylistStore(Path(self.tmpdir.name) / "source.json")
+        custom = source.create_custom(
+            "Best", emoji="🏆", color1="#123456", color2="#654321",
+        )
+        for slug in ("clip_a", "clip_b"):
+            source.add_clip(custom["id"], slug)
+            source.record_auto("Minecraft", slug)
+        entries = [(slug, source.metadata_for(slug))
+                   for slug in ("clip_a", "clip_b")]
+
+        restored = PlaylistStore(self.path)
+        self.assertFalse(restored.loaded_from_disk)
+        self.assertTrue(restored.restore_from_metadata(entries))
+
+        rebuilt = restored.get(custom["id"])
+        self.assertEqual(rebuilt["name"], "Best")
+        self.assertEqual(rebuilt["emoji"], "🏆")
+        self.assertEqual(rebuilt["color1"], "#123456")
+        self.assertEqual(sorted(rebuilt["clip_slugs"]), ["clip_a", "clip_b"])
+        self.assertEqual(
+            sorted(restored.get("auto:minecraft")["clip_slugs"]),
+            ["clip_a", "clip_b"],
+        )
+
+        # The rebuild is written back, so it survives even if the tags are
+        # removed from the videos afterwards.
+        reloaded = PlaylistStore(self.path)
+        self.assertTrue(reloaded.loaded_from_disk)
+        self.assertEqual(reloaded.get(custom["id"])["name"], "Best")
+        self.assertEqual(
+            sorted(reloaded.get(custom["id"])["clip_slugs"]),
+            ["clip_a", "clip_b"],
+        )
+
+    def test_restore_prefers_the_newest_definition_but_unions_members(self) -> None:
+        def playlist(name: str, slug: str) -> dict:
+            return {
+                "id": "pl-same",
+                "kind": "custom",
+                "name": name,
+                "clip_slugs": [slug],
+            }
+
+        entries = [
+            ("clip_a", encode_playlist_metadata([playlist("Old", "clip_a")],
+                                               "clip_a", rev=10)),
+            ("clip_b", encode_playlist_metadata([playlist("New", "clip_b")],
+                                               "clip_b", rev=20)),
+        ]
+        restored = PlaylistStore(self.path)
+        self.assertTrue(restored.restore_from_metadata(entries))
+        self.assertEqual(restored.get("pl-same")["name"], "New")
+        self.assertEqual(restored.get("pl-same")["clip_slugs"], ["clip_a", "clip_b"])
+
+    def test_merge_metadata_does_not_overwrite_the_json_definitions(self) -> None:
+        store = PlaylistStore(self.path)
+        custom = store.create_custom("Current")
+        store.add_clip(custom["id"], "clip_a")
+
+        stale = dict(custom, name="Stale", emoji="🕰️")
+        stale["clip_slugs"] = ["clip_a", "clip_b"]
+        extra = {
+            "id": "pl-tagged",
+            "kind": "custom",
+            "name": "From tag",
+            "emoji": "📼",
+            "color1": "#111111",
+            "color2": "#222222",
+            "clip_slugs": ["clip_b"],
+        }
+        entries = [("clip_b", encode_playlist_metadata([stale, extra], "clip_b"))]
+
+        self.assertTrue(store.merge_metadata(entries))
+        self.assertEqual(store.get(custom["id"])["name"], "Current")
+        self.assertEqual(store.get(custom["id"])["emoji"], "")
+        self.assertEqual(
+            sorted(store.get(custom["id"])["clip_slugs"]),
+            ["clip_a", "clip_b"],
+        )
+        self.assertEqual(store.get("pl-tagged")["name"], "From tag")
+        self.assertEqual(store.get("pl-tagged")["emoji"], "📼")
+        self.assertEqual(store.get("pl-tagged")["clip_slugs"], ["clip_b"])
+
+        # Merging the same tags again changes nothing.
+        self.assertFalse(store.merge_metadata(entries))
+        self.assertIn("pl-tagged", [p["id"] for p in PlaylistStore(self.path).list_playlists()])
+
+    def test_merge_metadata_does_not_revive_a_deleted_auto_playlist(self) -> None:
+        store = PlaylistStore(self.path)
+        store.record_auto("Minecraft", "clip_a")
+        store.delete("auto:minecraft")
+
+        tagged = {
+            "id": "auto:minecraft",
+            "kind": "auto",
+            "name": "Minecraft",
+            "game": "Minecraft",
+            "clip_slugs": ["clip_b"],
+        }
+        entries = [("clip_b", encode_playlist_metadata([tagged], "clip_b"))]
+        self.assertFalse(store.merge_metadata(entries))
+        self.assertIsNone(store.get("auto:minecraft"))
 
 
 class TagIndexTests(unittest.TestCase):

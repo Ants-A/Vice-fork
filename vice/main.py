@@ -213,6 +213,8 @@ class ViceDaemon:
         self._clip_task: Optional[asyncio.Task] = None
         self._screenshot_task: Optional[asyncio.Task] = None
         self._watchdog_task: Optional[asyncio.Task] = None
+        # Watches the clip directory for a drive that mounted after startup.
+        self._library_task: Optional[asyncio.Task] = None
         self._upgrade_task: Optional[asyncio.Task] = None
         self._update_task: Optional[asyncio.Task] = None
         self._update: Optional[dict] = None
@@ -446,6 +448,7 @@ class ViceDaemon:
             self._discord_task = asyncio.create_task(self._discord_presence_loop())
 
         self._watchdog_task = asyncio.create_task(self._recorder_watchdog_loop())
+        self._library_task = asyncio.create_task(self._library_watch_loop())
         self._upgrade_task = asyncio.create_task(self._upgrade_watch_loop())
         self._sync_follow_mouse_task()
         self._sync_window_capture_task()
@@ -732,6 +735,28 @@ class ViceDaemon:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 300.0)
                 last_wall = time.time()
+
+    async def _library_watch_loop(self) -> None:
+        """Re-scan the clip directory so a late-mounted drive reaches the UI.
+
+        Startup can happen before the desktop finishes mounting a games drive.
+        The share server then has an empty index and the WebSocket has no
+        reason to announce anything, so the gallery used to stay empty until
+        the daemon was restarted even though the files were on disk (#142).
+        """
+        await asyncio.sleep(5)
+        while True:
+            try:
+                if self.share:
+                    added = await self.share.rescan_clips()
+                    if added:
+                        log.info("Clip library recovered: %d new clip%s",
+                                 added, "" if added == 1 else "s")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Rescanning the clip library failed: %s", exc)
+            await asyncio.sleep(5)
 
     def _wire_recorder(self, recorder) -> None:
         """Attach the daemon's callbacks to a recorder. Fires for the initial
@@ -1552,6 +1577,12 @@ class ViceDaemon:
             self._watchdog_task.cancel()
             try:
                 await self._watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._library_task and not self._library_task.done():
+            self._library_task.cancel()
+            try:
+                await self._library_task
             except (asyncio.CancelledError, Exception):
                 pass
         if self._upgrade_task and not self._upgrade_task.done():

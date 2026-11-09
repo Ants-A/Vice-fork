@@ -32,6 +32,7 @@ REDIRECTS = {
 SHARE_REDIRECTS = {
     "THUMB_DIR": ROOT / "thumbs",
     "PROXY_DIR": ROOT / "proxies",
+    "MEDIA_CACHE_PATH": ROOT / "media.json",
     "EXPORT_WORK_DIR": ROOT / "exports",
     "HIGHLIGHTS_DIR": ROOT / "highlights",
     "VIEWS_PATH": ROOT / "views.json",

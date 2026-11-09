@@ -11,6 +11,8 @@ import asyncio
 import json
 import logging
 import math
+import os
+import tempfile
 from fractions import Fraction
 from pathlib import Path
 from typing import Optional
@@ -25,7 +27,10 @@ TEMP_FILE_GLOBS = ("*.trim.mp4", "*.wm.mp4", "*.fix.mp4", "*.trimming.mp4",
                    "*.export.mp4",
                    # Left behind when an image annotation is interrupted
                    # between writing the new picture and moving it into place.
-                   "*.annotating.png", "*.annotating.jpg", "*.annotating.jpeg")
+                   "*.annotating.png", "*.annotating.jpg", "*.annotating.jpeg",
+                   # Playlist metadata is remuxed into a hidden temp file
+                   # beside the clip before replacing it.
+                   ".vice-meta-*")
 
 
 async def communicate_with_timeout(
@@ -149,6 +154,15 @@ async def probe_media_detailed(path: Path) -> tuple[Optional[dict], str]:
             "language": str(tags.get("language", ""))[:32],
             "channels": int(stream.get("channels") or 0),
         })
+    # Container-level tags. Playlist membership lives here so it travels with
+    # the clip through moves, renames and reinstalls. Keys are lowercased
+    # because Matroska writers do not agree on the case and MP4 writers are
+    # not consistent either.
+    format_tags = {
+        str(k).lower(): str(v)
+        for k, v in (data.get("format", {}).get("tags") or {}).items()
+        if k is not None and v is not None
+    }
     return {
         "width": int(video.get("width") or 0),
         "height": int(video.get("height") or 0),
@@ -156,7 +170,140 @@ async def probe_media_detailed(path: Path) -> tuple[Optional[dict], str]:
         "vcodec": (video.get("codec_name") or "").lower(),
         "audio_streams": len(audio),
         "audio_tracks": audio_tracks,
+        "tags": format_tags,
     }, ""
+
+
+async def probe_container_tags(path: Path) -> dict[str, str]:
+    """Read only a file's container tags.
+
+    Cheaper than :func:`probe_media_detailed` because ffprobe does not have to
+    walk the streams. That matters on startup, when every clip in a large
+    library is checked for playlist metadata.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format_tags",
+            "-of", "json", str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await communicate_with_timeout(proc, timeout=10)
+        if proc.returncode != 0:
+            return {}
+        data = json.loads(stdout)
+        raw = (data.get("format") or {}).get("tags") or {}
+        return {
+            str(k).lower(): str(v)
+            for k, v in raw.items()
+            if k is not None and v is not None
+        }
+    except (asyncio.TimeoutError, FileNotFoundError, ValueError, OSError) as exc:
+        log.debug("Could not read the container tags of %s: %s", path.name, exc)
+        return {}
+
+
+async def write_metadata_tags(path: Path, tags: dict[str, str],
+                              timeout: float = 120) -> bool:
+    """Write container-level *tags* into *path* by remuxing it in place.
+
+    Streams are copied, so the video and audio are untouched. The file is
+    replaced atomically only after ffmpeg has produced a complete copy, and
+    its mode and mtime are preserved so a tag update does not look like a new
+    recording to the rest of Vice. Returns False (and leaves the original
+    alone) when the container cannot carry the tags or ffmpeg fails.
+    """
+    if not tags:
+        return False
+    suffix = path.suffix.lower()
+    if suffix not in {".mp4", ".mkv"}:
+        return False
+    try:
+        before = path.stat()
+    except OSError:
+        return False
+
+    with tempfile.NamedTemporaryFile(
+        prefix=".vice-meta-", suffix=suffix, dir=path.parent, delete=False,
+    ) as handle:
+        tmp = Path(handle.name)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(path),
+        "-map", "0", "-map_metadata", "0", "-c", "copy",
+    ]
+    for key, value in tags.items():
+        cmd += ["-metadata", f"{key}={value}"]
+    if suffix == ".mp4":
+        # With use_metadata_tags ffmpeg also writes the input's format-level
+        # brand fields into mdta; leaving them in makes every remux append
+        # another copy ("isom;isom;isom"). Clear the derived fields while
+        # preserving user tags such as title and comment.
+        cmd += [
+            "-metadata", "major_brand=",
+            "-metadata", "minor_version=",
+            "-metadata", "compatible_brands=",
+            "-movflags", "+faststart+use_metadata_tags", "-f", "mp4",
+        ]
+    else:
+        cmd += ["-f", "matroska"]
+    cmd.append(str(tmp))
+
+    proc = None
+    spawn = None
+    try:
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        ))
+        proc = await spawn
+        _, stderr = await communicate_with_timeout(proc, timeout=timeout)
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            reason = (stderr or b"").decode(errors="replace").strip()[-300:]
+            log.debug("Writing metadata to %s failed: %s", path.name,
+                      reason or f"ffmpeg exited {proc.returncode}")
+            return False
+        # Some muxers silently drop tags. Confirm the copy actually carries
+        # the membership before it replaces the user's only recording.
+        written = await probe_container_tags(tmp)
+        if any(written.get(str(key).lower()) != str(value)
+               for key, value in tags.items()):
+            log.debug("The container did not keep the metadata for %s",
+                      path.name)
+            return False
+        # A clip may be deleted or renamed while its tag is being written. If
+        # the file at this path changed at all, the remux read a different
+        # video than the one now there, so leave it alone.
+        try:
+            current = path.stat()
+        except OSError:
+            return False
+        if ((current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                or current.st_size != before.st_size
+                or current.st_mtime_ns != before.st_mtime_ns):
+            return False
+        os.chmod(tmp, before.st_mode & 0o777)
+        os.replace(tmp, path)
+        # Keep the old mtime: playlist edits are not edits to the recording.
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return True
+    except (asyncio.TimeoutError, OSError) as exc:
+        log.debug("Writing metadata to %s failed: %s", path.name, exc)
+        return False
+    finally:
+        if proc is None and spawn is not None:
+            try:
+                proc = await spawn
+            except (OSError, asyncio.CancelledError):
+                pass
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()
+        tmp.unlink(missing_ok=True)
 
 
 def _ffprobe_reason(stderr: Optional[bytes], path: Optional[Path] = None) -> str:

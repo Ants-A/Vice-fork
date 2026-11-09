@@ -173,6 +173,9 @@ export type WsMessage =
   | {type: 'image_error'; error?: string}
   | {type: 'image_copy_failed'; error?: string}
   | {type: 'playlists_changed'; playlists: Playlist[]}
+  /** The daemon found clips that were not in its index (a late-mounted drive). */
+  | {type: 'library_recovered'; added: number; clips?: number}
+  | {type: 'library_changed'; added: number; clips?: number}
   | {type: 'clip_saving'}
   | {type: 'clip_error'; error?: string}
   | ({type: 'status'} & Partial<Status>)
