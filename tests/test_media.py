@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -179,6 +180,8 @@ class RemuxGuardTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             original = Path(tmp) / "clip.mp4"
             original.write_bytes(b"x" * 10_000)
+            old_ns = 1_600_000_000_123_456_789
+            os.utime(original, ns=(old_ns, old_ns))
 
             class _Proc:
                 returncode = 0
@@ -201,6 +204,9 @@ class RemuxGuardTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(replaced)
             self.assertEqual(original.read_bytes(), b"y" * 9_800)
+            # A repair is not a new recording: keeping the timestamp stops
+            # the clip jumping to the top of the gallery.
+            self.assertEqual(original.stat().st_mtime_ns, old_ns)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ behaves identically everywhere.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import math
@@ -204,7 +205,8 @@ async def probe_container_tags(path: Path) -> dict[str, str]:
 
 
 async def write_metadata_tags(path: Path, tags: dict[str, str],
-                              timeout: float = 120) -> bool:
+                              timeout: float = 120,
+                              readrate: Optional[float] = None) -> bool:
     """Write container-level *tags* into *path* by remuxing it in place.
 
     Streams are copied, so the video and audio are untouched. The file is
@@ -212,6 +214,10 @@ async def write_metadata_tags(path: Path, tags: dict[str, str],
     its mode and mtime are preserved so a tag update does not look like a new
     recording to the rest of Vice. Returns False (and leaves the original
     alone) when the container cannot carry the tags or ffmpeg fails.
+
+    *readrate* caps how fast ffmpeg may read the input, as a multiple of
+    realtime. Background playlist backfills pass a small value so a remux
+    cannot saturate a WiFi/CIFS library; foreground edits leave it unset.
     """
     if not tags:
         return False
@@ -229,6 +235,14 @@ async def write_metadata_tags(path: Path, tags: dict[str, str],
         tmp = Path(handle.name)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+    ]
+    if readrate is not None:
+        # A tag write copies the whole file. A network library should not be
+        # saturated by a background remux, so cap the input read at 4× media
+        # speed; a 65 s clip takes at least ~16 s, spread out instead of a
+        # burst that makes playback and the recorder stutter.
+        cmd += ["-readrate", str(readrate)]
+    cmd += [
         "-i", str(path),
         "-map", "0", "-map_metadata", "0", "-c", "copy",
     ]
@@ -284,9 +298,17 @@ async def write_metadata_tags(path: Path, tags: dict[str, str],
                 or current.st_mtime_ns != before.st_mtime_ns):
             return False
         os.chmod(tmp, before.st_mode & 0o777)
+        # Stamp the replacement before it is moved into place. Doing it after
+        # os.replace leaves a window where the scanner sees a brand-new mtime
+        # (and the clip jumps to the top of the gallery), and a failed utime
+        # on a network filesystem would leave it that way for good.
+        os.utime(tmp, ns=(before.st_atime_ns, before.st_mtime_ns))
         os.replace(tmp, path)
         # Keep the old mtime: playlist edits are not edits to the recording.
-        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        try:
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        except OSError as exc:
+            log.debug("Could not restore the mtime of %s: %s", path.name, exc)
         return True
     except (asyncio.TimeoutError, OSError) as exc:
         log.debug("Writing metadata to %s failed: %s", path.name, exc)
@@ -389,10 +411,21 @@ def cleanup_temp_files(directory: Path) -> None:
     """Delete leftover in-place-edit temp files from interrupted runs."""
     if not directory.is_dir():
         return
-    for pattern in TEMP_FILE_GLOBS:
-        for stale in directory.glob(pattern):
-            try:
-                stale.unlink()
-                log.info("Removed stale temp file %s", stale.name)
-            except OSError as exc:
-                log.warning("Could not remove stale temp file %s: %s", stale, exc)
+    # One directory walk, not one glob per pattern. On a network clip folder
+    # globbing the same huge directory a dozen times is slow and noisy.
+    try:
+        with os.scandir(directory) as iterator:
+            entries = list(iterator)
+    except OSError as exc:
+        log.warning("Could not check %s for stale temp files: %s", directory, exc)
+        return
+    for entry in entries:
+        if not any(fnmatch.fnmatch(entry.name, pattern)
+                   for pattern in TEMP_FILE_GLOBS):
+            continue
+        try:
+            Path(entry.path).unlink()
+            log.info("Removed stale temp file %s", entry.name)
+        except OSError as exc:
+            log.warning("Could not remove stale temp file %s: %s",
+                        entry.path, exc)

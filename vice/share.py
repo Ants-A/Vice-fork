@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import fnmatch
 import glob
 import html
 import json
@@ -31,6 +32,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -52,8 +54,9 @@ from .editor import (DISCORD_MAX_BYTES, DiscordTooLarge, EditorProjectStore,
                      default_export_name, discord_bitrates, project_extent,
                      sanitize_export_name, text_file_contents,
                      validate_project)
-from .media import (communicate_with_timeout, probe_container_tags, probe_media,
-                    probe_media_detailed, write_metadata_tags)
+from .media import (TEMP_FILE_GLOBS, communicate_with_timeout,
+                    probe_container_tags, probe_media, probe_media_detailed,
+                    write_metadata_tags)
 from .playlists import (IMAGE_PREFIX, PLAYLIST_TAG, PlaylistStore,
                         build_tag_index, decode_playlist_metadata, image_slug)
 from .recorder import (IMAGE_EXTS, KEEP_ALL_STREAMS, _available_encoders,
@@ -67,6 +70,28 @@ log = logging.getLogger("vice.share")
 # Config maps whose keys are user data rather than field names.
 FREE_MAP_KEYS = frozenset({"audio_track_volumes"})
 UI_VERSION_TOKEN = "__VICE_VERSION__"
+
+# Playlist membership lives inside each video, which means a remux. On a
+# network clip folder that is a lot of I/O, so the background backfill is
+# deliberately polite: one clip at a time, a pause between files, and nothing
+# at all while somebody is using the app or watching a clip.
+PLAYLIST_TAG_STARTUP_DELAY = 15.0
+PLAYLIST_TAG_WRITE_PAUSE = 1.0
+PLAYLIST_TAG_IDLE_SECONDS = 10.0
+PLAYLIST_TAG_MEDIA_IDLE_SECONDS = 90.0
+
+
+def _is_transient_clip_name(name: str) -> bool:
+    """Whether a filename is an edit/remux temp rather than a real clip.
+
+    pathlib globs include dotfiles, so the hidden ``.vice-meta-*`` files used
+    while embedding playlist metadata used to appear as clips while they were
+    being written. They are never clips, and neither are the visible
+    ``*.trimming.mp4`` / ``*.fix.mp4`` leftovers from an interrupted edit.
+    """
+    if name.startswith("."):
+        return True
+    return any(fnmatch.fnmatch(name, pattern) for pattern in TEMP_FILE_GLOBS)
 
 
 def _resolve_ui_index() -> Path | None:
@@ -309,10 +334,11 @@ class _MediaCache:
 
     @staticmethod
     def _key(path: Path) -> str:
-        try:
-            return str(path.resolve())
-        except OSError:
-            return str(path.absolute())
+        # abspath, not resolve(): resolving walks every path component with
+        # lstat, and this runs once per clip on every gallery listing. The
+        # output directory is already an absolute mount path, so the key is
+        # the same without touching the network.
+        return os.path.abspath(os.fspath(path))
 
     @staticmethod
     def _identity(path: Path) -> Optional[list[int]]:
@@ -338,29 +364,45 @@ class _MediaCache:
         except Exception as exc:
             log.warning("Media cache %s is unreadable: %s", self.path, exc)
 
-    def _entry(self, path: Path) -> Optional[dict]:
+    def _entry(self, path: Path,
+               identity: Optional[list[int]] = None) -> Optional[dict]:
         self._load()
         entry = self._entries.get(self._key(path))
         if not isinstance(entry, dict):
             return None
-        identity = self._identity(path)
+        if identity is None:
+            identity = self._identity(path)
         if identity is None or entry.get("identity") != identity:
             self._entries.pop(self._key(path), None)
             self._dirty = True
             return None
         return entry
 
-    def get_meta(self, path: Path) -> Optional[dict]:
-        entry = self._entry(path)
+    def get_meta(self, path: Path,
+                 identity: Optional[list[int]] = None) -> Optional[dict]:
+        entry = self._entry(path, identity)
         meta = entry.get("meta") if entry else None
         return dict(meta) if isinstance(meta, dict) else None
 
-    def get_tags(self, path: Path) -> Optional[dict[str, str]]:
-        entry = self._entry(path)
+    def get_tags(self, path: Path,
+                 identity: Optional[list[int]] = None) -> Optional[dict[str, str]]:
+        entry = self._entry(path, identity)
         tags = entry.get("tags") if entry else None
         if not isinstance(tags, dict):
             return None
         return {str(k).lower(): str(v) for k, v in tags.items()}
+
+    def forget_temp_files(self) -> None:
+        """Drop cached probes for temp files indexed by older Vice versions."""
+        self._load()
+        stale = [
+            key for key in self._entries
+            if _is_transient_clip_name(Path(key).name)
+        ]
+        for key in stale:
+            self._entries.pop(key, None)
+        if stale:
+            self._dirty = True
 
     def _put(self, path: Path, **fields) -> None:
         self._load()
@@ -978,6 +1020,13 @@ def _local_ip() -> str:
 _PROBE_DEFAULTS = {"width": 1920, "height": 1080, "duration": 0, "vcodec": ""}
 
 
+# A moov repair rewrites the original file. It must never run in parallel
+# with another repair (or with the rest of the gallery's probes): a handful of
+# them at once saturates a network mount, which in turn makes probes time out
+# and asks for even more repairs.
+_MOOV_REPAIR_SEM = asyncio.Semaphore(1)
+
+
 async def _remux_moov(path: Path) -> bool:
     """Try to recover `path` via `ffmpeg -c copy -movflags +faststart`.
 
@@ -991,6 +1040,7 @@ async def _remux_moov(path: Path) -> bool:
     """
     tmp = path.with_suffix(path.suffix + ".fix.mp4")
     try:
+        before = path.stat()
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", str(path), *KEEP_ALL_STREAMS, "-c", "copy",
@@ -1001,13 +1051,26 @@ async def _remux_moov(path: Path) -> bool:
         await communicate_with_timeout(proc, timeout=60)
         if proc.returncode == 0 and tmp.exists():
             remuxed = await probe_media(tmp)
-            orig_size = path.stat().st_size
+            orig_size = before.st_size
             if (
                 remuxed
                 and remuxed["duration"] > 0
                 and tmp.stat().st_size >= orig_size * 0.5
             ):
+                # Keep the recording's timestamp. Without this the repaired
+                # clip looks brand new to the gallery and jumps to the top,
+                # and its cached metadata is invalidated by the new identity.
+                try:
+                    os.utime(tmp, ns=(before.st_atime_ns, before.st_mtime_ns))
+                except OSError as exc:
+                    log.debug("Could not keep the mtime of %s: %s",
+                              tmp.name, exc)
                 tmp.replace(path)
+                try:
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                except OSError as exc:
+                    log.debug("Could not keep the mtime of %s: %s",
+                              path.name, exc)
                 return True
             log.warning(
                 "Remux of %s produced an invalid or truncated file "
@@ -1038,6 +1101,12 @@ async def _ffprobe(path: Path) -> dict:
     reason, so the gallery can say so. It used to fall back to the defaults
     and be listed as an ordinary clip of 0:00 with no thumbnail, which is
     what a broken clip looks like to the person who recorded it (#154).
+
+    A probe that *times out* is not evidence of a damaged container: on a
+    network library it usually means the mount is busy. Repairing those was
+    catastrophic: eight timeouts started eight full remuxes, which made the
+    mount slower and produced more timeouts. Timeouts therefore come back
+    marked "_transient" (so they are not cached) and never remux.
     """
     meta, why = await probe_media_detailed(path)
     if meta and meta["duration"] > 0:
@@ -1046,15 +1115,48 @@ async def _ffprobe(path: Path) -> dict:
         # The remux below repairs MP4 moov atoms; other containers are
         # served as-is.
         return meta or _unreadable_meta(why)
-    log.warning("ffprobe cannot read %s (%s), attempting moov remux",
-                path.name, why or "it reads, but reports no duration")
-    if await _remux_moov(path):
+    if _probe_failure_is_transient(why):
+        return _transient_meta(why)
+    async with _MOOV_REPAIR_SEM:
+        # Repairing replaces the user's file, so confirm the failure with a
+        # second probe while no other repair is running. The first failure is
+        # often just contention on the network mount.
         meta, why = await probe_media_detailed(path)
-        log.info(
-            "Remuxed %s, duration now %.2fs",
-            path.name, meta["duration"] if meta else 0.0,
-        )
+        if meta and meta["duration"] > 0:
+            return meta
+        if _probe_failure_is_transient(why):
+            return _transient_meta(why)
+        log.warning("ffprobe cannot read %s (%s), attempting moov remux",
+                    path.name, why or "it reads, but reports no duration")
+        if await _remux_moov(path):
+            meta, why = await probe_media_detailed(path)
+            log.info(
+                "Remuxed %s, duration now %.2fs",
+                path.name, meta["duration"] if meta else 0.0,
+            )
     return meta or _unreadable_meta(why)
+
+
+def _probe_failure_is_transient(reason: str) -> bool:
+    """A failure caused by the mount, not by the clip's container.
+
+    Both a timeout and a file that vanished mid-probe say nothing about the
+    MP4 structure, so neither justifies rewriting the file.
+    """
+    return (reason.startswith("ffprobe timed out")
+            or "No such file or directory" in reason)
+
+
+def _transient_meta(reason: str) -> dict:
+    """A failed probe that says nothing about the file itself.
+
+    The caller must not cache this: the same clip may read fine on the next
+    attempt once the mount is quiet.
+    """
+    meta = dict(_PROBE_DEFAULTS)
+    meta["_transient"] = True
+    meta["unreadable_reason"] = reason
+    return meta
 
 
 def _unreadable_meta(reason: str) -> dict:
@@ -1191,8 +1293,13 @@ def _quick_tunnel_url(line: str) -> Optional[str]:
 class ShareServer:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
-        self._local_app = web.Application()
-        self._public_app = web.Application()
+        # Every local and public request marks the app busy. Background
+        # metadata remuxes wait for a quiet moment, so they never compete with
+        # a player or a grid of thumbnails on a slow network folder.
+        self._last_activity = 0.0
+        self._last_media_activity = 0.0
+        self._local_app = web.Application(middlewares=[self._note_activity])
+        self._public_app = web.Application(middlewares=[self._note_activity])
         self._local_runner: Optional[web.AppRunner] = None
         self._local_site: Optional[web.TCPSite] = None
         self._public_runner: Optional[web.AppRunner] = None
@@ -1201,6 +1308,10 @@ class ShareServer:
 
         # slug → Path  (populated from disk on start + runtime additions)
         self._clips: dict[str, Path] = {}
+        # slug → (path, size, mtime_ns, mtime). The scanner already stats
+        # every file, so list responses, probes and thumbnails reuse that
+        # instead of running hundreds of extra stats over a network mount.
+        self._clip_stats: dict[str, tuple[Path, int, int, float]] = {}
         # slug → {width, height, duration}
         self._meta:  dict[str, dict] = {}
         # Screenshots, kept in their own index. Slugs are filename stems like a
@@ -1213,17 +1324,35 @@ class ShareServer:
         self._media_cache = _MediaCache(MEDIA_CACHE_PATH)
         # slug → the vice_playlists tag last known to be in the file.
         self._playlist_tags: dict[str, str] = {}
-        self._probe_sem = asyncio.Semaphore(8)
-        self._tag_write_sem = asyncio.Semaphore(2)
+        # A cold clip can be requested by the list, its thumbnail and a player
+        # at the same time. One ffprobe per clip is plenty.
+        self._meta_locks: dict[str, asyncio.Lock] = {}
+        self._list_probes: dict[str, tuple[Path, asyncio.Task]] = {}
+        # ffprobe is a read, but four at once already saturates a CIFS mount
+        # enough that other probes time out. The list no longer waits for
+        # these, so politeness costs nothing the user can see.
+        self._probe_sem = asyncio.Semaphore(4)
+        # A metadata write is a full remux. One at a time keeps a big backfill
+        # from saturating a WiFi/CIFS library and making the whole app crawl.
+        self._tag_write_sem = asyncio.Semaphore(1)
         self._tag_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task] = set()
         # One playlist-metadata backfill at a time. A rescan or the UI button
         # can request another pass while one is already running.
         self._playlist_tag_task: Optional[asyncio.Task] = None
         self._playlist_tag_recheck = False
+        # Serialise rescans so the 30-second watcher and the recheck button
+        # cannot race each other with two different directory snapshots.
+        self._rescan_lock = asyncio.Lock()
+        # Thumbnail ffmpegs are short but still open the source file. A grid
+        # asks for a dozen at once; let a few through, not all of them.
+        self._thumb_sem = asyncio.Semaphore(3)
         # Signature of the last successful output scan, so the mount watcher
         # can notice a change without probing or stat-ing every clip twice.
         self._library_signature: tuple = ()
+        # Set by _scan_library when the mount refused to stat some files.
+        # Incomplete scans must never be read as deletions.
+        self._last_scan_incomplete = False
 
         self.playlists = PlaylistStore()
         self._views = _load_views()
@@ -1267,6 +1396,15 @@ class ShareServer:
         self._setup_public_routes()
 
     # ── routes ───────────────────────────────────────────────────────────────
+
+    @web.middleware
+    async def _note_activity(self, request: web.Request, handler):
+        """Mark the app busy, and remember when a video was last opened."""
+        now = time.monotonic()
+        self._last_activity = now
+        if request.path.startswith("/v/"):
+            self._last_media_activity = now
+        return await handler(request)
 
     def _setup_local_routes(self) -> None:
         r = self._local_app.router
@@ -1349,39 +1487,123 @@ class ShareServer:
 
     # ── library scanning and metadata ────────────────────────────────────────
 
-    def _scan_output_dir(self) -> tuple[dict[str, Path], tuple]:
-        """The clip index and identity signature of the output directory.
+    def _scan_library(self) -> tuple[
+            dict[str, Path], tuple,
+            dict[str, tuple[Path, int, int, float]]]:
+        """The clip index, identity signature and file stats of the folder.
 
-        Both are produced in one pass: the mount watcher runs this every few
-        seconds, so stat-ing every clip twice would be wasteful on a large
-        library or a network drive.
+        All three are produced in one directory walk. The watcher runs this
+        periodically, so stat-ing every clip twice (or globbing the folder
+        once per container) is wasteful on a large library or a network drive.
         """
         out_dir = resolve_path(self.cfg.output.directory)
         found: dict[str, Path] = {}
         identities: dict[str, tuple[str, int, int]] = {}
+        stats: dict[str, tuple[Path, int, int, float]] = {}
+        self._last_scan_incomplete = False
         if not out_dir.exists():
-            return found, ()
+            return found, (), stats
+        media: list[tuple[Path, float, int, int]] = []
+        # Files whose stat failed this pass. A busy CIFS/NFS mount can fail an
+        # individual stat even though the file is there; dropping it from the
+        # index made the next scan report hundreds of "new" clips at once.
+        unread: list[Path] = []
         try:
-            media = list(out_dir.glob("*.mp4")) + list(out_dir.glob("*.mkv"))
+            with os.scandir(out_dir) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if _is_transient_clip_name(name):
+                        continue
+                    if not name.lower().endswith((".mp4", ".mkv")):
+                        continue
+                    try:
+                        if not entry.is_file():
+                            continue
+                        st = entry.stat()
+                    except OSError:
+                        # A clip saved or deleted while the scan runs must not
+                        # make us mistake the rest of the directory for gone.
+                        unread.append(out_dir / name)
+                        continue
+                    media.append(
+                        (out_dir / name, st.st_mtime, st.st_size,
+                         st.st_mtime_ns))
         except OSError as exc:
             log.warning("Could not scan the clip directory %s: %s", out_dir, exc)
-            return found, ()
-        dated: list[tuple[float, Path, int, int]] = []
-        for clip in media:
-            try:
-                st = clip.stat()
-            except OSError:
-                # A clip saved or deleted while the scan runs must not make us
-                # mistake the rest of the directory for missing.
-                continue
-            dated.append((st.st_mtime, clip, st.st_size, st.st_mtime_ns))
-        for _, clip, size, mtime_ns in sorted(dated, key=lambda item: item[0]):
-            found[clip.stem] = clip
-            identities[clip.stem] = (str(clip), size, mtime_ns)
+            return found, (), stats
+        for attempt in range(3):
+            if not unread:
+                break
+            if attempt:
+                time.sleep(0.25)
+            still: list[Path] = []
+            for path in unread:
+                try:
+                    st = path.stat()
+                except OSError:
+                    still.append(path)
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                media.append((path, st.st_mtime, st.st_size, st.st_mtime_ns))
+            unread = still
+        if unread:
+            # The scan is incomplete, not empty: callers must keep the clips
+            # they already know about instead of treating them as deleted.
+            self._last_scan_incomplete = True
+            log.warning(
+                "Could not read %d file%s in %s; keeping the previous library "
+                "index for %s",
+                len(unread), "" if len(unread) == 1 else "s", out_dir,
+                "it" if len(unread) == 1 else "them",
+            )
+        for path, mtime, size, mtime_ns in sorted(media, key=lambda item: item[1]):
+            slug = path.stem
+            found[slug] = path
+            identities[slug] = (str(path), size, mtime_ns)
+            stats[slug] = (path, size, mtime_ns, mtime)
         signature = tuple(
             (slug, *identities[slug]) for slug in sorted(identities)
         )
+        return found, signature, stats
+
+    def _scan_output_dir(self) -> tuple[dict[str, Path], tuple]:
+        """Backwards-compatible index-and-signature view of _scan_library."""
+        found, signature, _ = self._scan_library()
         return found, signature
+
+    def _file_info(self, path: Path) -> Optional[tuple[Path, int, int, float]]:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return path, st.st_size, st.st_mtime_ns, st.st_mtime
+
+    def _clip_info(self, slug: str,
+                   path: Path) -> Optional[tuple[Path, int, int, float]]:
+        """Cached identity for a clip, falling back to one stat."""
+        info = getattr(self, "_clip_stats", {}).get(slug)
+        if info is not None and info[0] == path:
+            return info
+        info = self._file_info(path)
+        if info is None:
+            self._clip_stats.pop(slug, None)
+        else:
+            self._clip_stats[slug] = info
+        return info
+
+    def _remember_clip(self, slug: str, path: Path) -> None:
+        info = self._file_info(path)
+        if info is None:
+            self._clip_stats.pop(slug, None)
+        else:
+            self._clip_stats[slug] = info
+
+    def _clip_identity(self, slug: str, path: Path) -> Optional[list[int]]:
+        info = getattr(self, "_clip_stats", {}).get(slug)
+        if info is not None and info[0] == path:
+            return [info[1], info[2]]
+        return _MediaCache._identity(path)
 
     def _track_task(self, task: asyncio.Task) -> asyncio.Task:
         self._background_tasks.add(task)
@@ -1399,7 +1621,8 @@ class ShareServer:
 
     async def _clip_tags(self, slug: str, path: Path) -> dict[str, str]:
         """Container tags for one clip, cached by file identity."""
-        tags = self._media_cache.get_tags(path)
+        identity = self._clip_identity(slug, path)
+        tags = self._media_cache.get_tags(path, identity)
         if tags is None:
             async with self._probe_sem:
                 tags = await probe_container_tags(path)
@@ -1407,9 +1630,16 @@ class ShareServer:
         self._playlist_tags[slug] = tags.get(PLAYLIST_TAG, "")
         return tags
 
-    async def _playlist_tag_entries(self, only: Optional[set[str]] = None
+    async def _playlist_tag_entries(self, only: Optional[set[str]] = None,
+                                    *, throttle: bool = False
                                     ) -> list[tuple[str, str]]:
-        """Read the playlist tag from every clip, in parallel."""
+        """Read the playlist tag from every clip, in parallel.
+
+        *throttle* is for the background migration: one file at a time, with
+        a pause, and only while nobody is using the app. The read-only probe
+        is much cheaper than a remux, but eight of them at once on a WiFi
+        library still made the gallery feel sluggish.
+        """
         async def one(slug: str, path: Path):
             tags = await self._clip_tags(slug, path)
             raw = tags.get(PLAYLIST_TAG, "")
@@ -1417,8 +1647,33 @@ class ShareServer:
 
         items = [
             (slug, path) for slug, path in self._clips.items()
-            if (only is None or slug in only) and path.exists()
+            if only is None or slug in only
         ]
+        if throttle:
+            # Serve whatever the cache already knows without a wait or a
+            # pause. Only files whose tags were never read need a probe, and
+            # those are the ones that must be polite.
+            found: list[tuple[str, str]] = []
+            pending: list[tuple[str, Path]] = []
+            for slug, path in items:
+                identity = self._clip_identity(slug, path)
+                tags = self._media_cache.get_tags(path, identity)
+                if tags is None:
+                    pending.append((slug, path))
+                    continue
+                raw = tags.get(PLAYLIST_TAG, "")
+                self._playlist_tags[slug] = raw
+                if raw:
+                    found.append((slug, raw))
+            for index, (slug, path) in enumerate(pending):
+                await self._wait_for_tag_idle()
+                entry = await one(slug, path)
+                if entry is not None:
+                    found.append(entry)
+                if index + 1 < len(pending):
+                    await asyncio.sleep(PLAYLIST_TAG_WRITE_PAUSE)
+            self._media_cache.save(force=True)
+            return found
         found = await asyncio.gather(
             *(one(slug, path) for slug, path in items),
             return_exceptions=True,
@@ -1437,7 +1692,8 @@ class ShareServer:
                 result.append(slug)
         return result
 
-    async def _write_playlist_tag(self, slug: str, path: Path) -> None:
+    async def _write_playlist_tag(self, slug: str, path: Path, *,
+                                  throttle: bool = False) -> None:
         """Put the clip's current playlist membership into its own file."""
         payload = self.playlists.metadata_for(slug)
         known = self._playlist_tags.get(slug)
@@ -1455,11 +1711,19 @@ class ShareServer:
             cached_files = frozenset(_current_cache_files(path))
             old_thumb = _thumb_path(path)
             old_proxy = _proxy_path(path)
-            old_tags = dict(self._media_cache.get_tags(path) or {})
+            identity = self._clip_identity(slug, path)
+            old_tags = dict(self._media_cache.get_tags(path, identity) or {})
             async with self._tag_write_sem:
-                ok = await write_metadata_tags(path, {PLAYLIST_TAG: payload})
+                ok = await write_metadata_tags(
+                    path, {PLAYLIST_TAG: payload},
+                    readrate=4 if throttle else None)
             if not ok:
                 return
+            # A delete or rename can land while the remux runs. Do not put a
+            # stale clip back into the in-memory indexes.
+            if self._clips.get(slug) != path:
+                return
+            self._remember_clip(slug, path)
             self._playlist_tags[slug] = payload
             # A remux changes the file's identity, so cached thumbnails and
             # previews would be orphaned under the old key. Carry them to the
@@ -1497,19 +1761,21 @@ class ShareServer:
             self._media_cache.save()
             log.debug("Stored playlist metadata in %s", path.name)
 
-    async def _sync_playlist_tags(self, slugs, budget: Optional[float] = None) -> None:
+    async def _sync_playlist_tags(self, slugs, budget: Optional[float] = None,
+                                  *, throttle: bool = False) -> None:
         """Write membership to the given clips, optionally time-boxed.
 
         Small changes (adding or removing one clip) wait for the write so a
         restart immediately afterwards keeps the change. Editing a playlist
         with many members is time-boxed: the response does not wait for a
-        hundred remuxes, but they continue in the background.
+        hundred remuxes, but they continue in the background. Background
+        callers pass *throttle* to keep a network library responsive.
         """
         tasks = [
             self._track_task(asyncio.create_task(
-                self._write_playlist_tag(slug, self._clips[slug])))
+                self._write_playlist_tag(slug, self._clips[slug],
+                                         throttle=throttle)))
             for slug in self._playlist_sync_slugs(slugs)
-            if self._clips[slug].exists()
         ]
         if not tasks:
             return
@@ -1544,7 +1810,29 @@ class ShareServer:
             return
         self._playlist_tag_recheck = False
         self._playlist_tag_task = self._track_task(
-            asyncio.create_task(self._backfill_playlist_tags()))
+            asyncio.create_task(self._backfill_after_startup()))
+
+    async def _wait_for_tag_idle(self) -> None:
+        """Wait until nobody is using the gallery or watching a clip.
+
+        A backfill remux is a full read and rewrite of a video. On a network
+        clip folder, doing that while somebody is browsing or watching is what
+        made the app feel broken, so the worker simply gets out of the way.
+        """
+        while True:
+            now = time.monotonic()
+            quiet = now - getattr(self, "_last_activity", 0.0)
+            media_quiet = now - getattr(self, "_last_media_activity", 0.0)
+            if (quiet >= PLAYLIST_TAG_IDLE_SECONDS
+                    and media_quiet >= PLAYLIST_TAG_MEDIA_IDLE_SECONDS):
+                return
+            await asyncio.sleep(2.0)
+
+    async def _backfill_after_startup(self) -> None:
+        # Let the window, the recorder and the first gallery load finish
+        # before touching the clip folder.
+        await asyncio.sleep(PLAYLIST_TAG_STARTUP_DELAY)
+        await self._backfill_playlist_tags()
 
     async def _backfill_playlist_tags(self) -> None:
         """Copy playlist membership from playlists.json into its member videos.
@@ -1561,7 +1849,8 @@ class ShareServer:
                 # Read the existing tags first. _clip_tags also fills
                 # _playlist_tags, so files that already match are skipped
                 # without being remuxed.
-                await self._playlist_tag_entries(only=set(members))
+                await self._playlist_tag_entries(only=set(members),
+                                                 throttle=True)
                 needs_write = [
                     slug for slug in members
                     if not _playlist_tag_matches(
@@ -1572,7 +1861,14 @@ class ShareServer:
                 if needs_write:
                     log.info("Writing playlist metadata into %d clip%s",
                              len(needs_write), "" if len(needs_write) == 1 else "s")
-                    await self._sync_playlist_tags(needs_write)
+                    # One at a time, with a pause, and only while the app is
+                    # idle. This can take a while on a big network library,
+                    # which is fine: playlists.json already holds the truth.
+                    for index, slug in enumerate(needs_write):
+                        await self._wait_for_tag_idle()
+                        await self._sync_playlist_tags([slug], throttle=True)
+                        if index + 1 < len(needs_write):
+                            await asyncio.sleep(PLAYLIST_TAG_WRITE_PAUSE)
                 self._media_cache.save(force=True)
             if not self._playlist_tag_recheck:
                 return
@@ -1584,20 +1880,65 @@ class ShareServer:
         is told to reload when anything changed, which is what makes the
         gallery recover without restarting the daemon.
         """
-        found, signature = self._scan_output_dir()
+        async with self._rescan_lock:
+            return await self._rescan_clips_locked()
+
+    async def _rescan_clips_locked(self) -> int:
+        before_paths = dict(self._clips)
+        # A directory walk over a network folder can take seconds. Keep it off
+        # the event loop so the UI, websocket and video streams stay live.
+        found, signature, stats = await asyncio.to_thread(self._scan_library)
+
+        # A clip can be saved, renamed or deleted while the scan runs. Keep
+        # that newer in-memory change rather than letting the older snapshot
+        # undo it.
+        for slug, path in self._clips.items():
+            if before_paths.get(slug) == path:
+                continue
+            info = self._clip_stats.get(slug)
+            if info is None or info[0] != path:
+                info = self._file_info(path)
+            if info is None:
+                found.pop(slug, None)
+                stats.pop(slug, None)
+            else:
+                found[slug] = path
+                stats[slug] = info
+        for slug in before_paths.keys() - self._clips.keys():
+            found.pop(slug, None)
+            stats.pop(slug, None)
+
+        incomplete = bool(getattr(self, "_last_scan_incomplete", False))
+        if incomplete:
+            # The walk could not stat every file (a busy network mount).
+            # Keep what the previous index knew about the files it missed;
+            # only a complete walk may conclude that a clip was deleted.
+            for slug, path in before_paths.items():
+                if slug in found:
+                    continue
+                info = self._clip_stats.get(slug)
+                if info is not None and info[0] == path:
+                    found[slug] = path
+                    stats[slug] = info
+
         out_dir = resolve_path(self.cfg.output.directory)
         # A drive that is not mounted must not be mistaken for an empty
         # library: leave the existing index and playlist membership alone.
-        if not found and not out_dir.exists():
+        if not found and not await asyncio.to_thread(out_dir.exists):
             return 0
-        if signature == self._library_signature and set(found) == set(self._clips):
+        if (not incomplete
+                and signature == self._library_signature
+                and set(found) == set(self._clips)):
+            self._clip_stats = stats
             return 0
 
         previous = set(self._clips)
         added = set(found) - previous
         removed = previous - set(found)
         self._clips = found
-        self._library_signature = signature
+        self._clip_stats = stats
+        if not incomplete:
+            self._library_signature = signature
         for slug in removed:
             self._meta.pop(slug, None)
 
@@ -1646,8 +1987,11 @@ class ShareServer:
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        # Pre-populate from output dir
-        self._clips, self._library_signature = self._scan_output_dir()
+        # Pre-populate from output dir. The walk stats every clip, which can
+        # take a while on a network mount, so keep it off the event loop.
+        self._clips, self._library_signature, self._clip_stats = (
+            await asyncio.to_thread(self._scan_library))
+        self._media_cache.forget_temp_files()
         self._ensure_share_tokens()
         self.rescan_images()
         # When playlists.json is missing or corrupt, rebuild it from the tags
@@ -1761,6 +2105,7 @@ class ShareServer:
         """Register a new clip and return its share URL."""
         slug = path.stem
         self._clips[slug] = path
+        self._remember_clip(slug, path)
         self._meta.pop(slug, None)
         # A reused clip number has a different file; do not let the old file's
         # playlist tag make the sync below believe the new one is up to date.
@@ -1775,7 +2120,7 @@ class ShareServer:
                 and self.playlists.record_auto(game, slug)):
             asyncio.create_task(self._broadcast_playlists())
             self._track_task(asyncio.create_task(
-                self._sync_playlist_tags([slug])))
+                self._sync_playlist_tags([slug], throttle=True)))
         asyncio.create_task(self.broadcast({
             "type": "clip_saved",
             "clip": self._clip_json(slug, path, {}),
@@ -1937,45 +2282,52 @@ class ShareServer:
         await self.broadcast({"type": "clip_saved", "clip": self._clip_json(slug, path, meta)})
 
     async def _get_meta(self, slug: str, path: Path) -> dict:
-        identity = _MediaCache._identity(path)
-        current = self._meta.get(slug)
-        if isinstance(current, dict):
-            known = current.get("_identity")
-            if known is None or identity is None or known == identity:
-                return current
-            self._meta.pop(slug, None)
-            self._playlist_tags.pop(slug, None)
+        identity = self._clip_identity(slug, path)
+        meta = self._cached_meta(slug, path, identity)
+        if meta is not None:
+            return meta
 
-        cached = self._media_cache.get_meta(path)
-        if cached is not None:
-            cached["_identity"] = identity
-            self._meta[slug] = cached
-            tags = cached.get("tags")
+        # Several routes ask for the same cold clip at once (the list, its
+        # thumbnail and an open player). Without this only one of them runs
+        # ffprobe; the rest wait and then take the cached result.
+        lock = self._meta_locks.setdefault(slug, asyncio.Lock())
+        async with lock:
+            identity = self._clip_identity(slug, path)
+            meta = self._cached_meta(slug, path, identity)
+            if meta is not None:
+                return meta
+            async with self._probe_sem:
+                meta = await _ffprobe(path)
+            meta = dict(meta)
+            if meta.pop("_transient", False):
+                # A timeout over a busy network mount is not a property of the
+                # file. Do not cache it, so the next request can try again.
+                return meta
+            # A moov repair can rewrite the file under the same slug, so take
+            # the identity again before caching the result against it.
+            info = self._file_info(path)
+            if info is not None:
+                self._clip_stats[slug] = info
+                identity = [info[1], info[2]]
+            if identity is not None:
+                meta["_identity"] = identity
+            self._meta[slug] = meta
+            self._media_cache.put_meta(path, meta)
+            tags = meta.get("tags")
             if isinstance(tags, dict):
                 self._playlist_tags[slug] = tags.get(PLAYLIST_TAG, "")
-            return cached
-
-        async with self._probe_sem:
-            meta = await _ffprobe(path)
-        meta = dict(meta)
-        if identity is not None:
-            meta["_identity"] = identity
-        self._meta[slug] = meta
-        self._media_cache.put_meta(path, meta)
-        tags = meta.get("tags")
-        if isinstance(tags, dict):
-            self._playlist_tags[slug] = tags.get(PLAYLIST_TAG, "")
-            self._media_cache.put_tags(path, tags)
-        self._media_cache.save()
-        return meta
+                self._media_cache.put_tags(path, tags)
+            self._media_cache.save()
+            return meta
 
     def _clip_json(self, slug: str, path: Path, meta: dict) -> dict:
-        try:
-            st = path.stat()
-            size = st.st_size
-            mtime_ns = st.st_mtime_ns
-            created_at = datetime.fromtimestamp(st.st_mtime).isoformat()
-        except OSError:
+        info = getattr(self, "_clip_stats", {}).get(slug)
+        if info is None or info[0] != path:
+            info = self._clip_info(slug, path)
+        if info is not None:
+            _, size, mtime_ns, mtime = info
+            created_at = datetime.fromtimestamp(mtime).isoformat()
+        else:
             size, mtime_ns, created_at = 0, 0, ""
 
         # The slug is a filename, so it can hold spaces and punctuation that
@@ -2333,7 +2685,8 @@ class ShareServer:
     async def _serve_thumb(self, req: web.Request, *, public: bool) -> web.Response:
         slug, path = self._clip_for_ref(req.match_info["ref"], public=public)
         meta = await self._get_meta(slug, path)
-        t = await _make_thumb(path, duration=meta.get("duration", 0))
+        async with self._thumb_sem:
+            t = await _make_thumb(path, duration=meta.get("duration", 0))
         if not t.exists() or t.stat().st_size == 0:
             raise web.HTTPNotFound()
         return web.FileResponse(t, headers={"Content-Type": "image/jpeg"})
@@ -2342,6 +2695,12 @@ class ShareServer:
 
     async def _probe_for_list(self, slug: str, path: Path) -> dict:
         """Finish a cold probe after the list response has already gone out."""
+        # The clip can be deleted or renamed while its probe waits for a slot.
+        # Probing a file that is already gone only produces a failed ffprobe
+        # and a pointless remux attempt. Compare by path value: a rescan
+        # rebuilds the Path objects without changing which clip they name.
+        if self._clips.get(slug) != path:
+            return {}
         meta = await self._get_meta(slug, path)
         if self._clips.get(slug) is path and path.exists():
             await self.broadcast({
@@ -2350,8 +2709,10 @@ class ShareServer:
             })
         return meta
 
-    def _cached_meta(self, slug: str, path: Path) -> Optional[dict]:
-        identity = _MediaCache._identity(path)
+    def _cached_meta(self, slug: str, path: Path,
+                     identity: Optional[list[int]] = None) -> Optional[dict]:
+        if identity is None:
+            identity = self._clip_identity(slug, path)
         current = self._meta.get(slug)
         if isinstance(current, dict):
             known = current.get("_identity")
@@ -2359,7 +2720,7 @@ class ShareServer:
                 return current
             self._meta.pop(slug, None)
             self._playlist_tags.pop(slug, None)
-        cached = self._media_cache.get_meta(path)
+        cached = self._media_cache.get_meta(path, identity)
         if cached is not None:
             cached["_identity"] = identity
             self._meta[slug] = cached
@@ -2369,41 +2730,44 @@ class ShareServer:
         return cached
 
     async def _api_clips(self, _: web.Request) -> web.Response:
-        def _mtime(path: Path) -> float:
-            try:
-                return path.stat().st_mtime
-            except OSError:
-                return 0.0
-
-        items = [
-            (slug, path) for slug, path in self._clips.items()
-            if path.exists()
-        ]
-        items.sort(key=lambda item: _mtime(item[1]), reverse=True)
+        # Everything here comes from the last directory scan. Stats over a
+        # CIFS/NFS mount are not free, and doing one per clip on every list
+        # request used to stall the whole daemon while the grid reloaded.
+        items: list[tuple[str, Path, tuple[Path, int, int, float]]] = []
+        for slug, path in self._clips.items():
+            info = self._clip_info(slug, path)
+            if info is not None:
+                items.append((slug, path, info))
+        items.sort(key=lambda item: item[2][3], reverse=True)
         metas: dict[str, dict] = {}
-        pending: dict[str, asyncio.Task] = {}
-        for slug, path in items:
-            cached = self._cached_meta(slug, path)
+        for slug, path, info in items:
+            cached = self._cached_meta(slug, path, [info[1], info[2]])
             if cached is not None:
                 metas[slug] = cached
-            else:
-                metas[slug] = {}
-                pending[slug] = self._track_task(
-                    asyncio.create_task(self._probe_for_list(slug, path)))
-        if pending:
-            # Give a cold library a short head start, then answer with what is
-            # ready. The probes keep running and push their clip updates over
-            # the WebSocket, so the cards gain duration and dimensions without
-            # making the first paint wait for a thousand ffprobe runs.
-            done, _ = await asyncio.wait(
-                pending.values(), timeout=1.5,
-                return_when=asyncio.ALL_COMPLETED)
-            for slug, task in pending.items():
-                if task in done and not task.cancelled() and task.exception() is None:
-                    metas[slug] = task.result()
+                continue
+            metas[slug] = {}
+            # A cold probe keeps running in the background and announces its
+            # result over the WebSocket. The list must not wait for it: on a
+            # network library one slow ffprobe used to hold up the whole grid
+            # for 1.5 seconds on every request, and a poll during that time
+            # started duplicate probes for the same clips.
+            known = self._list_probes.get(slug)
+            if known is not None and known[0] == path and not known[1].done():
+                continue
+            task = self._track_task(
+                asyncio.create_task(self._probe_for_list(slug, path)))
+            self._list_probes[slug] = (path, task)
+            task.add_done_callback(
+                lambda done, slug=slug: self._forget_list_probe(slug, done))
 
-        result = [self._clip_json(slug, path, metas[slug]) for slug, path in items]
+        result = [self._clip_json(slug, path, metas[slug])
+                  for slug, path, _ in items]
         return web.json_response({"clips": result})
+
+    def _forget_list_probe(self, slug: str, task: asyncio.Task) -> None:
+        known = self._list_probes.get(slug)
+        if known is not None and known[1] is task:
+            self._list_probes.pop(slug, None)
 
     async def _api_rescan_library(self, _: web.Request) -> web.Response:
         """Recheck the clip folder on demand, e.g. after mounting a drive."""
@@ -2419,7 +2783,7 @@ class ShareServer:
             "added": added,
             "clips": len(self._clips),
             "directory": str(out_dir),
-            "available": out_dir.exists(),
+            "available": await asyncio.to_thread(out_dir.exists),
         })
 
     async def _api_clip_info(self, req: web.Request) -> web.Response:
@@ -2430,12 +2794,18 @@ class ShareServer:
         meta = await self._get_meta(slug, path)
         return web.json_response(self._clip_json(slug, path, meta))
 
+    def _delete_clip_files(self, path: Path) -> None:
+        """Remove a clip and its Discord copies off the event loop."""
+        _purge_clip_discord(path)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Could not delete %s: %s", path, exc)
+
     async def _api_delete(self, req: web.Request) -> web.Response:
         slug = req.match_info["slug"]
         path = self._clips.pop(slug, None)
-        _purge_clip_discord(path)
-        if path and path.exists():
-            path.unlink()
+        self._clip_stats.pop(slug, None)
         _purge_slug_thumbs(slug)
         _purge_slug_proxies(slug)
         (HIGHLIGHTS_DIR / f"{slug}.json").unlink(missing_ok=True)
@@ -2444,6 +2814,11 @@ class ShareServer:
         self._playlist_tags.pop(slug, None)
         if path is not None:
             self._media_cache.forget(path)
+            # Unlink can block for seconds on a network folder. Take the card
+            # away immediately and let the filesystem catch up in the
+            # background, so deleting a clip does not freeze the gallery.
+            self._track_task(asyncio.create_task(
+                asyncio.to_thread(self._delete_clip_files, path)))
         if self._views.pop(slug, None) is not None:
             _save_views(self._views)
         self._forget_share_token(slug)
@@ -2564,6 +2939,7 @@ class ShareServer:
             return web.json_response({"ok": True, "slug": target.stem, "copy": True})
 
         tmp.replace(path)
+        self._remember_clip(slug, path)
         if kept_keys is not None:
             keystore.save_sidecar(slug, keystore.cut_intervals(kept_keys, start, end))
         # Clear cached thumbnail and metadata so they regenerate on next access
@@ -2621,6 +2997,10 @@ class ShareServer:
         # Update internal state
         self._clips.pop(slug, None)
         self._clips[new_slug] = new_path
+        info = self._clip_stats.pop(slug, None)
+        if info is not None:
+            self._clip_stats[new_slug] = (
+                new_path, info[1], info[2], info[3])
         _purge_slug_thumbs(slug, keep=cached)
         _purge_slug_proxies(slug, keep=cached)
         _purge_clip_discord(path)
@@ -2758,7 +3138,8 @@ class ShareServer:
 
     async def _image_thumb(self, req: web.Request) -> web.Response:
         _, path = self._image_or_404(req)
-        t = await _make_thumb(path)
+        async with self._thumb_sem:
+            t = await _make_thumb(path)
         if not t.exists():
             raise web.HTTPNotFound()
         return web.FileResponse(t, headers={"Content-Type": "image/jpeg"})
@@ -2992,7 +3373,7 @@ class ShareServer:
             raise web.HTTPNotFound()
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
-        await self._sync_playlist_tags(members, budget=2.0)
+        await self._sync_playlist_tags(members, budget=2.0, throttle=True)
         await self._broadcast_playlists()
         return web.json_response({"ok": True, "playlist": playlist})
 
@@ -3006,7 +3387,7 @@ class ShareServer:
             raise web.HTTPNotFound()
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
-        await self._sync_playlist_tags(members, budget=2.0)
+        await self._sync_playlist_tags(members, budget=2.0, throttle=True)
         await self._broadcast_playlists()
         return web.json_response({"ok": True})
 
@@ -3027,7 +3408,10 @@ class ShareServer:
             playlist = self.playlists.add_clip(pid, slug)
         except KeyError:
             raise web.HTTPNotFound()
-        await self._sync_playlist_tags([slug])
+        # playlists.json already records the change, and the background
+        # backfill owns the (slow) remux. Do not make the card wait on a full
+        # copy of a video stored on a network drive.
+        await self._sync_playlist_tags([slug], budget=0.0, throttle=True)
         await self._broadcast_playlists()
         return web.json_response({"ok": True, "playlist": playlist})
 
@@ -3038,7 +3422,7 @@ class ShareServer:
             self.playlists.remove_clip(pid, slug)
         except KeyError:
             raise web.HTTPNotFound()
-        await self._sync_playlist_tags([slug])
+        await self._sync_playlist_tags([slug], budget=0.0, throttle=True)
         await self._broadcast_playlists()
         return web.json_response({"ok": True})
 

@@ -5,6 +5,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -48,6 +49,11 @@ def _free_port() -> int:
 
 async def _stub_ffprobe(_: Path) -> dict:
     return {"width": 1920, "height": 1080, "duration": 4.2}
+
+
+# LibraryMetadataTests replaces vice.share._ffprobe with the stub above, so
+# keep the real implementation for tests that exercise the probe itself.
+_REAL_FFPROBE = _share._ffprobe if ShareServer is not None else None
 
 
 class _JsonRequest:
@@ -665,7 +671,8 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
             return dict(self.tags.get(path.name, {}))
 
         async def _fake_write(path: Path, tags: dict[str, str],
-                              timeout: float = 120) -> bool:
+                              timeout: float = 120,
+                              readrate: float | None = None) -> bool:
             self.writes.append((path, dict(tags)))
             return True
 
@@ -686,6 +693,12 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
             mock.patch("vice.share._make_thumb", new=_stub_make_thumb),
             mock.patch("vice.share.probe_container_tags", new=_fake_tags),
             mock.patch("vice.share.write_metadata_tags", new=_fake_write),
+            # The real delays keep a network library responsive. Tests only
+            # care that the writes happen, not that they take 15 seconds.
+            mock.patch("vice.share.PLAYLIST_TAG_STARTUP_DELAY", 0.0),
+            mock.patch("vice.share.PLAYLIST_TAG_WRITE_PAUSE", 0.0),
+            mock.patch("vice.share.PLAYLIST_TAG_IDLE_SECONDS", 0.0),
+            mock.patch("vice.share.PLAYLIST_TAG_MEDIA_IDLE_SECONDS", 0.0),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -953,6 +966,9 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.post(f"{base}/api/playlists/{pid}/clips",
                                     json={"slug": "SomeClip"}) as resp:
             self.assertEqual(resp.status, 200)
+        # Add and remove answer before the remux finishes; the write itself
+        # is the background task's job.
+        await self._drain_background(server)
 
         written = self._written_playlist_tags(clip)
         self.assertTrue(written)
@@ -965,6 +981,7 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.patch(f"{base}/api/playlists/{pid}",
                                      json={"name": "Bangers"}) as resp:
             self.assertEqual(resp.status, 200)
+        await self._drain_background(server)
         written = self._written_playlist_tags(clip)
         records = {r["id"]: r for r in
                    decode_playlist_metadata(written[-1][PLAYLIST_TAG])}
@@ -974,6 +991,7 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.delete(
                 f"{base}/api/playlists/{pid}/clips/SomeClip") as resp:
             self.assertEqual(resp.status, 200)
+        await self._drain_background(server)
         written = self._written_playlist_tags(clip)
         self.assertEqual(decode_playlist_metadata(written[-1][PLAYLIST_TAG]), [])
 
@@ -1033,6 +1051,15 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
             async with self.client.get(
                     f"{first.local_base_url()}/api/clips") as resp:
                 payload = await resp.json()
+            # The list answers with what is cached and probes the rest in the
+            # background. It must not hold the grid hostage while ffprobe
+            # reads a network file.
+            self.assertEqual(payload["clips"][0]["duration"], 0)
+            self.assertEqual(len(calls), 1)
+            await self._drain_background(first)
+            async with self.client.get(
+                    f"{first.local_base_url()}/api/clips") as resp:
+                payload = await resp.json()
             self.assertEqual(payload["clips"][0]["duration"], 2.0)
             self.assertEqual(len(calls), 1)
             await first.stop()
@@ -1068,7 +1095,231 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(started.is_set())
         self.assertEqual([c["slug"] for c in payload["clips"]], ["Slow"])
         self.assertEqual(payload["clips"][0]["duration"], 0)
-        self.assertLess(elapsed, 3.0)
+        self.assertLess(elapsed, 1.0)
+
+    async def test_overlapping_lists_share_one_cold_probe(self) -> None:
+        clip = self.output_dir / "Shared.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+        base = server.local_base_url()
+        release = asyncio.Event()
+        calls: list[Path] = []
+
+        async def _slow_probe(path: Path) -> dict:
+            calls.append(path)
+            await release.wait()
+            return {"width": 1280, "height": 720, "duration": 3.0}
+
+        async def _get() -> dict:
+            async with self.client.get(f"{base}/api/clips") as resp:
+                return await resp.json()
+
+        with mock.patch("vice.share._ffprobe", new=_slow_probe):
+            first = asyncio.create_task(_get())
+            second = asyncio.create_task(_get())
+            await asyncio.sleep(0.05)
+            release.set()
+            await asyncio.gather(first, second)
+            await self._drain_background(server)
+
+        self.assertEqual(len(calls), 1)
+
+    async def test_a_probe_timeout_does_not_remux_the_file(self) -> None:
+        clip = self.output_dir / "SlowMount.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        repairs: list[Path] = []
+
+        async def _timeout(_: Path):
+            return None, "ffprobe timed out after 15s"
+
+        async def _repair(path: Path) -> bool:
+            repairs.append(path)
+            return True
+
+        with mock.patch("vice.share.probe_media_detailed", new=_timeout), \
+                mock.patch("vice.share._remux_moov", new=_repair):
+            meta = await _REAL_FFPROBE(clip)
+
+        # A timeout says the mount is busy, not that the MP4 is damaged. A
+        # full remux here used to make the mount busier still and cascade.
+        self.assertEqual(repairs, [])
+        self.assertTrue(meta.get("_transient"))
+
+    async def test_a_probe_of_a_deleted_file_does_not_remux(self) -> None:
+        clip = self.output_dir / "Deleted.mp4"
+        repairs: list[Path] = []
+
+        async def _gone(_: Path):
+            return None, "[Errno 2] No such file or directory: 'Deleted.mp4'"
+
+        async def _repair(path: Path) -> bool:
+            repairs.append(path)
+            return True
+
+        with mock.patch("vice.share.probe_media_detailed", new=_gone), \
+                mock.patch("vice.share._remux_moov", new=_repair):
+            meta = await _REAL_FFPROBE(clip)
+
+        # Deleting a clip can leave a list probe in flight. A missing file is
+        # not a damaged container, and remuxing it just logs an error.
+        self.assertEqual(repairs, [])
+        self.assertTrue(meta.get("_transient"))
+
+    async def test_a_deleted_clip_is_not_probed_for_the_list(self) -> None:
+        clip = self.output_dir / "Vanishing.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+        calls: list[Path] = []
+
+        async def _probe(path: Path) -> dict:
+            calls.append(path)
+            return {"width": 1280, "height": 720, "duration": 1.0}
+
+        with mock.patch("vice.share._ffprobe", new=_probe):
+            # The clip is gone from the index by the time its background
+            # probe gets to run.
+            server._clips.pop("Vanishing", None)
+            await server._probe_for_list("Vanishing", clip)
+
+        self.assertEqual(calls, [])
+
+    async def test_temp_and_hidden_videos_are_never_listed_as_clips(self) -> None:
+        real = self.output_dir / "RealClip.mp4"
+        real.write_bytes(b"not-a-real-mp4")
+        # Playlist remuxes and interrupted edits used to show up as clips,
+        # sorted to the top because their mtime was the newest in the folder.
+        for name in (
+                ".vice-meta-abc123.mp4",
+                ".hidden-clip.mp4",
+                "RealClip.trimming.mp4",
+                "RealClip.trim.mp4",
+                "RealClip.wm.mp4",
+                "RealClip.fix.mp4",
+                "RealClip.export.mp4",
+                ".vice-meta-xyz789.mkv",
+        ):
+            (self.output_dir / name).write_bytes(b"temp")
+
+        server = self._make_server()
+        await server.start()
+
+        found, _ = server._scan_output_dir()
+        self.assertEqual(set(found), {"RealClip"})
+
+        async with self.client.get(
+                f"{server.local_base_url()}/api/clips") as resp:
+            payload = await resp.json()
+        self.assertEqual([c["slug"] for c in payload["clips"]], ["RealClip"])
+
+    async def test_clip_list_reuses_scan_stats_instead_of_restatting(self) -> None:
+        clip = self.output_dir / "Cached.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+        base = server.local_base_url()
+
+        # Warm the probe cache first. A cold clip legitimately needs one stat
+        # to record the identity of the file it just probed.
+        async with self.client.get(f"{base}/api/clips") as resp:
+            await resp.json()
+
+        stats: list[Path] = []
+        resolves: list[Path] = []
+        original_stat = Path.stat
+        original_resolve = Path.resolve
+
+        def _counting_stat(path: Path, *args, **kwargs):
+            if path == clip:
+                stats.append(path)
+            return original_stat(path, *args, **kwargs)
+
+        def _counting_resolve(path: Path, *args, **kwargs):
+            if path == clip:
+                resolves.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", new=_counting_stat), \
+                mock.patch.object(Path, "resolve", new=_counting_resolve):
+            async with self.client.get(f"{base}/api/clips") as resp:
+                payload = await resp.json()
+
+        self.assertEqual([c["slug"] for c in payload["clips"]], ["Cached"])
+        self.assertEqual(stats, [])
+        # resolve() lstats every component, which is a network round trip for
+        # a CIFS clip. The list must not do that either.
+        self.assertEqual(resolves, [])
+
+    async def test_backfill_writes_metadata_one_clip_at_a_time(self) -> None:
+        store = PlaylistStore(self.playlists_path)
+        custom = store.create_custom("Best")
+        for index in range(4):
+            slug = f"Member{index}"
+            (self.output_dir / f"{slug}.mp4").write_bytes(b"not-a-real-mp4")
+            store.add_clip(custom["id"], slug)
+
+        active = 0
+        max_active = 0
+        written: list[str] = []
+
+        async def _slow_write(path: Path, tags: dict[str, str],
+                              timeout: float = 120,
+                              readrate: float | None = None) -> bool:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.02)
+                written.append(path.stem)
+                return True
+            finally:
+                active -= 1
+
+        with mock.patch("vice.share.write_metadata_tags", new=_slow_write):
+            server = self._make_server()
+            await server.start()
+            await self._drain_background(server)
+
+        self.assertEqual(sorted(written), [f"Member{i}" for i in range(4)])
+        self.assertEqual(max_active, 1)
+
+    async def test_delete_answers_before_the_file_is_unlinked(self) -> None:
+        clip = self.output_dir / "SlowDelete.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        server = self._make_server()
+        await server.start()
+        base = server.local_base_url()
+        await self._drain_background(server)
+
+        started = threading.Event()
+        release = threading.Event()
+        original = ShareServer._delete_clip_files
+
+        def _slow_delete(path: Path) -> None:
+            started.set()
+            release.wait(timeout=30)
+            original(server, path)
+
+        with mock.patch.object(server, "_delete_clip_files", new=_slow_delete):
+            began = time.monotonic()
+            async with self.client.delete(
+                    f"{base}/api/clips/SlowDelete") as resp:
+                self.assertEqual(resp.status, 200)
+                elapsed = time.monotonic() - began
+            self.assertLess(elapsed, 2.0)
+            self.assertTrue(started.wait(timeout=5))
+
+            # The card is gone from the gallery while the unlink is still
+            # waiting on the network folder.
+            async with self.client.get(f"{base}/api/clips") as resp:
+                payload = await resp.json()
+            self.assertEqual(payload["clips"], [])
+
+            release.set()
+            await self._drain_background(server)
+
+        self.assertFalse(clip.exists())
 
 
 @unittest.skipUnless(ShareServer is not None, "aiohttp is not installed")

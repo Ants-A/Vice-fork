@@ -367,11 +367,12 @@ class ViceDaemon:
                 raise RuntimeError(dir_problem)
         else:
             # Remove half-written temp files (trim/watermark/remux) from a
-            # previous run that was interrupted mid-edit.
-            cleanup_temp_files(out_dir)
+            # previous run that was interrupted mid-edit. This walks the clip
+            # folder, which can be a network mount, so do it in a thread.
+            await asyncio.to_thread(cleanup_temp_files, out_dir)
             img_dir = resolve_path(getattr(self.cfg.output, "image_directory", "") or "")
             if img_dir and img_dir.exists() and img_dir != out_dir:
-                cleanup_temp_files(img_dir)
+                await asyncio.to_thread(cleanup_temp_files, img_dir)
 
         # A recorder that will not start is not a reason to take the UI down
         # with it. It used to be: the share server was stopped on the way out,
@@ -756,7 +757,10 @@ class ViceDaemon:
                 raise
             except Exception as exc:
                 log.warning("Rescanning the clip library failed: %s", exc)
-            await asyncio.sleep(5)
+            # A full walk stats every clip. 30 seconds is still quick enough
+            # for a late-mounted drive, and the Recheck folder button covers
+            # the case where somebody is waiting for it.
+            await asyncio.sleep(30)
 
     def _wire_recorder(self, recorder) -> None:
         """Attach the daemon's callbacks to a recorder. Fires for the initial
