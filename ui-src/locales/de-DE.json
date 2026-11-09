@@ -28,6 +28,15 @@
     "playlistOptions": "Playlist-Optionen",
     "newPlaylist": "Neue Playlist",
     "saveClip": "Clip speichern",
+    "recheckFolder": "Ordner erneut prüfen",
+    "rechecking": "Wird geprüft…",
+    "recheckFound": {
+      "one": "{count} neuer Clip gefunden",
+      "other": "{count} neue Clips gefunden"
+    },
+    "recheckUpToDate": "Clip-Ordner ist aktuell",
+    "recheckMissing": "Clip-Ordner nicht gefunden",
+    "errRecheck": "Clip-Ordner konnte nicht erneut geprüft werden",
     "hotkeysUnavailableTitle": "Globale Hotkeys sind nicht verfügbar.",
     "hotkeysUnavailableBody": "Vice kann deine Tastatur nicht auslesen, deshalb speichert {hotkey} keinen Clip. Der Button „Clip speichern“ oben funktioniert weiterhin. Meist hilft es, deinen Benutzer zur Gruppe „input“ hinzuzufügen und dich neu anzumelden.",
     "emptySearch": "Nichts gefunden für „{query}“.",

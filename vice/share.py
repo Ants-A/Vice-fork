@@ -1217,6 +1217,10 @@ class ShareServer:
         self._tag_write_sem = asyncio.Semaphore(2)
         self._tag_locks: dict[str, asyncio.Lock] = {}
         self._background_tasks: set[asyncio.Task] = set()
+        # One playlist-metadata backfill at a time. A rescan or the UI button
+        # can request another pass while one is already running.
+        self._playlist_tag_task: Optional[asyncio.Task] = None
+        self._playlist_tag_recheck = False
         # Signature of the last successful output scan, so the mount watcher
         # can notice a change without probing or stat-ing every clip twice.
         self._library_signature: tuple = ()
@@ -1286,6 +1290,7 @@ class ShareServer:
 
         # REST
         r.add_get("/api/clips",              self._api_clips)
+        r.add_post("/api/library/rescan",    self._api_rescan_library)
         r.add_get("/api/clips/{slug}",       self._api_clip_info)
         r.add_delete("/api/clips/{slug}",    self._api_delete)
         r.add_post("/api/clips/{slug}/trim",              self._api_trim)
@@ -1513,6 +1518,65 @@ class ShareServer:
         else:
             await asyncio.wait(tasks, timeout=budget)
 
+    def _playlist_tag_members(self) -> list[str]:
+        """Clips that should carry at least one playlist definition."""
+        members: set[str] = set()
+        for playlist in self.playlists.list_playlists():
+            for raw_slug in playlist.get("clip_slugs", []):
+                slug = str(raw_slug)
+                if (slug and not slug.startswith(IMAGE_PREFIX)
+                        and slug in self._clips):
+                    members.add(slug)
+        return sorted(members)
+
+    def _kick_playlist_tag_backfill(self) -> None:
+        """Start (or queue) a background sync of playlists.json into the clips.
+
+        The first run after upgrading from a Vice that only wrote
+        playlists.json can remux the whole library, so it must not hold up
+        startup or an API response. Calling this again while one is running
+        asks for one more pass, which is how a rescan catches clips that
+        appeared after the current pass took its snapshot.
+        """
+        task = self._playlist_tag_task
+        if task is not None and not task.done():
+            self._playlist_tag_recheck = True
+            return
+        self._playlist_tag_recheck = False
+        self._playlist_tag_task = self._track_task(
+            asyncio.create_task(self._backfill_playlist_tags()))
+
+    async def _backfill_playlist_tags(self) -> None:
+        """Copy playlist membership from playlists.json into its member videos.
+
+        A valid playlists.json is the source of truth. Videos recorded before
+        container tags existed have no copy of it, so they are remuxed once to
+        add the tag. Videos already carrying the same definitions are skipped
+        by _write_playlist_tag, which keeps later startups cheap.
+        """
+        while True:
+            self._playlist_tag_recheck = False
+            members = self._playlist_tag_members()
+            if members:
+                # Read the existing tags first. _clip_tags also fills
+                # _playlist_tags, so files that already match are skipped
+                # without being remuxed.
+                await self._playlist_tag_entries(only=set(members))
+                needs_write = [
+                    slug for slug in members
+                    if not _playlist_tag_matches(
+                        self._playlist_tags.get(slug, ""),
+                        self.playlists.metadata_for(slug),
+                    )
+                ]
+                if needs_write:
+                    log.info("Writing playlist metadata into %d clip%s",
+                             len(needs_write), "" if len(needs_write) == 1 else "s")
+                    await self._sync_playlist_tags(needs_write)
+                self._media_cache.save(force=True)
+            if not self._playlist_tag_recheck:
+                return
+
     async def rescan_clips(self) -> int:
         """Refresh the clip index, e.g. when a late-mounted drive appears.
 
@@ -1557,6 +1621,9 @@ class ShareServer:
             })
             log.info("Found %d new clip%s in %s",
                      len(added), "" if len(added) == 1 else "s", out_dir)
+            # Newly discovered members need their metadata written, including
+            # when a drive mounted after the startup backfill already ran.
+            self._kick_playlist_tag_backfill()
         elif removed:
             # An empty scan with a non-empty previous index usually means the
             # drive was unmounted under us, not that every clip was deleted.
@@ -1605,6 +1672,10 @@ class ShareServer:
             # visible that the launch scan ran.
             self.playlists.save()
         self._media_cache.save()
+        # A valid playlists.json can predate container tags (or come from an
+        # older Vice). Put the definitions on its member videos in the
+        # background, without delaying the UI or the recorder.
+        self._kick_playlist_tag_backfill()
         # View counts persist like highlights: they are only dropped when a
         # clip is deleted (in _api_delete) or its number is reused by a new
         # recording (in add_clip). They are never purged against the startup
@@ -2334,6 +2405,23 @@ class ShareServer:
         result = [self._clip_json(slug, path, metas[slug]) for slug, path in items]
         return web.json_response({"clips": result})
 
+    async def _api_rescan_library(self, _: web.Request) -> web.Response:
+        """Recheck the clip folder on demand, e.g. after mounting a drive."""
+        added = await self.rescan_clips()
+        # rescan_clips already starts the metadata sync when it found clips.
+        # A manual recheck must also repair existing clips that predate the
+        # playlist tags even when no file was added or removed.
+        if not added:
+            self._kick_playlist_tag_backfill()
+        out_dir = resolve_path(self.cfg.output.directory)
+        return web.json_response({
+            "ok": True,
+            "added": added,
+            "clips": len(self._clips),
+            "directory": str(out_dir),
+            "available": out_dir.exists(),
+        })
+
     async def _api_clip_info(self, req: web.Request) -> web.Response:
         slug = req.match_info["slug"]
         path = self._clips.get(slug)
@@ -2486,11 +2574,13 @@ class ShareServer:
         self._media_cache.forget(path)
         # ffmpeg normally copies container tags across a trim, but do not trust
         # it with membership that cannot be regenerated from the filename.
+        # Read the tag the new file actually has, then rewrite it only when
+        # ffmpeg dropped or outdated it. Waiting here means the response
+        # leaves a replacement that already carries its playlist metadata.
         if any(slug in p.get("clip_slugs", [])
                for p in self.playlists.list_playlists()):
-            self._playlist_tags.pop(slug, None)
-            self._track_task(asyncio.create_task(
-                self._sync_playlist_tags([slug])))
+            await self._clip_tags(slug, path)
+            await self._sync_playlist_tags([slug])
         asyncio.create_task(self._broadcast_clip(slug, path))
         return web.json_response({"ok": True, "slug": slug})
 

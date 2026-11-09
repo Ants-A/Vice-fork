@@ -28,6 +28,15 @@
     "playlistOptions": "Opções da playlist",
     "newPlaylist": "Nova playlist",
     "saveClip": "Salvar clipe",
+    "recheckFolder": "Verificar pasta novamente",
+    "rechecking": "Verificando…",
+    "recheckFound": {
+      "one": "{count} novo clipe encontrado",
+      "other": "{count} novos clipes encontrados"
+    },
+    "recheckUpToDate": "A pasta de clipes está atualizada",
+    "recheckMissing": "Pasta de clipes não encontrada",
+    "errRecheck": "Não foi possível verificar a pasta de clipes",
     "hotkeysUnavailableTitle": "Atalhos globais indisponíveis.",
     "hotkeysUnavailableBody": "O Vice não consegue detectar seu teclado, então {hotkey} não salvará um clipe. Mas, o botão de salvar clipe acima ainda funciona. Adicionar seu usuário ao grupo \"input\" e relogar normalmente resolve isso.",
     "emptySearch": "Nenhum resultado para “{query}”.",

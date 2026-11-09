@@ -766,6 +766,26 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reloaded.loaded_from_disk)
         self.assertEqual(reloaded.get(custom["id"])["name"], "Best")
 
+    async def test_late_mount_writes_tags_for_untagged_members(self) -> None:
+        store = PlaylistStore(self.playlists_path)
+        custom = store.create_custom("Best")
+        store.add_clip(custom["id"], "LateClip")
+        late_dir = self.root / "late-drive"
+        server = self._make_server(late_dir)
+        await server.start()
+
+        late_dir.mkdir()
+        clip = late_dir / "LateClip.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        self.assertEqual(await server.rescan_clips(), 1)
+        await self._drain_background(server)
+
+        written = self._written_playlist_tags(clip)
+        self.assertTrue(written)
+        records = {r["id"] for r in
+                   decode_playlist_metadata(written[-1][PLAYLIST_TAG])}
+        self.assertIn(custom["id"], records)
+
     async def test_startup_without_the_clip_drive_keeps_membership(self) -> None:
         store = PlaylistStore(self.playlists_path)
         custom = store.create_custom("Keep")
@@ -857,6 +877,65 @@ class LibraryMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered, [{
             "type": "library_recovered", "added": 1, "clips": 1,
         }])
+
+    async def test_startup_writes_playlist_json_into_untagged_members(self) -> None:
+        store = PlaylistStore(self.playlists_path)
+        custom = store.create_custom("Best", emoji="🔥")
+        store.add_clip(custom["id"], "Existing")
+        clip = self.output_dir / "Existing.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+
+        server = self._make_server()
+        await server.start()
+        await self._drain_background(server)
+
+        written = self._written_playlist_tags(clip)
+        self.assertTrue(written)
+        records = {r["id"]: r for r in
+                   decode_playlist_metadata(written[-1][PLAYLIST_TAG])}
+        self.assertEqual(records[custom["id"]]["name"], "Best")
+        self.assertEqual(records[custom["id"]]["emoji"], "🔥")
+
+    async def test_startup_does_not_rewrite_clips_already_carrying_the_tag(self) -> None:
+        store = PlaylistStore(self.playlists_path)
+        custom = store.create_custom("Best")
+        store.add_clip(custom["id"], "Existing")
+        clip = self.output_dir / "Existing.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+        self.tags[clip.name] = {
+            PLAYLIST_TAG: store.metadata_for(clip.stem),
+        }
+
+        server = self._make_server()
+        await server.start()
+        await self._drain_background(server)
+
+        self.assertEqual(self._written_playlist_tags(clip), [])
+
+    async def test_manual_recheck_repairs_tags_without_a_library_change(self) -> None:
+        store = PlaylistStore(self.playlists_path)
+        custom = store.create_custom("Best")
+        store.add_clip(custom["id"], "Existing")
+        clip = self.output_dir / "Existing.mp4"
+        clip.write_bytes(b"not-a-real-mp4")
+
+        server = self._make_server()
+        server.playlists = store
+        found, signature = server._scan_output_dir()
+        server._clips = found
+        server._library_signature = signature
+
+        resp = await server._api_rescan_library(_JsonRequest({}))
+        payload = json.loads(resp.text)
+        self.assertEqual(payload["added"], 0)
+        self.assertTrue(payload["available"])
+        await self._drain_background(server)
+
+        written = self._written_playlist_tags(clip)
+        self.assertTrue(written)
+        records = {r["id"] for r in
+                   decode_playlist_metadata(written[-1][PLAYLIST_TAG])}
+        self.assertIn(custom["id"], records)
 
     async def test_playlist_changes_are_written_into_the_clip(self) -> None:
         clip = self.output_dir / "SomeClip.mp4"
@@ -1546,6 +1625,39 @@ class TrimKeyframeTests(unittest.IsolatedAsyncioTestCase):
             # Exact length the user asked for, and something to decode from.
             self.assertAlmostEqual(self._duration(src), 2.0, delta=0.2)
             self.assertGreaterEqual(self._keyframe_count(src), 1)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
+    async def test_replacing_a_trimmed_clip_writes_its_playlist_metadata(self) -> None:
+        """A replacement is a new file. The response must not arrive before
+        the clip on disk has its playlist tag again."""
+        import vice.share as share_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = self._long_gop_source(root)
+            store = PlaylistStore(root / "playlists.json")
+            custom = store.create_custom("Keep", emoji="🎯")
+            store.add_clip(custom["id"], src.stem)
+
+            cfg = Config()
+            cfg.output.directory = str(root)
+            server = ShareServer(cfg)
+            server.playlists = store
+            server._clips[src.stem] = src
+
+            req = mock.MagicMock()
+            req.match_info = {"slug": src.stem}
+            req.json = mock.AsyncMock(return_value={"start": 2.0, "end": 4.0})
+            with mock.patch.object(share_mod, "_purge_slug_thumbs"), \
+                 mock.patch.object(share_mod, "_purge_slug_proxies"), \
+                 mock.patch.object(server, "_broadcast_clip", new=mock.AsyncMock()):
+                resp = await server._api_trim(req)
+
+            self.assertTrue(json.loads(resp.text)["ok"], resp.text)
+            tags = await share_mod.probe_container_tags(src)
+            records = {r["id"]: r for r in
+                       decode_playlist_metadata(tags.get(PLAYLIST_TAG, ""))}
+            self.assertEqual(records[custom["id"]]["name"], "Keep")
+            self.assertEqual(records[custom["id"]]["emoji"], "🎯")
 
 
 

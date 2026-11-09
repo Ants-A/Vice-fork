@@ -10,11 +10,20 @@ import {ImageCard} from '../components/ImageCard';
 import {ContextMenu} from '../components/ContextMenu';
 import {PlaylistModal, type PlaylistDraft} from '../components/PlaylistModal';
 import {Modal} from '../components/Modal';
-import {IconMore, IconWarning} from '../components/Icons';
+import {IconMore, IconRefresh, IconWarning} from '../components/Icons';
 
 export function Clips() {
-  const {state, dispatch, visibleClips, visibleImages, hotkey, notify, refreshPlaylists} =
-    useStore();
+  const {
+    state,
+    dispatch,
+    visibleClips,
+    visibleImages,
+    hotkey,
+    notify,
+    refreshClips,
+    refreshImages,
+    refreshPlaylists,
+  } = useStore();
   const {playlists, currentPlaylistId, searchQuery, recentNew, status, config} = state;
 
   const playlist = currentPlaylistId
@@ -29,9 +38,46 @@ export function Clips() {
   const [editingPlaylist, setEditingPlaylist] = useState<'new' | 'edit' | null>(null);
   const [confirmPlaylistDelete, setConfirmPlaylistDelete] = useState(false);
   const [playlistMenu, setPlaylistMenu] = useState<{x: number; y: number} | null>(null);
+  const [rescanning, setRescanning] = useState(false);
 
   const fail = (title: string) => (err: Error) =>
     notify({kind: 'error', title, detail: err.message, tone: 'error', holdMs: 7000});
+
+  const rescanFolder = async () => {
+    if (rescanning) return;
+    setRescanning(true);
+    try {
+      const result = await api.rescanLibrary();
+      await Promise.all([refreshClips(), refreshImages(), refreshPlaylists()]);
+      if (!result.available) {
+        notify({
+          kind: 'error',
+          title: t('clips.recheckMissing'),
+          detail: result.directory,
+          tone: 'error',
+          holdMs: 7000,
+        });
+      } else if (result.added > 0) {
+        notify({
+          kind: 'info',
+          title: t('clips.recheckFound', {count: result.added}),
+          tone: 'accent',
+          holdMs: 4000,
+        });
+      } else {
+        notify({
+          kind: 'info',
+          title: t('clips.recheckUpToDate'),
+          tone: 'neutral',
+          holdMs: 3000,
+        });
+      }
+    } catch (err) {
+      fail(t('clips.errRecheck'))(err as Error);
+    } finally {
+      setRescanning(false);
+    }
+  };
 
   const submitPlaylist = async (draft: PlaylistDraft) => {
     if (editingPlaylist === 'edit' && playlist) {
@@ -88,6 +134,17 @@ export function Clips() {
               <IconMore size={16} />
             </button>
           ) : null}
+          <button
+            type="button"
+            className="btn btn-quiet clips-recheck"
+            title={t('clips.recheckFolder')}
+            aria-label={t('clips.recheckFolder')}
+            aria-busy={rescanning || undefined}
+            disabled={rescanning}
+            onClick={() => void rescanFolder()}>
+            <IconRefresh size={15} className={rescanning ? 'spin' : undefined} />
+            {t(rescanning ? 'clips.rechecking' : 'clips.recheckFolder')}
+          </button>
           <button type="button" className="btn btn-quiet" onClick={() => setEditingPlaylist('new')}>
             {t('clips.newPlaylist')}
           </button>

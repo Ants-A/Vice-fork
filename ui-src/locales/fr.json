@@ -28,6 +28,15 @@
     "playlistOptions": "Options de la playlist",
     "newPlaylist": "Nouvelle playlist",
     "saveClip": "Enregistrer un clip",
+    "recheckFolder": "Revérifier le dossier",
+    "rechecking": "Vérification…",
+    "recheckFound": {
+      "one": "{count} nouveau clip trouvé",
+      "other": "{count} nouveaux clips trouvés"
+    },
+    "recheckUpToDate": "Le dossier des clips est à jour",
+    "recheckMissing": "Dossier des clips introuvable",
+    "errRecheck": "Impossible de revérifier le dossier des clips",
     "hotkeysUnavailableTitle": "Les raccourcis globaux ne sont pas disponibles.",
     "hotkeysUnavailableBody": "Vice ne peut pas lire ton clavier, donc {hotkey} n'enregistrera pas de clip. Le bouton Enregistrer un clip ci-dessus fonctionne toujours. Ajouter ton utilisateur au groupe input puis te reconnecter règle généralement le problème.",
     "emptySearch": "Aucun résultat pour « {query} ».",

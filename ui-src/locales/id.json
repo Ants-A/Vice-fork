@@ -30,6 +30,14 @@
     "playlistOptions": "Opsi daftar putar",
     "newPlaylist": "Daftar putar baru",
     "saveClip": "Simpan klip",
+    "recheckFolder": "Periksa ulang folder",
+    "rechecking": "Memeriksa…",
+    "recheckFound": {
+      "other": "{count} klip baru ditemukan"
+    },
+    "recheckUpToDate": "Folder klip sudah terbaru",
+    "recheckMissing": "Folder klip tidak ditemukan",
+    "errRecheck": "Tidak dapat memeriksa ulang folder klip",
     "hotkeysUnavailableTitle": "Pintasan global tidak tersedia.",
     "hotkeysUnavailableBody": "Vice tidak dapat membaca keyboard, jadi {hotkey} tidak akan menyimpan klip. Tombol Simpan klip di atas tetap berfungsi. Biasanya ini bisa diatasi dengan menambahkan pengguna Anda ke grup input, lalu keluar dan masuk lagi.",
     "emptySearch": "Tidak ada hasil untuk “{query}”.",

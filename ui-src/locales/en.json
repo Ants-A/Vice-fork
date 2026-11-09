@@ -32,6 +32,15 @@
     "playlistOptions": "Playlist options",
     "newPlaylist": "New playlist",
     "saveClip": "Save clip",
+    "recheckFolder": "Recheck folder",
+    "rechecking": "Checking…",
+    "recheckFound": {
+      "one": "Found {count} new clip",
+      "other": "Found {count} new clips"
+    },
+    "recheckUpToDate": "Clip folder is up to date",
+    "recheckMissing": "Clip folder not found",
+    "errRecheck": "Could not recheck the clip folder",
     "hotkeysUnavailableTitle": "Global hotkeys are not available.",
     "hotkeysUnavailableBody": "Vice cannot read your keyboard, so {hotkey} will not save a clip. The Save clip button above still works. Adding your user to the input group and logging back in usually fixes it.",
     "emptySearch": "Nothing matches “{query}”.",

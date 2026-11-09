@@ -61,6 +61,15 @@ export const api = {
   // The list endpoints wrap their payload in an envelope. Unwrapped here so
   // callers only ever see the list.
   clips: async () => (await request<{clips: Clip[]}>('/api/clips')).clips,
+  /** Re-scan the output directory and repair playlist tags where needed. */
+  rescanLibrary: () =>
+    post<{
+      ok: boolean;
+      added: number;
+      clips: number;
+      directory: string;
+      available: boolean;
+    }>('/api/library/rescan'),
   deleteClip: (slug: string) => request<void>(`/api/clips/${enc(slug)}`, {method: 'DELETE'}),
   renameClip: (slug: string, name: string) => post<Clip>(`/api/clips/${enc(slug)}/rename`, {name}),
   revealClip: (slug: string) => post<void>(`/api/clips/${enc(slug)}/reveal`),
