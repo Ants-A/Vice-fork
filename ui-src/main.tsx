@@ -16,6 +16,7 @@ import './styles/editor.css';
 import {initLocale, subscribeLocale, t} from './lib/i18n';
 import {setNativeTrayLabels, setNativeScale} from './lib/env';
 import {accentVars, resolveAccent} from './theme/viceTheme';
+import {appearance} from './theme/appearance';
 import {StoreProvider, useStore} from './state/store';
 import {PlaybackProvider} from './state/playback';
 import {AppFrame} from './components/AppFrame';
@@ -31,12 +32,18 @@ function syncNativeTrayLabels(): void {
   setNativeTrayLabels(t('tray.openVice'), t('tray.quitVice'));
 }
 
+function cachedAppearance() {
+  try { return localStorage.getItem('vice-appearance'); }
+  catch { return 'light'; }
+}
+
 function App() {
   const {state} = useStore();
   const {accent, customAccent, ready, view} = state;
   // One resolve per render, shared by the theme, the ambient wash and the
   // custom properties, so a custom accent cannot be derived three times.
-  const {ramp, theme} = resolveAccent(accent, customAccent);
+  const mode = appearance(state.config ? state.config.ui?.theme : cachedAppearance());
+  const {ramp, theme} = resolveAccent(accent, customAccent, mode);
   const [, retranslate] = useState(0);
 
   useEffect(() => {
@@ -69,9 +76,12 @@ function App() {
   // that element and would otherwise never see the themed background.
   useEffect(() => {
     const root = document.documentElement;
+    root.dataset.appearance = mode;
+    try { localStorage.setItem('vice-appearance', mode); }
+    catch { /* The selection still works when browser storage is unavailable. */ }
     const vars = accentVars(ramp);
     for (const [key, value] of Object.entries(vars)) root.style.setProperty(key, value);
-  }, [ramp]);
+  }, [ramp, mode]);
 
   return (
     <Theme theme={theme} mode="dark">

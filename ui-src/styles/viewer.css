@@ -1152,24 +1152,11 @@ kbd {
   background: color-mix(in srgb, var(--color-accent) 32%, transparent);
   pointer-events: none;
 }
-.video-buffering {background: rgba(0, 0, 0, 0.62);}
-.video-buffer-progress {
-  width: min(320px, 70vw);
-  height: 7px;
+/* Conversion status belongs in the trim footer; the video stays unobstructed. */
+.trim-save-progress {
+  display: block;
+  width: min(100%, 180px);
+  height: 4px;
+  margin-top: 5px;
   accent-color: var(--color-accent);
-  border: 0;
-  border-radius: var(--radius-full);
-  overflow: hidden;
 }
-.video-buffer-progress::-webkit-progress-bar {background: rgba(255, 255, 255, 0.18);}
-.video-buffer-progress::-webkit-progress-value {background: var(--color-accent);}
-.video-buffer-progress::-moz-progress-bar {background: var(--color-accent);}
-.video-buffer-progress:indeterminate {
-  background: linear-gradient(90deg, transparent, var(--color-accent), transparent) rgba(255,255,255,.18);
-  background-size: 50% 100%;
-  background-repeat: no-repeat;
-  animation: video-buffer-wait 1.2s ease-in-out infinite alternate;
-}
-.video-buffer-caption {max-width: 40ch; color: #d1d1d1; font-size: 11px;}
-@keyframes video-buffer-wait {from {background-position: -100% 0;} to {background-position: 200% 0;}}
-@media (prefers-reduced-motion: reduce) {.video-buffer-progress:indeterminate {animation: none; background-position: center;}}

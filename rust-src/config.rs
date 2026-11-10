@@ -77,7 +77,8 @@ section!(NotificationsConfig {
 });
 section!(UIConfig {
     hardware_video_decode: bool = true,
-    scale: f64 = 1.0
+    scale: f64 = 1.0,
+    theme: String = "light".into()
 });
 section!(OverlayConfig {
     keys: bool = false,
@@ -266,6 +267,9 @@ impl Config {
         self.overlay.keys_x = self.overlay.keys_x.max(0);
         self.overlay.keys_y = self.overlay.keys_y.max(0);
         self.ui.scale = finite_clamp(self.ui.scale, 1.0, 0.75, 2.0);
+        if !["light", "dark"].contains(&self.ui.theme.as_str()) {
+            self.ui.theme = "light".into();
+        }
         self.overlay.keys_scale = finite_clamp(self.overlay.keys_scale, 1., 0.5, 3.);
     }
     pub fn validate(&self) -> Result<()> {
@@ -382,6 +386,17 @@ mod tests {
         c.hotkeys.clip = "KEY_LEFTCTRL+KEY_F9".into();
         c.hotkeys.screenshot = Some("KEY_RIGHTCTRL+KEY_F9".into());
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn appearance_preserves_existing_installs_and_persists_dark() {
+        let mut cfg: Config = toml::from_str("[ui]\nscale=1.5\n").unwrap();
+        assert_eq!(cfg.ui.theme, "light");
+        cfg.ui.theme = "dark".into();
+        let parsed: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(parsed.ui.theme, "dark");
+        cfg.ui.theme = "unknown".into();
+        cfg.normalize();
+        assert_eq!(cfg.ui.theme, "light");
     }
     #[test]
     fn ui_scale_is_persistent_and_bounded() {

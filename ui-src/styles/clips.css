@@ -63,7 +63,8 @@
 
 .clip-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* Keep previews near their desktop size, with at most four columns. */
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, max(320px, calc((100% - 3 * var(--spacing-3)) / 4))), 1fr));
   gap: var(--spacing-3);
 }
 
@@ -79,20 +80,18 @@
    skip the cards below the fold; contain-intrinsic-size keeps their estimated
    height so the scrollbar does not jump as they come into view. */
 .clip-card {
+  /* Hidden galleries restart CSS entrance animations when revealed. Existing
+     cards should be visible immediately when returning to a menu. */
+  animation: none;
   content-visibility: auto;
   contain-intrinsic-size: auto 300px;
 }
 
 /* Four columns is the default even on a wide window: the cards are meant to
-   be readable previews, not a wall of thumbnails. Drop one column at a time
-   before the cards get narrower than their metadata. */
-@media (max-width: 1100px) {
-  .clip-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 820px) {
+   be readable previews, not a wall of thumbnails. */
+/* Half-screen windows on 1080p/1440p desktops keep two substantial
+   previews rather than squeezing in three smaller cards. */
+@media (max-width: 1280px) {
   .clip-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -435,3 +434,20 @@
   letter-spacing: 0.02em;
   color: var(--color-text-secondary);
 }
+
+/* Raster game artwork and user-selected playlist icons share the same places. */
+.playlist-icon-image {
+  display: block;
+  flex: none;
+  object-fit: cover;
+  border-radius: 4px;
+}
+.npl-icon-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--spacing-2);
+  margin-bottom: var(--spacing-4);
+}
+.npl-icon-options > span {margin-right: auto; color: var(--color-text-secondary);}
+.npl-icon-options button[aria-pressed="true"] {background: color-mix(in srgb, var(--color-accent) 15%, transparent); color: var(--color-accent);}

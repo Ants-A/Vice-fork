@@ -10,7 +10,6 @@ import {DEFAULT_MARK_COLOR, MARK_COLORS} from '../lib/palette';
 import {useExitTransition} from '../lib/exit';
 import {formatBytes, formatDuration} from '../lib/format';
 import {
-  clipNeedsProxy,
   playQuietly,
   playbackUrl,
   seekTo,
@@ -128,17 +127,11 @@ export function Viewer(props: ViewerProps) {
   const stageRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({current: 0, duration: 0});
   const [paused, setPaused] = useState(true);
-  const [preparing, setPreparing] = useState(false);
-  const [previewProgress, setPreviewProgress] = useState<number | null>(null);
   const [quality, setQuality] = useState<{slug: string; smaller: boolean} | null>(null);
   const smaller = Boolean(clip && quality?.slug === clip.slug && quality.smaller);
   const source = playbackUrl(clip, smaller);
   const buffer = useVideoBuffer(videoRef, props.clip !== null, source, clip?.duration ?? 0);
-  useEffect(() => {setPreviewProgress(null);}, [source, props.clip?.slug]);
   useEffect(() => onWsMessage(msg => {
-    if (msg.type === 'preview_progress' && msg.slug === clip?.slug && Number.isFinite(msg.progress)) {
-      setPreviewProgress(Math.max(0, Math.min(1, msg.progress)));
-    }
     const video = videoRef.current;
     if (msg.type === 'preview_ready' && msg.slug === clip?.slug && video?.currentSrc.includes('proxy=webm') && !Number.isFinite(video.duration)) {
       const at = video.currentTime;
@@ -203,7 +196,6 @@ export function Viewer(props: ViewerProps) {
     video.muted = muted;
     video.src = src;
     video.load();
-    setPreparing(clipNeedsProxy(clip) || smaller);
     setPosition({current: 0, duration: clip.duration ?? 0});
     if (!trimOpen) playQuietly(video);
     void api
@@ -653,9 +645,6 @@ export function Viewer(props: ViewerProps) {
               }
               onPlay={() => setPaused(false)}
               onPause={() => setPaused(true)}
-              onCanPlay={() => setPreparing(false)}
-              onLoadedData={() => setPreparing(false)}
-              onError={() => setPreparing(false)}
             />
             <button
               type="button"
@@ -667,23 +656,6 @@ export function Viewer(props: ViewerProps) {
             <span className="viewer-timebadge mono">
               {formatDuration(position.current, true)} / {formatDuration(duration, true)}
             </span>
-
-            {!failed && (preparing || buffer.waiting) ? (
-              <div className="video-overlay video-buffering" role="status" aria-live="polite" onClick={e => e.stopPropagation()}>
-                <p>{t(preparing ? 'viewer.preparingPreview' : 'viewer.buffering')}</p>
-                <progress
-                  className="video-buffer-progress"
-                  aria-label={t(preparing ? 'viewer.preparingPreview' : 'viewer.buffering')}
-                  max={100}
-                  value={preparing ? (previewProgress === null ? undefined : previewProgress * 100) : (buffer.percent ? buffer.percent : undefined)}
-                />
-                <span className="video-buffer-caption mono">
-                  {preparing
-                    ? previewProgress === null ? t('viewer.preparingWait') : `${Math.floor(previewProgress * 100)}%`
-                    : buffer.percent !== null && buffer.percent > 0 ? t('viewer.bufferedPercent', {percent: Math.floor(buffer.percent)}) : t('viewer.connecting')}
-                </span>
-              </div>
-            ) : null}
 
             {/* The modal's own timeline and the player bar are both scrolled
                 away while expanded, so the stage carries its own transport. */}

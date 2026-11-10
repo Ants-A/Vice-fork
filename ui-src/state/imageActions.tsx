@@ -1,3 +1,4 @@
+import {PlaylistMark} from '../components/PlaylistMark';
 import {useCallback, useMemo, useState, type ReactNode} from 'react';
 
 import {api} from '../lib/api';
@@ -165,7 +166,7 @@ export function useImageActions(collection?: Image[]): {actions: ImageActionSet;
                 label: inIt
                   ? t('card.removeFrom', {playlist: playlist.name})
                   : t('card.addTo', {playlist: playlist.name}),
-                mark: inIt ? '✓' : (playlist.emoji ?? undefined),
+                mark: inIt ? '✓' : <PlaylistMark playlist={playlist} size={16} />,
                 onSelect: () => {
                   const call = inIt
                     ? api.removeClipFromPlaylist(playlist.id, key)

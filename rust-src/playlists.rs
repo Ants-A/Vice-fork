@@ -271,6 +271,15 @@ impl PlaylistStore {
             }
             p["emoji"] = json!(emoji);
         }
+        if let Some(icon) = fields.get("icon") {
+            let icon = icon
+                .as_str()
+                .context("Playlist icon must be an image or automatic")?;
+            if !crate::playlist_icons::valid_icon(icon) {
+                bail!("Playlist icon must be a PNG image of at most 256×256 pixels and 64 KB");
+            }
+            p["icon"] = json!(icon);
+        }
         for k in ["color1", "color2"] {
             if valid_color(text(fields, k)) {
                 p[k] = fields[k].clone();
@@ -343,7 +352,7 @@ impl PlaylistStore {
         } else {
             let (c1, c2) = PL_COLORS[crc32(key.as_bytes()) as usize % 8];
             let name = display_name.unwrap_or(game);
-            self.playlists.push(json!({"id":pid,"kind":"auto","name":name,"game":name,"emoji":"","color1":c1,"color2":c2,"clip_slugs":[],"created_at":chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()}));
+            self.playlists.push(json!({"id":pid,"kind":"auto","name":name,"game":name,"emoji":"","icon":"auto","color1":c1,"color2":c2,"clip_slugs":[],"created_at":chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()}));
             self.playlists.len() - 1
         };
         if slugs(&self.playlists[i]).iter().any(|s| s == slug) {
@@ -509,6 +518,26 @@ mod tests {
         PlaylistStore::new(
             std::env::temp_dir().join(format!("vice-playlists-{}.json", uuid::Uuid::new_v4())),
         )
+    }
+    #[test]
+    fn icon_changes_persist_without_growing_embedded_video_metadata() {
+        let mut s = store();
+        let p = s.create_custom("Best", "🎮", "", "").unwrap();
+        let id = text(&p, "id");
+        s.add_clip(id, "clip").unwrap();
+        let before = s.metadata_for("clip", Some(1));
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABg";
+        assert!(crate::playlist_icons::valid_icon(png));
+        s.update_playlist(id, &json!({"icon":png})).unwrap();
+        let loaded = PlaylistStore::new(s.path.clone());
+        assert_eq!(loaded.get(id).unwrap()["icon"], png);
+        assert_eq!(s.metadata_for("clip", Some(1)), before);
+        assert!(
+            s.update_playlist(id, &json!({"icon":"https://untrusted/image.svg"}))
+                .is_err()
+        );
+        assert_eq!(s.get(id).unwrap()["icon"], png);
+        let _ = std::fs::remove_file(s.path);
     }
     #[test]
     fn rename_delete_and_roundtrip() {

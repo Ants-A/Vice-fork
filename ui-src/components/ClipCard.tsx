@@ -2,7 +2,7 @@ import {startHoverPreview, stopHoverPreview} from '../lib/hoverPreview';
 import {memo, useEffect, useRef, useState} from 'react';
 
 import {endClipDrag, startClipDrag} from '../lib/clipDrag';
-import {formatBytes, formatDuration} from '../lib/format';
+import {formatBytes, formatDuration, formatCardDate} from '../lib/format';
 import {clipTitle, type Clip} from '../lib/types';
 import {H264_SUPPORTED} from '../lib/env';
 import {playbackUrl, clipNeedsProxy} from '../lib/playback';
@@ -55,6 +55,8 @@ export const ClipCard = memo(function ClipCard({
   const thumbTimer = useRef<number | undefined>(undefined);
   const thumbAttempts = useRef(0);
   const [previewFailed, setPreviewFailed] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const [previewReady, setPreviewReady] = useState(false);
   const [renamingHere, setRenamingHere] = useState(false);
   const [thumbUrl, setThumbUrl] = useState(clip.thumb_url);
   const [thumbFailed, setThumbFailed] = useState(false);
@@ -70,8 +72,10 @@ export const ClipCard = memo(function ClipCard({
 
   useEffect(() => {
     const video = videoRef.current;
-    return () => {if (video) stopHoverPreview(video);};
-  }, [canPreview]);
+    if (!hovered || !canPreview || !video) return;
+    startHoverPreview(video, playbackUrl(clip), () => setPreviewFailed(true));
+    return () => stopHoverPreview(video);
+  }, [hovered, canPreview, clip.video_url]);
 
   useEffect(() => {
     // A rename or a trim gives the clip a new thumbnail revision. Start over,
@@ -100,24 +104,18 @@ export const ClipCard = memo(function ClipCard({
   };
 
   const attachPreview = () => {
-    const video = videoRef.current;
-    if (video && canPreview) startHoverPreview(video, playbackUrl(clip), () => setPreviewFailed(true));
+    if (canPreview) setHovered(true);
   };
 
   const releasePreview = () => {
+    setHovered(false);
+    setPreviewReady(false);
     const video = videoRef.current;
     if (video) stopHoverPreview(video);
   };
 
   const meta = [
-    clip.created_at
-      ? new Date(clip.created_at).toLocaleDateString(undefined, {
-          month: 'short',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-        })
-      : '',
+    formatCardDate(clip.created_at),
     !broken && clip.width ? `${clip.width}x${clip.height}` : '',
     clip.size ? formatBytes(clip.size) : '',
     clip.views ? t('card.views', {count: clip.views}) : '',
@@ -158,6 +156,7 @@ export const ClipCard = memo(function ClipCard({
           <img
             src={thumbUrl}
             loading="lazy"
+            decoding="async"
             alt=""
             draggable={false}
             onError={retryThumb}
@@ -165,10 +164,13 @@ export const ClipCard = memo(function ClipCard({
         ) : (
           <span className="clip-thumb-empty" aria-hidden="true" />
         )}
-        {canPreview ? (
+        {canPreview && hovered ? (
           <video
             ref={videoRef}
             className="clip-preview"
+            data-ready={previewReady || undefined}
+            onLoadedData={() => setPreviewReady(true)}
+            onEmptied={() => setPreviewReady(false)}
             muted
             loop
             playsInline

@@ -1515,19 +1515,31 @@ pub(crate) async fn run_preview_attempt(
 async fn run_media_attempt(
     state: &Shared,
     source: &FsPath,
-    mut args: Vec<String>,
+    args: Vec<String>,
     seconds: u64,
     event: &str,
 ) -> Result<()> {
+    run_media_attempt_for(state, source, args, seconds, event, None).await
+}
+async fn run_media_attempt_for(
+    state: &Shared,
+    source: &FsPath,
+    mut args: Vec<String>,
+    seconds: u64,
+    event: &str,
+    expected_duration: Option<f64>,
+) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let slug = state.media_id(source, false).await;
-    let duration = state
-        .cached_meta(source)
-        .await
-        .and_then(|v| v["duration"].as_f64())
-        .unwrap_or(0.0);
+    let duration = expected_duration.unwrap_or(
+        state
+            .cached_meta(source)
+            .await
+            .and_then(|v| v["duration"].as_f64())
+            .unwrap_or(0.0),
+    );
     let encoder = crate::encoding::video_encoder(&args)
-        .unwrap_or("unknown")
+        .unwrap_or("stream copy")
         .to_owned();
     tracing::info!(%encoder, task=event, %slug, "Preparing video conversion");
     args.splice(1..1, ["-progress".into(), "pipe:1".into()]);
@@ -1541,7 +1553,9 @@ async fn run_media_attempt(
     let mut child = command.spawn()?;
     let mut lines = BufReader::new(child.stdout.take().context("preview stdout")?).lines();
     let mut stderr = child.stderr.take().context("preview stderr")?;
-    state.emit(json!({"type":event,"slug":slug,"encoder":encoder,"progress":0.0}));
+    state.emit(
+        json!({"type":event,"slug":slug,"encoder":encoder,"phase":"encoding","progress":0.0}),
+    );
     let advanced = std::sync::Mutex::new(Instant::now());
     let progress = async {
         let mut furthest = -1.0_f64;
@@ -1554,7 +1568,7 @@ async fn run_media_attempt(
                 }
                 if last.elapsed() >= Duration::from_millis(200) {
                     state.emit(
-                        json!({"type":event,"slug":slug,"encoder":encoder,"progress":fraction}),
+                        json!({"type":event,"slug":slug,"encoder":encoder,"phase":"encoding","progress":fraction}),
                     );
                     last = Instant::now();
                 }
@@ -1600,7 +1614,9 @@ async fn run_media_attempt(
             String::from_utf8_lossy(&errors)
         );
     }
-    state.emit(json!({"type":event,"slug":slug,"encoder":encoder,"progress":1.0}));
+    state.emit(
+        json!({"type":event,"slug":slug,"encoder":encoder,"phase":"encoding","progress":1.0}),
+    );
     Ok(())
 }
 pub async fn run_command(args: Vec<String>, seconds: u64) -> Result<()> {
@@ -1755,6 +1771,19 @@ async fn api(State(s): State<Shared>, Path(path): Path<String>, req: Request<Bod
             ok(
                 json!({"ok":true,"added":added,"clips":s.files.read().await.len(),"directory":cfg.output.directory,"available":runtime::resolve_path(&cfg.output.directory).is_dir()}),
             )
+        }
+        ("GET", ["game-icon"]) => {
+            let parsed = reqwest::Url::parse(&format!("http://localhost/?{query}"))
+                .map_err(anyhow::Error::from)?;
+            let name = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "name")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            if name.trim().is_empty() || name.len() > 256 {
+                return Err(bad("a game name is required"));
+            }
+            Ok(crate::playlist_icons::serve_game_icon(&name).await)
         }
         ("GET", ["clips"]) => {
             let mut clips = s.clips_json().await;
@@ -2111,10 +2140,11 @@ async fn media_api(
             let work = MediaTemp(work_dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext)));
             let identity = cache_key(&path);
             let info =
-                media::trim_range_with_metadata(&path, &work.0, start, end, &before, &tags).await?;
-            tokio::fs::copy(&work.0, &tmp.0)
-                .await
-                .map_err(anyhow::Error::from)?;
+                media::trim_range_with_runner(&path, &work.0, start, end, &before, &tags, |args| {
+                    run_media_attempt_for(&s, &path, args, 900, "trim_progress", Some(end - start))
+                })
+                .await?;
+            stage_trim(&s, slug, &work.0, &tmp.0).await?;
             if cache_key(&path) != identity {
                 return Err(bad("the clip changed while it was being trimmed; retry"));
             }
@@ -2468,6 +2498,55 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
     }
     bail!("could not fit the encoded clip under Discord's file limit; trim it shorter")
 }
+/// Avoid copying a locally stored trim onto the same filesystem. Cross-device
+/// libraries (including mounted shares) receive one sequential upload, with
+/// progress distinct from encoding so the remaining wait is visible.
+async fn stage_trim(state: &Shared, slug: &str, source: &FsPath, target: &FsPath) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let progress = |done: u64, total: u64| {
+        state.emit(json!({"type":"trim_progress", "slug":slug,
+        "encoder":"", "phase":"uploading", "progress":done as f64 / total.max(1) as f64, "bytes":done, "total":total}))
+    };
+    match tokio::fs::rename(source, target).await {
+        Ok(()) => {
+            progress(1, 1);
+            return Ok(());
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut input = tokio::fs::File::open(source).await?;
+    let total = input.metadata().await?.len();
+    let mut output = tokio::fs::File::create(target).await?;
+    output.set_max_buf_size(4 * 1024 * 1024);
+    input.set_max_buf_size(4 * 1024 * 1024);
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+    let mut done = 0;
+    let mut last = Instant::now();
+    progress(0, total);
+    loop {
+        if *state.shutdown.borrow() {
+            bail!("trim upload stopped");
+        }
+        let count = input.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        output.write_all(&buffer[..count]).await?;
+        done += count as u64;
+        if done < total && last.elapsed() >= Duration::from_millis(200) {
+            progress(done, total);
+            last = Instant::now();
+        }
+    }
+    output.flush().await?;
+    if done != total {
+        bail!("trim upload ended before the completed file was copied");
+    }
+    progress(done, total);
+    Ok(())
+}
+
 fn trimmed_copy_path(path: &FsPath) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path.extension().unwrap_or_default().to_string_lossy();
@@ -2500,9 +2579,25 @@ fn trim_highlights(highlights: &Value, start: f64, end: f64) -> Vec<Value> {
 
 async fn playlist_api(s: Shared, parts: &[&str], method: &Method, body: &Value) -> ApiResult {
     let mut store = s.playlists.lock().await;
+    let previous = parts.first().and_then(|pid| store.get(pid)).cloned();
     let result = match (method.as_str(), parts) {
         ("POST", []) => {
-            json!({"ok":true,"playlist":store.create_custom(body["name"].as_str().unwrap_or(""),body["emoji"].as_str().unwrap_or(""),body["color1"].as_str().unwrap_or(""),body["color2"].as_str().unwrap_or(""))?})
+            if let Some(icon) = body.get("icon")
+                && !icon.as_str().is_some_and(crate::playlist_icons::valid_icon)
+            {
+                return Err(bad("invalid playlist icon"));
+            }
+            let mut playlist = store.create_custom(
+                body["name"].as_str().unwrap_or(""),
+                body["emoji"].as_str().unwrap_or(""),
+                body["color1"].as_str().unwrap_or(""),
+                body["color2"].as_str().unwrap_or(""),
+            )?;
+            if body.get("icon").is_some() {
+                let id = playlist["id"].as_str().context("playlist id")?;
+                playlist = store.update_playlist(id, &json!({"icon":body["icon"]}))?;
+            }
+            json!({"ok":true,"playlist":playlist})
         }
         ("PATCH", [pid]) => json!({"ok":true,"playlist":store.update_playlist(pid,body)?}),
         ("DELETE", [pid]) => {
@@ -2529,12 +2624,42 @@ async fn playlist_api(s: Shared, parts: &[&str], method: &Method, body: &Value) 
         }
         _ => return Err(missing()),
     };
+    let artwork_only = method == Method::PATCH
+        && previous.as_ref().is_some_and(|before| {
+            ["name", "emoji", "color1", "color2"]
+                .iter()
+                .all(|key| before[key] == result["playlist"][key])
+        });
     let playlists = store.list_playlists();
     drop(store);
     s.emit(json!({"type":"playlists_changed","playlists":playlists}));
-    // Tags are updated off the HTTP path: remuxing a large recording can take minutes.
+    // Choosing artwork is a local presentation change, so avoid probing or
+    // remuxing the library merely to update an icon.
+    let affected: std::collections::HashSet<String> = previous
+        .iter()
+        .chain(result.get("playlist"))
+        .flat_map(|playlist| {
+            playlist["clip_slugs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|slug| slug.as_str().map(str::to_owned))
+        })
+        .collect();
+    if artwork_only || affected.is_empty() {
+        return ok(result);
+    }
+    // Update only members of the changed playlist. Creating an empty playlist
+    // or choosing artwork must never scan/remux every video on a remote share.
     tokio::spawn(async move {
-        let files = s.files.read().await.clone();
+        let files: Vec<_> = s
+            .files
+            .read()
+            .await
+            .iter()
+            .filter(|(slug, _)| affected.contains(*slug))
+            .map(|(slug, path)| (slug.clone(), path.clone()))
+            .collect();
         for (slug, path) in files {
             if *s.shutdown.borrow() {
                 break;
@@ -2874,6 +2999,52 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(state.rescan().await, 0);
         assert!(state.files.read().await.is_empty());
+    }
+    #[tokio::test]
+    async fn staging_a_local_trim_moves_bytes_without_another_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("work.mp4");
+        let target = dir.path().join("staged.mp4");
+        std::fs::write(&source, b"finished trim").unwrap();
+        let inode = source.metadata().unwrap().ino();
+        let mut cfg = Config::default();
+        cfg.output.directory = dir.path().join("clips").to_string_lossy().into();
+        cfg.output.image_directory = dir.path().join("images").to_string_lossy().into();
+        let state = AppState::new(cfg);
+        stage_trim(&state, "clip", &source, &target).await.unwrap();
+        assert!(!source.exists());
+        assert_eq!(target.metadata().unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&target).unwrap(), b"finished trim");
+    }
+    #[tokio::test]
+    async fn staging_a_trim_across_filesystems_reports_complete_upload() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(remote) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let local = tempfile::tempdir().unwrap();
+        if local.path().metadata().unwrap().dev() == remote.path().metadata().unwrap().dev() {
+            return;
+        }
+        let source = local.path().join("work.mp4");
+        let target = remote.path().join("staged.mp4");
+        let data: Vec<u8> = (0..4 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source, &data).unwrap();
+        let mut cfg = Config::default();
+        cfg.output.directory = local.path().join("clips").to_string_lossy().into();
+        cfg.output.image_directory = local.path().join("images").to_string_lossy().into();
+        let state = AppState::new(cfg);
+        let mut events = state.events.subscribe();
+        stage_trim(&state, "clip", &source, &target).await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), data);
+        assert!(source.exists());
+        let mut finished = false;
+        while let Ok(event) = events.try_recv() {
+            assert_eq!(event["phase"], "uploading");
+            finished |= event["progress"] == 1.0 && event["bytes"] == data.len() as u64;
+        }
+        assert!(finished);
     }
     #[test]
     fn trimmed_highlights_rebase_and_keep_user_fields() {

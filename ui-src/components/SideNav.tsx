@@ -1,3 +1,4 @@
+import {PlaylistMark} from './PlaylistMark';
 import {useState} from 'react';
 
 import {useStore} from '../state/store';
@@ -20,7 +21,6 @@ import {
   IconImages,
   IconSparkle,
   IconMark,
-  IconPlaylist,
   IconPlus,
   IconSearch,
   IconSettings,
@@ -218,7 +218,7 @@ export function SideNav({
             onSelect: () => {
               const target = menu.playlist;
               void api
-                .updatePlaylist(target.id, {emoji: glyph})
+                .updatePlaylist(target.id, {emoji: glyph, icon: ''})
                 .then(async result => {
                   if (result?.ok === false) {
                     throw new Error(result.error || t('nav.errSetEmoji'));
@@ -352,7 +352,7 @@ function PlaylistRow({
         }}
         {...drop.props}>
         <span className="playlist-mark" aria-hidden="true">
-          {playlist.emoji || <IconPlaylist size={14} />}
+          {<PlaylistMark playlist={playlist} size={16} />}
         </span>
         <span className="nav-label">{playlist.name}</span>
         <span className="nav-count">{playlist.clip_slugs?.length ?? 0}</span>

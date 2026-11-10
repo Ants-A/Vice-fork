@@ -6,14 +6,13 @@ import {onWsMessage} from '../lib/ws';
 import {useEscape} from '../lib/escape';
 import {formatDuration} from '../lib/format';
 import {
-  clipNeedsProxy,
   playQuietly,
   playbackUrl,
   timecode,
   useVideoFailure,
   videoFailureMessage,
 } from '../lib/playback';
-import {clipTitle, type Clip, type Highlight} from '../lib/types';
+import {clipTitle, type Clip, type Highlight, type WsMessage} from '../lib/types';
 import {IconClose} from './Icons';
 import {InlineRename} from './InlineRename';
 import {t} from '../lib/i18n';
@@ -54,18 +53,16 @@ export function TrimModal({
   const [selection, setSelection] = useState({start: 0, end: 0});
   const [playhead, setPlayhead] = useState(0);
   const [previewing, setPreviewing] = useState(false);
-  const [preparing, setPreparing] = useState(false);
-  const [previewProgress, setPreviewProgress] = useState<number | null>(null);
   const source = playbackUrl(clip);
   const buffer = useVideoBuffer(videoRef, clip !== null, source, clip?.duration ?? 0);
-  useEffect(() => {setPreviewProgress(null);}, [source]);
-  useEffect(() => onWsMessage(msg => {
-    if (msg.type === 'preview_progress' && msg.slug === clip?.slug && Number.isFinite(msg.progress)) {
-      setPreviewProgress(Math.max(0, Math.min(1, msg.progress)));
-    }
-  }), [clip?.slug]);
   const [dragging, setDragging] = useState<'start' | 'end' | null>(null);
   const [saving, setSaving] = useState(false);
+  const [saveProgress, setSaveProgress] = useState<Extract<WsMessage, {type: 'trim_progress'}> | null>(null);
+  useEffect(() => onWsMessage(msg => {
+    if (saving && msg.type === 'trim_progress' && msg.slug === clip?.slug && Number.isFinite(msg.progress)) {
+      setSaveProgress({...msg, progress: Math.max(0, Math.min(1, msg.progress))});
+    }
+  }), [saving, clip?.slug]);
   const [error, setError] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState(false);
   // Held until the dialog closes. Renaming the file straight away swapped the
@@ -100,8 +97,8 @@ export function TrimModal({
     setPlayhead(0);
     setPreviewing(false);
     setSaving(false);
+    setSaveProgress(null);
     setError(null);
-    setPreparing(clipNeedsProxy(clip));
     setPendingName(null);
     setConfirmReplace(false);
     video.src = playbackUrl(clip);
@@ -187,6 +184,7 @@ export function TrimModal({
   const save = async (copy: boolean) => {
     if (previewing) stopPreview();
     setSaving(true);
+    setSaveProgress(null);
     setError(null);
     setConfirmReplace(false);
     try {
@@ -265,7 +263,6 @@ export function TrimModal({
                 const next = {start: 0, end: seconds};
                 setSelection(next);
                 selectionRef.current = next;
-                setPreparing(false);
               }}
               onTimeUpdate={onTimeUpdate}
               onEnded={() => {
@@ -274,17 +271,7 @@ export function TrimModal({
                 video.currentTime = selectionRef.current.start;
                 playQuietly(video);
               }}
-              onCanPlay={() => setPreparing(false)}
-              onError={() => setPreparing(false)}
             />
-            {!failed && (preparing || buffer.waiting) ? (
-              <div className="video-overlay video-buffering" role="status" aria-live="polite">
-                <p>{t(preparing ? 'trim.preparingPreview' : 'viewer.buffering')}</p>
-                <progress className="video-buffer-progress" aria-label={t('viewer.buffering')} max={100}
-                  value={preparing ? previewProgress === null ? undefined : previewProgress * 100 : buffer.percent || undefined} />
-                <span className="video-buffer-caption mono">{preparing && previewProgress !== null ? `${Math.floor(previewProgress * 100)}%` : !preparing && buffer.percent ? t('viewer.bufferedPercent', {percent: Math.floor(buffer.percent)}) : t('viewer.connecting')}</span>
-              </div>
-            ) : null}
             {failed ? (
               <div className="video-overlay">
                 <p>{videoFailureMessage()}</p>
@@ -316,7 +303,11 @@ export function TrimModal({
           </div>
 
           <div className="trim-timeline" ref={timelineRef}>
-            <div className="trim-track" />
+            <div className="trim-track">
+              {total > 0 ? buffer.ranges.map((range, index) => (
+                <div key={index} className="viewer-buffered" style={{left: `${pct(range.start)}%`, width: `${pct(range.end - range.start)}%`}} />
+              )) : null}
+            </div>
             <div
               className="trim-selection"
               style={{left: `${startPct}%`, width: `${endPct - startPct}%`}}
@@ -362,8 +353,16 @@ export function TrimModal({
             disabled={!total}>
             {previewing ? t('trim.stop') : t('trim.preview')}
           </button>
-          <span className="trim-status" data-warning={(!error && confirmReplace) || undefined}>
-            {error ?? (confirmReplace ? t('trim.replaceWarning') : t('trim.loopHelp'))}
+          <span className="trim-status" data-warning={(!error && confirmReplace) || undefined}
+            role={saving ? 'status' : undefined} aria-live="polite">
+            {error ?? (saving ? (
+              <>
+                {saveProgress?.phase === 'uploading' ? t('trim.uploading')
+                  : saveProgress?.encoder ? t('trim.encodingProgress', {encoder: saveProgress.encoder}) : t('trim.finishing')}
+                {saveProgress ? ` · ${Math.floor(saveProgress.progress * 100)}%` : ''}
+                <progress className="trim-save-progress" max={1} value={saveProgress?.progress} />
+              </>
+            ) : confirmReplace ? t('trim.replaceWarning') : t('trim.loopHelp'))}
           </span>
           <button type="button" className="btn btn-quiet btn-sm" onClick={close}>
             {t('common.cancel')}

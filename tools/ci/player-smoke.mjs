@@ -171,7 +171,7 @@ esac
     HTMLMediaElement.prototype.canPlayType = function(type) {return ${forceWebm ? '/mp4|avc1|hvc1|hev1/i.test(type)' : 'false'} ? '' : originalCanPlay.call(this, type);};
     localStorage.setItem('vice_tutorial_shown','1');localStorage.setItem('vice_whats_new_seen','2.17.0');localStorage.setItem('vice-muted','1');
     window.__viceSmoke={bufferObserved:false};
-    new MutationObserver(()=>{const bar=document.querySelector('.video-buffering progress');if(bar&&bar.getBoundingClientRect().width>0)window.__viceSmoke.bufferObserved=true;}).observe(document,{childList:true,subtree:true,attributes:true});
+    new MutationObserver(()=>{const bar=document.querySelector('.viewer-buffered');if(bar&&bar.getBoundingClientRect().width>0)window.__viceSmoke.bufferObserved=true;}).observe(document,{childList:true,subtree:true,attributes:true});
   `});
   // Make the waiting state reproducible even on a fast CPU and local disk.
   await cdp.send('Fetch.enable', {patterns: [{urlPattern: `*proxy=${previewQuery}*`, requestStage: 'Request'}]});
@@ -192,7 +192,8 @@ esac
     await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Smaller preview'))`), 'smaller preview control did not render');
     await cdp.evaluate(`window.__viceSmoke.bufferObserved=false;Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Smaller preview').click()`);
   }
-  if (!original) await until(() => cdp.evaluate(`window.__viceSmoke.bufferObserved`), 'waiting state never displayed its buffering progress');
+  if (!original) await until(() => cdp.evaluate(`window.__viceSmoke.bufferObserved`), 'buffered timeline never became visible');
+  assert.equal(await cdp.evaluate(`document.querySelectorAll('.video-buffering').length`), 0, 'buffering overlay must be absent');
   await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return Boolean(v&&${original ? "!v.currentSrc.includes('proxy=')" : "v.currentSrc.includes('proxy=" + previewQuery + "')"}&&v.videoWidth>0&&v.currentTime>0&&!v.paused&&!v.error);})()`), 'WebM fallback never reached active video playback', 60000);
   const firstFrameMs = Date.now() - openedAt;
   const stage = await cdp.evaluate(`(()=>{const r=document.querySelector('.viewer-stage').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
@@ -271,14 +272,35 @@ esac
     await cdp.evaluate(`document.querySelector('.viewer-head .modal-close').click()`);
     await until(() => cdp.evaluate(`!document.querySelector('.viewer-video')`), 'viewer did not close');
     await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='All Clips').click()`);
-    await Promise.all(Array.from({length: 100}, (_, i) => fs.link(path.join(root, 'clips/smoke.mp4'), path.join(root, `clips/gallery-${i}.mp4`))));
+    await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='Home').click()`);
+    await Promise.all(Array.from({length: 200}, (_, i) => fs.link(path.join(root, 'clips/smoke.mp4'), path.join(root, `clips/gallery-${i}.mp4`))));
     assert((await fetch(`${base}/api/library/rescan`, {method: 'POST'})).ok);
-    await until(() => cdp.evaluate(`document.querySelectorAll('.clip-card').length >= 96`), 'gallery did not refresh');
+    await until(() => cdp.evaluate(`document.querySelector('.nav-count')?.textContent==='201'`), 'gallery did not refresh');
+    await delay(800);
+    const hiddenCards = await cdp.evaluate(`document.querySelector('.screen-keepalive[hidden]')?.querySelectorAll('.clip-card').length`);
+    assert(hiddenCards <= 96, `hidden gallery expanded itself to ${hiddenCards} cards`);
+    assert.equal(await cdp.evaluate(`document.querySelectorAll('.clip-preview').length`), 0, 'idle cards must not allocate video players');
+    const navigationTimes = [];
+    for (const label of ['Settings', 'All Clips', 'Home', 'All Clips', 'Settings', 'All Clips']) {
+      const elapsed = await cdp.evaluate(`new Promise(resolve=>{const start=performance.now();Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent===${JSON.stringify(label)}).click();requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(performance.now()-start)));})`);
+      navigationTimes.push({label, ms: Math.round(elapsed)});
+    }
+
+    const galleryLayouts = [];
+    for (const [width, expectedColumns] of [[1920,4],[960,2],[2560,4],[1280,2],[520,1]]) {
+      await cdp.send('Emulation.setDeviceMetricsOverride', {width, height: 900, deviceScaleFactor: 1, mobile: false});
+      await delay(100);
+      const grid = await cdp.evaluate(`(()=>{const node=document.querySelector('.screen-keepalive .clip-grid');const card=node.querySelector('.clip-card');return {columns:getComputedStyle(node).gridTemplateColumns.split(' ').length,cardWidth:card.getBoundingClientRect().width,scrollWidth:document.documentElement.scrollWidth,viewport:innerWidth};})()`);
+      assert.equal(grid.columns, expectedColumns, `gallery at ${width}px: ${JSON.stringify(grid)}`);
+      assert(grid.scrollWidth <= grid.viewport, 'gallery must not introduce horizontal scrolling');
+      galleryLayouts.push({width,...grid});
+    }
+    await cdp.send('Emulation.setDeviceMetricsOverride', {width: 1280, height: 820, deviceScaleFactor: 1, mobile: false});
     for (let i = 0; i < 5; i++) {
       await cdp.evaluate(`{const pane=document.querySelector('.frame-content');pane.scrollTop=pane.scrollHeight;pane.dispatchEvent(new Event('scroll'));}`);
       await delay(200);
     }
-    await until(() => cdp.evaluate(`document.querySelectorAll('.clip-card').length === 101`), 'scrolling stopped at the first page');
+    await until(() => cdp.evaluate(`document.querySelectorAll('.screen-keepalive .clip-card').length === 201`), 'scrolling stopped at the first page');
     assert((await fetch(`${base}/api/trigger`, {method: 'POST'})).ok);
     await until(async () => {try {return (await fs.stat(path.join(root, 'clips/2026-replay.mp4'))).size === 7;} catch {return false;}}, 'fake replay never began writing');
     const statusStarted = Date.now();
@@ -287,7 +309,7 @@ esac
     assert(statusMs < 500, `saving a replay blocked status for ${statusMs}ms`);
     assert((await fetch(`${base}/api/library/rescan`, {method: 'POST'})).ok);
     const during = await (await fetch(`${base}/api/clips`)).json();
-    assert.equal(during.clips.length, 101, 'unfinished replay leaked into the library');
+    assert.equal(during.clips.length, 201, 'unfinished replay leaked into the library');
     await until(() => cdp.evaluate(`Array.from(document.querySelectorAll('.clip-name')).some(n=>n.textContent==='Vice_Clip_1')`), 'saved replay did not reach the gallery');
     const clips = (await (await fetch(`${base}/api/clips`)).json()).clips;
     const saved = clips.find(c => c.name === 'Vice_Clip_1.mp4');
@@ -301,18 +323,51 @@ esac
     assert.equal(renamed.slug, saved.slug);
     await delay(500);
     assert(await cdp.evaluate(`document.querySelector('.viewer-video').paused`), 'metadata/rename update restarted paused playback');
+    const trimSocket = new WebSocket(`${base.replace('http:', 'ws:')}/ws`);
+    await once(trimSocket, 'open');
+    const trimEvents = [];
+    trimSocket.addEventListener('message', event=>{const msg=JSON.parse(String(event.data));if(msg.type==='trim_progress'&&msg.slug===saved.slug)trimEvents.push(msg);});
     const trimStarted = Date.now();
     const replaced = await fetch(`${base}/api/clips/${saved.slug}/trim`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({start:0.25,end:1.75,copy:false})});
     assert(replaced.ok, await replaced.text());
     const trimmed = await (await fetch(`${base}/api/clips/${saved.slug}`)).json();
     assert(Math.abs(trimmed.duration - 1.5) < 0.15, JSON.stringify(trimmed));
     const trimMs = Date.now() - trimStarted;
+    await until(() => trimEvents.some(event=>event.phase==='uploading'&&event.progress===1), 'trim upload progress never completed');
+    trimSocket.close();
+    assert(trimEvents.some(event=>event.phase==='encoding'&&event.encoder), 'trim must report its actual encoder');
     const noOpStarted = Date.now();
     assert((await fetch(`${base}/api/clips/${saved.slug}/trim`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({start:0,end:trimmed.duration,copy:false})})).ok);
     const noOpMs = Date.now() - noOpStarted;
     assert(noOpMs < 500, `unchanged trim took ${noOpMs}ms`);
     assert.notEqual(trimmed.video_url, after, 'replace must invalidate the old playback revision');
-    lifecycle = {statusMs, galleryCards: 102, trimMs, noOpMs, literalName: renamed.name};
+    lifecycle = {statusMs, hiddenCards, navigationTimes, galleryLayouts, galleryCards: 202, trimMs, trimEncoder:trimEvents.find(event=>event.phase==='encoding')?.encoder, noOpMs, literalName: renamed.name};
+    await cdp.evaluate(`document.querySelector('.viewer-head .modal-close').click()`);
+    await until(() => cdp.evaluate(`!document.querySelector('.viewer-video')`), 'viewer did not close after trim');
+    await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='Settings').click()`);
+    await until(() => cdp.evaluate(`Boolean(document.querySelector('select[aria-label="Theme"]'))`), 'appearance selector missing');
+    assert.equal(await cdp.evaluate(`document.documentElement.dataset.appearance`), 'light');
+    await cdp.evaluate(`{const select=document.querySelector('select[aria-label="Theme"]');select.value='dark';select.dispatchEvent(new Event('change',{bubbles:true}));}`);
+    await until(() => cdp.evaluate(`document.documentElement.dataset.appearance==='dark'&&getComputedStyle(document.documentElement).getPropertyValue('--vice-bg').trim()==='#040506'`), 'dark theme did not apply');
+    await until(async () => (await (await fetch(`${base}/api/config`)).json()).ui?.theme === 'dark', 'dark theme was not persisted');
+    const icon = await cdp.evaluate(`(()=>{const canvas=document.createElement('canvas');canvas.width=canvas.height=96;const ctx=canvas.getContext('2d');ctx.fillStyle='#ff5722';ctx.fillRect(0,0,96,96);return canvas.toDataURL('image/png');})()`);
+    const playlistResponse = await fetch(`${base}/api/playlists`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:'Artwork test',emoji:'',icon})});
+    assert(playlistResponse.ok, await playlistResponse.text());
+    await until(() => cdp.evaluate(`Array.from(document.querySelectorAll('.playlist-icon-image')).some(img=>img.src.startsWith('data:image/png')&&img.complete&&img.naturalWidth===96)`), 'uploaded playlist image did not render');
+    await cdp.evaluate(`Array.from(document.querySelectorAll('.sidenav-playlists .nav-item')).find(b=>b.querySelector('.nav-label')?.textContent==='Artwork test').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:80,clientY:160}))`);
+    await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.ctx-item')).find(b=>b.textContent.includes('Edit playlist')))`), 'playlist editor action missing');
+    await cdp.evaluate(`Array.from(document.querySelectorAll('.ctx-item')).find(b=>b.textContent.includes('Edit playlist')).click()`);
+    await until(() => cdp.evaluate(`Boolean(document.querySelector('.npl-icon-options input[type="file"]'))`), 'playlist icon upload option missing');
+    await cdp.evaluate(`(()=>{const canvas=document.createElement('canvas');canvas.width=canvas.height=128;const ctx=canvas.getContext('2d');ctx.fillStyle='#02ff40';ctx.fillRect(0,0,128,128);const bytes=Uint8Array.from(atob(canvas.toDataURL('image/png').split(',')[1]),c=>c.charCodeAt(0));const transfer=new DataTransfer();transfer.items.add(new File([bytes],'custom-icon.png',{type:'image/png'}));const input=document.querySelector('.npl-icon-options input[type="file"]');input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+    await until(() => cdp.evaluate(`(()=>{const img=document.querySelector('.npl-preview .playlist-icon-image');return img?.complete&&img.naturalWidth===96&&document.querySelector('.modal-foot button:last-child')?.disabled===false;})()`), 'uploaded icon did not finish resizing');
+    await cdp.evaluate(`document.querySelector('.modal-foot button:last-child').click()`);
+    await until(() => cdp.evaluate(`!document.querySelector('.npl-icon-options')`), 'playlist icon edit did not save');
+    const persistedPlaylists = (await (await fetch(`${base}/api/playlists`)).json()).playlists;
+    assert(persistedPlaylists.find(p=>p.name==='Artwork test')?.icon.startsWith('data:image/png;base64,'));
+    await cdp.send('Emulation.setDeviceMetricsOverride', {width: 1280, height: 820, deviceScaleFactor: 1, mobile: false});
+    const darkPng = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
+    await fs.writeFile('/tmp/vice-dark-theme.png', Buffer.from(darkPng.data, 'base64'));
+    lifecycle.darkTheme = true; lifecycle.playlistIcon = true;
   }
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));

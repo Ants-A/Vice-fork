@@ -1,6 +1,8 @@
-import {useEffect, useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 
 import {Modal} from './Modal';
+import {PlaylistMark} from './PlaylistMark';
+import {readPlaylistIcon} from '../lib/playlistIcon';
 import type {Playlist} from '../lib/types';
 import {t} from '../lib/i18n';
 
@@ -23,6 +25,7 @@ export interface PlaylistDraft {
   emoji: string;
   color1: string;
   color2: string;
+  icon: string;
 }
 
 export function PlaylistModal({
@@ -39,6 +42,9 @@ export function PlaylistModal({
 }) {
   const [name, setName] = useState('');
   const [emoji, setEmoji] = useState('');
+  const [icon, setIcon] = useState('');
+  const [readingIcon, setReadingIcon] = useState(false);
+  const iconInput = useRef<HTMLInputElement>(null);
   const [colorIndex, setColorIndex] = useState(DEFAULT_COLOR);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -50,6 +56,7 @@ export function PlaylistModal({
     if (editing) {
       setName(editing.name);
       setEmoji(editing.emoji ?? '');
+      setIcon(editing.icon ?? (editing.kind === 'auto' && !editing.emoji ? 'auto' : ''));
       const found = PLAYLIST_COLORS.findIndex(
         ([a, b]) => a === editing.color1 && b === editing.color2,
       );
@@ -57,6 +64,7 @@ export function PlaylistModal({
     } else {
       setName('');
       setEmoji('');
+      setIcon('');
       setColorIndex(DEFAULT_COLOR);
     }
   }, [open, editing]);
@@ -71,7 +79,7 @@ export function PlaylistModal({
     }
     setSaving(true);
     try {
-      await onSubmit({name: trimmed, emoji: emoji.trim(), color1: c1, color2: c2});
+      await onSubmit({name: trimmed, emoji: emoji.trim(), color1: c1, color2: c2, icon});
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -89,7 +97,7 @@ export function PlaylistModal({
           <button type="button" className="btn btn-quiet" onClick={onClose}>
             {t('common.cancel')}
           </button>
-          <button type="button" className="btn" onClick={() => void submit()} disabled={saving}>
+          <button type="button" className="btn" onClick={() => void submit()} disabled={saving || readingIcon}>
             {editing ? t('common.save') : t('common.create')}
           </button>
         </>
@@ -99,7 +107,7 @@ export function PlaylistModal({
           className="npl-preview"
           style={{background: `linear-gradient(150deg, ${c1}, ${c2})`}}
           aria-hidden="true">
-          {emoji.trim()}
+          <PlaylistMark playlist={{kind: editing?.kind ?? 'custom', game: editing?.game ?? null, name, emoji, icon}} size={44} />
         </span>
         <div className="npl-fields">
           <label className="field">
@@ -120,10 +128,33 @@ export function PlaylistModal({
               value={emoji}
               maxLength={4}
               placeholder={t('playlistModal.emojiPlaceholder')}
-              onChange={e => setEmoji(e.target.value)}
+              onChange={e => {setEmoji(e.target.value); setIcon('');}}
             />
           </label>
         </div>
+      </div>
+
+      <div className="npl-icon-options">
+        <span>{t('playlistModal.icon')}</span>
+        {editing?.kind === 'auto' ? (
+          <button type="button" className="btn btn-quiet" aria-pressed={icon === 'auto'}
+            onClick={() => setIcon('auto')}>{t('playlistModal.gameIcon')}</button>
+        ) : null}
+        <button type="button" className="btn btn-quiet" aria-pressed={icon.startsWith('data:')}
+          disabled={readingIcon} onClick={() => iconInput.current?.click()}>{t('playlistModal.chooseImage')}</button>
+        <button type="button" className="btn btn-quiet" aria-pressed={!icon}
+          onClick={() => setIcon('')}>{t('playlistModal.useEmoji')}</button>
+        <input ref={iconInput} type="file" accept="image/png,image/jpeg,image/webp" hidden
+          aria-label={t('playlistModal.chooseImage')}
+          onChange={async event => {
+            const file = event.currentTarget.files?.[0];
+            event.currentTarget.value = '';
+            if (!file) return;
+            setReadingIcon(true); setError(null);
+            try {setIcon(await readPlaylistIcon(file));}
+            catch (err) {setError((err as Error).message);}
+            finally {setReadingIcon(false);}
+          }} />
       </div>
 
       <div className="npl-colors" role="radiogroup" aria-label={t('playlistModal.colour')}>

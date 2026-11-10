@@ -61,6 +61,8 @@ export interface Highlight {
 export interface Playlist {
   id: string;
   kind: 'auto' | 'custom' | string;
+  /** Automatic game artwork, an uploaded PNG data URL, or empty for emoji. */
+  icon?: string;
   name: string;
   game: string | null;
   emoji: string | null;
@@ -186,6 +188,7 @@ export type WsMessage =
   | {type: 'session_start'}
   | {type: 'session_stop'}
   | {type: 'session_highlight'; time?: number}
+  | {type: 'trim_progress'; slug: string; progress: number; encoder?: string; phase: 'encoding' | 'uploading'}
   | {type: 'preview_ready'; slug: string}
   | {type: 'preview_progress' | 'discord_progress'; slug: string; progress: number; encoder?: string}
   | {type: 'export_progress'; [key: string]: unknown}

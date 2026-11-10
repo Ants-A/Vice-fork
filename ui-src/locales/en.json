@@ -178,6 +178,10 @@
     "errDiscordCopy": "Could not copy the clip for Discord"
   },
   "playlistModal": {
+    "icon": "Icon",
+    "gameIcon": "Game icon",
+    "chooseImage": "Choose image…",
+    "useEmoji": "Use emoji",
     "editTitle": "Edit playlist",
     "newTitle": "New playlist",
     "nameRequired": "Give the playlist a name",
@@ -366,6 +370,9 @@
     "preview": "Preview",
     "stop": "Stop",
     "loopHelp": "Loops the selection. Cut bounds are lossless.",
+    "encodingProgress": "Encoding · {encoder}",
+    "uploading": "Copying to library",
+    "finishing": "Finishing…",
     "saving": "Saving",
     "saveCopy": "Save as new clip",
     "savedCopy": "Trim saved as a new clip",
@@ -956,6 +963,10 @@
     "soundScreenshot": "Screenshot",
     "shareDiscordFile": "Share copies a Discord file",
     "shareDiscordFileHelp": "On: the Share button copies the clip itself, shrunk to fit Discord's free upload limit, ready to paste into a message. Off: it copies the share link. Right-click Share for the other one either way.",
+    "theme": "Theme",
+    "themeHelp": "Light keeps the current look. Dark uses much darker backgrounds and surfaces.",
+    "themeLight": "Light",
+    "themeDark": "Dark",
     "uiScale": "UI scale",
     "uiScaleHelp": "Make text, buttons and panels larger in the desktop client. Browser tabs use your browser’s zoom. Changes apply immediately and are remembered.",
     "scaleFailed": "Could not save UI scale"

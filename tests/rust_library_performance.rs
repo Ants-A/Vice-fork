@@ -271,3 +271,60 @@ async fn thumbnail_does_not_wait_for_metadata_queue() -> Result<()> {
     details.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn playlist_artwork_does_not_probe_or_remux_the_video_library() -> Result<()> {
+    let library = Library::start(3, true, "0.05").await?;
+    let created: Value = library
+        .client
+        .post(format!("{}/api/playlists", library.base))
+        .json(&json!({"name":"Artwork","icon":"auto"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let pid = created["playlist"]["id"].as_str().context("playlist id")?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let log_path = library.root.path().join("probes.log");
+    assert!(
+        std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .is_empty(),
+        "creating an empty playlist must not probe every recording"
+    );
+    library
+        .client
+        .post(format!("{}/api/playlists/{pid}/clips", library.base))
+        .json(&json!({"slug":"clip-0"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !before.is_empty(),
+        "adding a member must update its portable membership"
+    );
+    assert!(
+        !before.contains("clip-1.mp4") && !before.contains("clip-2.mp4"),
+        "membership updates should touch only affected clips: {before}"
+    );
+    let updated: Value = library
+        .client
+        .patch(format!("{}/api/playlists/{pid}", library.base))
+        .json(&json!({"icon":"","name":"Artwork"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(updated["playlist"]["icon"], "");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        std::fs::read_to_string(&log_path).unwrap_or_default(),
+        before,
+        "choosing a playlist icon must not read or rewrite its recordings"
+    );
+    Ok(())
+}

@@ -1,3 +1,4 @@
+import {PlaylistMark} from '../components/PlaylistMark';
 import {useMemo, useState} from 'react';
 
 import {useStore} from '../state/store';
@@ -15,7 +16,7 @@ import {t, tNode} from '../lib/i18n';
 import {ClipCard} from '../components/ClipCard';
 import {Tile, ActionTile} from '../components/Tile';
 import {Modal} from '../components/Modal';
-import {IconClips, IconPlaylist, IconSettings} from '../components/Icons';
+import {IconClips, IconSettings} from '../components/Icons';
 
 const ROW_LIMIT = 8;
 
@@ -506,7 +507,7 @@ function PlaylistChip({
       onClick={onOpen}
       {...drop.props}>
       <span className="playlist-chip-mark" aria-hidden="true">
-        {playlist.emoji || <IconPlaylist size={15} />}
+        {<PlaylistMark playlist={playlist} size={26} />}
       </span>
       <span className="playlist-chip-text">
         <b>{playlist.name}</b>

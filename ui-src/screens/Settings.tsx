@@ -1134,6 +1134,19 @@ export function Settings() {
 
         {/* ── Appearance ────────────────────────────────────────── */}
         <Card id="appearance" title={t('settings.secAppearance')} register={register('appearance')}>
+          <Row label={t('settings.theme')} help={t('settings.themeHelp')}>
+            <Select
+              label={t('settings.theme')}
+              value={config?.ui?.theme === 'dark' ? 'dark' : 'light'}
+              options={[["light", t('settings.themeLight')], ["dark", t('settings.themeDark')]]}
+              onChange={theme => {
+                void saveConfig({ui: {theme}}).catch(err =>
+                  notify({kind: 'error', title: t('events.notSaved'), detail: err.message, tone: 'error', holdMs: 6000}),
+                );
+              }}
+            />
+          </Row>
+
           <Row label={t('settings.uiScale')} help={t('settings.uiScaleHelp')}>
             <Select
               label={t('settings.uiScale')}

@@ -1,3 +1,4 @@
+import {PlaylistMark} from '../components/PlaylistMark';
 import {useEffect, useRef, useState} from 'react';
 
 import {useStore} from '../state/store';
@@ -54,6 +55,9 @@ export function Clips() {
   }, [currentPlaylistId, searchQuery]);
 
   useEffect(() => {
+    // Kept-alive galleries have zero bounds when another screen is visible.
+    // Treating those bounds as a near-bottom scroll builds the entire library.
+    if (state.view !== 'clips') return;
     const node = loadMoreRef.current;
     if (!node) return;
     const root = node.closest('.frame-content');
@@ -63,6 +67,7 @@ export function Clips() {
     const check = () => {
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
+        if (!node.getClientRects().length) return;
         const bounds = node.getBoundingClientRect();
         const viewport = root?.getBoundingClientRect();
         if (bounds.top <= (viewport?.bottom ?? window.innerHeight) + 1200 &&
@@ -82,7 +87,7 @@ export function Clips() {
       window.removeEventListener('resize', check);
       cancelAnimationFrame(frame);
     };
-  }, [clipLimit, visibleClips.length]);
+  }, [clipLimit, visibleClips.length, state.view]);
 
   const fail = (title: string) => (err: Error) =>
     notify({kind: 'error', title, detail: err.message, tone: 'error', holdMs: 7000});
@@ -158,7 +163,7 @@ export function Clips() {
       <header className="clips-head">
         <div className="clips-title">
           <h1>
-            {playlist?.emoji ? <span className="clips-emoji">{playlist.emoji}</span> : null}
+            {playlist ? <span className="clips-emoji"><PlaylistMark playlist={playlist} size={28} /></span> : null}
             {title}
           </h1>
           <p>{subtitle}</p>

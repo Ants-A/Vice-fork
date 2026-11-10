@@ -39,6 +39,9 @@
     bg = BG[name];
     ac = AC[name];
   }
+  try {
+    if (localStorage.getItem('vice-appearance') === 'dark') bg = '#040506';
+  } catch (e) { /* Keep the default appearance when storage is unavailable. */ }
   var root = document.documentElement.style;
   root.setProperty('--vice-bg', bg);
   root.setProperty('--boot-accent', ac);

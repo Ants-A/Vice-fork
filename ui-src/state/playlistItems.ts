@@ -1,5 +1,6 @@
-import {useCallback} from 'react';
+import {useCallback, createElement} from 'react';
 
+import {PlaylistMark} from '../components/PlaylistMark';
 import {api} from '../lib/api';
 import {t} from '../lib/i18n';
 import type {Clip} from '../lib/types';
@@ -25,7 +26,7 @@ export function usePlaylistToggleItems(): (clip: Clip) => MenuItem[] {
           label: inIt
             ? t('card.removeFrom', {playlist: playlist.name})
             : t('card.addTo', {playlist: playlist.name}),
-          mark: inIt ? '✓' : (playlist.emoji ?? undefined),
+          mark: inIt ? '✓' : createElement(PlaylistMark, {playlist, size: 16}),
           onSelect: () => {
             const call = inIt
               ? api.removeClipFromPlaylist(playlist.id, clip.slug)

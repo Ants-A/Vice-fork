@@ -69,3 +69,16 @@ export function relativeTime(isoTimestamp: string | null | undefined): string {
   if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
   return new Date(then).toLocaleDateString();
 }
+
+// Reuse the formatter across the gallery. toLocaleDateString(options) creates
+// an expensive Intl formatter for every card on each mount.
+let cardDateFormatter: Intl.DateTimeFormat | undefined;
+export function formatCardDate(timestamp: string | null | undefined): string {
+  if (!timestamp) return '';
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return '';
+  cardDateFormatter ??= new Intl.DateTimeFormat(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+  return cardDateFormatter.format(date);
+}

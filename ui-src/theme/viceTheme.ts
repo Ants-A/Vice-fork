@@ -3,6 +3,7 @@ import {defineTheme} from '@astryxdesign/core/theme';
 import {neutralTheme} from '../../src/themes/neutral/neutralTheme';
 import {ACCENTS, type AccentName, type AccentRamp} from './accents';
 import {deriveAccent} from './deriveAccent';
+import {darkRamp, type Appearance} from './appearance';
 
 /**
  * The five shipped swatches, or a colour the user picked.
@@ -61,8 +62,8 @@ function accentTheme(name: string, a: AccentRamp) {
       // being touched, and the ones that need a specific role reach for the
       // --vice-* properties below.
       //
-      // Dark-only app, but both slots are filled so a light render never falls
-      // back to neutral's grayscale.
+      // Appearance uses a complete palette; both Astryx slots carry it so
+      // native controls and overlays always inherit the selected colours.
       '--color-accent': [a.base, a.base],
       '--color-text-accent': [a.base, a.base],
       '--color-icon-accent': [a.base, a.base],
@@ -180,8 +181,26 @@ export function customAccent(seed: string): {
   return {ramp, theme, failures};
 }
 
+const darkThemes = new WeakMap<AccentRamp, {ramp: AccentRamp; theme: ReturnType<typeof accentTheme>}>();
+
 /** The ramp and theme for whatever the user has chosen. */
 export function resolveAccent(
+  accent: AccentChoice,
+  seed: string | null,
+  appearance: Appearance = 'light',
+): {ramp: AccentRamp; theme: ReturnType<typeof accentTheme>} {
+  const selected = resolveLightAccent(accent, seed);
+  if (appearance === 'light') return selected;
+  let dark = darkThemes.get(selected.ramp);
+  if (!dark) {
+    const ramp = darkRamp(selected.ramp);
+    dark = {ramp, theme: accentTheme(`${accent}-dark`, ramp)};
+    darkThemes.set(selected.ramp, dark);
+  }
+  return dark;
+}
+
+function resolveLightAccent(
   accent: AccentChoice,
   seed: string | null,
 ): {ramp: AccentRamp; theme: ReturnType<typeof accentTheme>} {

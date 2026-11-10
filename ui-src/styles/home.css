@@ -250,8 +250,14 @@ kbd {
 
 .clip-row {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, max(280px, calc((100% - 3 * var(--spacing-3)) / 4))), 1fr));
   gap: var(--spacing-3);
+}
+
+@media (max-width: 1280px) {
+  .clip-row {
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, max(280px, calc((100% - var(--spacing-3)) / 2))), 1fr));
+  }
 }
 
 /* ── clip card ──────────────────────────────────────────────────── */
@@ -307,7 +313,7 @@ kbd {
   transition: opacity var(--duration-fast) var(--ease-standard);
 }
 
-.clip-thumb:hover .clip-preview {
+.clip-thumb:hover .clip-preview[data-ready] {
   opacity: 1;
 }
 

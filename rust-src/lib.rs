@@ -9,6 +9,7 @@ pub mod hotkey;
 pub mod keys;
 pub mod media;
 pub mod platform_info;
+pub mod playlist_icons;
 pub mod playlists;
 pub mod recorder;
 pub mod runtime;

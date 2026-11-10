@@ -443,6 +443,39 @@ pub async fn trim_range_with_metadata(
     before: &MediaInfo,
     tags: &HashMap<String, String>,
 ) -> Result<MediaInfo> {
+    trim_range_with_runner(
+        source,
+        target,
+        start,
+        end,
+        before,
+        tags,
+        |args| async move {
+            let output = run_command(&args, 900.0).await?;
+            if !output.status.success() {
+                bail!("{}", String::from_utf8_lossy(&output.stderr));
+            }
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// The server supplies a runner to report actual encoder/progress while the
+/// same validated trim path remains usable by CLI and integration tests.
+pub async fn trim_range_with_runner<F, Fut>(
+    source: &Path,
+    target: &Path,
+    start: f64,
+    end: f64,
+    before: &MediaInfo,
+    tags: &HashMap<String, String>,
+    mut run: F,
+) -> Result<MediaInfo>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
         bail!("invalid trim range");
     }
@@ -504,9 +537,7 @@ pub async fn trim_range_with_metadata(
     // Most slider cuts start between keyframes. Do not copy an entire large
     // interval only to discover at validation that it needs encoding anyway.
     if starts_on_keyframe(source, start).await
-        && run_command(&make(None), 120.0)
-            .await
-            .is_ok_and(|out| out.status.success())
+        && run(make(None)).await.is_ok()
         && let Some(info) = validated_trim(target, duration).await
     {
         return Ok(info);
@@ -525,20 +556,18 @@ pub async fn trim_range_with_metadata(
     // Hardware support is confirmed by a real encode, then the selected cut
     // is decoded before accepting it. A runtime GPU failure can safely fall
     // through to the original software command without touching the source.
-    for args in crate::encoding::command_candidates(&make(Some(preferred))).await {
-        match run_command(&args, 900.0).await {
-            Ok(output) if output.status.success() => {
+    for args in crate::encoding::trim_command_candidates(&make(Some(preferred))).await {
+        let encoder = crate::encoding::video_encoder(&args)
+            .unwrap_or("unknown")
+            .to_owned();
+        tracing::info!(%encoder, gpu_decode=args.iter().any(|arg| arg == "-hwaccel"), "Trimming video");
+        match run(args).await {
+            Ok(()) => {
                 if let Some(info) = validated_trim(target, duration).await {
                     return Ok(info);
                 }
                 reason =
                     "the trimmed file does not decode correctly; the original has been kept".into();
-            }
-            Ok(output) => {
-                reason = String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(500)
-                    .collect()
             }
             Err(error) => reason = error.to_string(),
         }

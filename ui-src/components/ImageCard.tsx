@@ -1,7 +1,7 @@
 import {useState} from 'react';
 
 import {endClipDrag, startImageDrag} from '../lib/clipDrag';
-import {formatBytes} from '../lib/format';
+import {formatBytes, formatCardDate} from '../lib/format';
 import {imageTitle, type Image} from '../lib/types';
 import {t} from '../lib/i18n';
 import {InlineRename} from './InlineRename';
@@ -44,14 +44,7 @@ export function ImageCard({
   };
 
   const meta = [
-    image.created_at
-      ? new Date(image.created_at).toLocaleDateString(undefined, {
-          month: 'short',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-        })
-      : '',
+    formatCardDate(image.created_at),
     image.width ? `${image.width}x${image.height}` : '',
     image.size ? formatBytes(image.size) : '',
   ]
@@ -82,7 +75,7 @@ export function ImageCard({
         onClick={() => actions.onOpen?.(image)}
         aria-label={t('images.openTitle', {name: imageTitle(image)})}>
         {image.thumb_url && failedThumb !== image.thumb_url ? (
-          <img src={image.thumb_url} loading="lazy" alt="" draggable={false}
+          <img src={image.thumb_url} loading="lazy" decoding="async" alt="" draggable={false}
             onError={() => setFailedThumb(image.thumb_url ?? null)} />
         ) : (
           <span className="clip-thumb-empty" aria-hidden="true"><IconImages size={32} /></span>

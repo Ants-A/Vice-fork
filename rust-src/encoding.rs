@@ -271,6 +271,90 @@ pub async fn command_candidates(args: &[String]) -> Vec<Vec<String>> {
     commands
 }
 
+/// Plain cuts have no software filters: keep decoded frames on the same GPU
+/// used by the encoder. Unsupported input codecs/bit depths retry GPU encoding
+/// with software decoding, then the original CPU command.
+pub async fn trim_command_candidates(args: &[String]) -> Vec<Vec<String>> {
+    let Some(family) = job_family(args) else {
+        return vec![args.to_vec()];
+    };
+    let mut commands = vec![];
+    for encoder in probed(family)
+        .await
+        .into_iter()
+        .filter(VideoEncoder::is_hardware)
+    {
+        if let Ok(command) = rewrite_trim_args(args, &encoder) {
+            commands.push(command);
+        }
+        if let Ok(command) = rewrite_video_args(args, &encoder) {
+            commands.push(command);
+        }
+    }
+    commands.push(args.to_vec());
+    commands
+}
+fn rewrite_trim_args(args: &[String], encoder: &VideoEncoder) -> Result<Vec<String>> {
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-vf" | "-filter:v" | "-filter_complex" | "-hwaccel" | "-pix_fmt" | "-pix_fmt:v"
+        )
+    }) {
+        bail!("direct GPU trim requires an unfiltered input");
+    }
+    let mut command = rewrite_video_args(args, encoder)?;
+    let (accel, device) = match &encoder.hardware {
+        Hardware::Nvenc => ("cuda", "0".to_owned()),
+        Hardware::Vaapi(device) => ("vaapi", device.clone()),
+        Hardware::Qsv(_) => ("qsv", "vice_encode".into()),
+        Hardware::Vulkan(_) => ("vulkan", "vice_encode".into()),
+        Hardware::Cpu => bail!("not a GPU encoder"),
+    };
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < command.len() {
+        let option = command[index].as_str();
+        // rewrite_video_args adds uploads for CPU-decoded input. Hardware
+        // decoded frames already have the encoder's native surface format.
+        if matches!(option, "-vf" | "-filter_hw_device" | "-vaapi_device") {
+            index += 2;
+            continue;
+        }
+        if option == "-preset" {
+            let preset = match encoder.hardware {
+                Hardware::Nvenc => "p4",
+                Hardware::Qsv(_) => "fast",
+                _ => &command[index + 1],
+            };
+            result.extend([command[index].clone(), preset.to_owned()]);
+            index += 2;
+            continue;
+        }
+        result.push(command[index].clone());
+        index += 1;
+    }
+    command = result;
+    let input = command
+        .iter()
+        .position(|arg| arg == "-i")
+        .context("trim input")?;
+    command.splice(
+        input..input,
+        [
+            "-hwaccel".into(),
+            accel.into(),
+            "-hwaccel_device".into(),
+            device,
+            "-hwaccel_output_format".into(),
+            accel.into(),
+            "-extra_hw_frames".into(),
+            "16".into(),
+        ],
+    );
+    Ok(command)
+}
+
 fn rewrite_decode_args(args: &[String], hardware: &Hardware) -> Result<Vec<String>> {
     let input = args
         .iter()
@@ -762,6 +846,73 @@ mod tests {
             "-y",
             "output.mp4",
         ])
+    }
+    #[test]
+    fn gpu_trims_keep_frames_on_device_and_preserve_selected_interval() {
+        let original = strings(&[
+            "ffmpeg",
+            "-ss",
+            "1.25",
+            "-i",
+            "source.mp4",
+            "-ss",
+            "0",
+            "-t",
+            "4.5",
+            "-map",
+            "0",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "copy",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "out.mp4",
+        ]);
+        for hardware in [
+            Hardware::Nvenc,
+            Hardware::Vaapi("/dev/dri/renderD128".into()),
+            Hardware::Qsv("/dev/dri/renderD128".into()),
+            Hardware::Vulkan(0),
+        ] {
+            let name = match hardware {
+                Hardware::Nvenc => "h264_nvenc",
+                Hardware::Vaapi(_) => "h264_vaapi",
+                Hardware::Qsv(_) => "h264_qsv",
+                _ => "h264_vulkan",
+            };
+            let command =
+                rewrite_trim_args(&original, &encoder(name, hardware, Family::H264)).unwrap();
+            assert_eq!(value(&command, &["-ss"]), Some("1.25"));
+            assert_eq!(value(&command, &["-t"]), Some("4.5"));
+            assert_eq!(value(&command, &["-c:a"]), Some("copy"));
+            assert_eq!(value(&command, &["-map"]), Some("0"));
+            assert!(
+                !command
+                    .iter()
+                    .any(|arg| arg.contains("hwupload") || arg.contains("hwdownload"))
+            );
+            assert!(
+                command
+                    .iter()
+                    .position(|arg| arg == "-hwaccel_output_format")
+                    .unwrap()
+                    < command.iter().position(|arg| arg == "-i").unwrap()
+            );
+            assert_eq!(command.last(), original.last());
+        }
+        let mut filtered = original;
+        filtered.splice(1..1, ["-vf".into(), "scale=1280:720".into()]);
+        assert!(
+            rewrite_trim_args(
+                &filtered,
+                &encoder("h264_nvenc", Hardware::Nvenc, Family::H264)
+            )
+            .is_err(),
+            "software filters must retain their normal upload path"
+        );
     }
     #[test]
     fn discord_nvenc_preserves_exact_bitrate_budget() {

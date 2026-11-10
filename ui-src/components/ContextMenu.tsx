@@ -1,9 +1,9 @@
-import {useEffect, useLayoutEffect, useRef, useState} from 'react';
+import {useEffect, useLayoutEffect, useRef, useState, type ReactNode} from 'react';
 
 export interface MenuItem {
   id: string;
   label?: string;
-  mark?: string;
+  mark?: ReactNode;
   disabled?: boolean;
   danger?: boolean;
   /** A rule between groups. Carries no label and cannot be chosen. */
