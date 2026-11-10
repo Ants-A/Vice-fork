@@ -23,3 +23,5 @@ pub mod tray;
 pub mod encoding;
 
 pub mod stream_preview;
+
+pub mod media_stream;

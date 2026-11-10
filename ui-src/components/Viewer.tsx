@@ -1,4 +1,3 @@
-import {preferSmallerPreview} from '../lib/mediaSupport';
 import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
 
 import {api} from '../lib/api';
@@ -132,7 +131,7 @@ export function Viewer(props: ViewerProps) {
   const [preparing, setPreparing] = useState(false);
   const [previewProgress, setPreviewProgress] = useState<number | null>(null);
   const [quality, setQuality] = useState<{slug: string; smaller: boolean} | null>(null);
-  const smaller = Boolean(clip && (quality?.slug === clip.slug ? quality.smaller : preferSmallerPreview(clip.size, clip.duration)));
+  const smaller = Boolean(clip && quality?.slug === clip.slug && quality.smaller);
   const source = playbackUrl(clip, smaller);
   const buffer = useVideoBuffer(videoRef, props.clip !== null, source, clip?.duration ?? 0);
   useEffect(() => {setPreviewProgress(null);}, [source, props.clip?.slug]);
@@ -197,6 +196,8 @@ export function Viewer(props: ViewerProps) {
       return;
     }
     video.pause();
+    video.volume = volume;
+    video.muted = muted;
     video.src = src;
     video.load();
     setPreparing(clipNeedsProxy(clip) || smaller);
@@ -629,6 +630,7 @@ export function Viewer(props: ViewerProps) {
               ref={videoRef}
               className="viewer-video"
               playsInline
+              preload="auto"
               onTimeUpdate={e =>
                 setPosition({
                   current: e.currentTarget.currentTime,

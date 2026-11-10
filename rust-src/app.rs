@@ -60,6 +60,18 @@ fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--key-overlay") {
         return vice::key_overlay::run();
     }
+    // WebKitGTK's download buffer otherwise waits for up to five seconds of
+    // media after an underflow. Keep native startup/rebuffering responsive,
+    // independently of the server's larger read-ahead window. This shared
+    // WebKit GStreamer setting applies to GTK as well as WPE:
+    // Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+    // (configureDownloadBuffer). Preserve an explicit environment override.
+    if std::env::var_os("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC").is_none() {
+        // The application is still single-threaded, before GTK/WebKit starts.
+        unsafe {
+            std::env::set_var("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC", "1000000000");
+        }
+    }
     // WebKit uses GStreamer's autoplugger. Apply the persisted decode preference
     // before either GTK or a WebKit subprocess starts. See:
     // https://gstreamer.freedesktop.org/documentation/tutorials/playback/hardware-accelerated-video-decoding.html

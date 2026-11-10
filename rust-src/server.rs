@@ -834,12 +834,12 @@ async fn file(path: PathBuf, req: Request<Body>) -> ApiResult {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| ["mp4", "mkv", "mov", "webm", "m4a", "aac", "ogg"].contains(&e));
+    if media {
+        return crate::media_stream::serve(path, req)
+            .await
+            .map_err(ApiError::from);
+    }
     let service = tower_http::services::ServeFile::new(path);
-    let service = if media {
-        service.with_buf_chunk_size(1024 * 1024)
-    } else {
-        service
-    };
     let response = service
         .oneshot(req)
         .await

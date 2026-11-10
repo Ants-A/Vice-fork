@@ -1,3 +1,4 @@
+import {stopHoverPreview} from '../lib/hoverPreview';
 import {
   createContext,
   useCallback,
@@ -51,7 +52,7 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
   const openViewer = useCallback((slug: string) => {
     // Card previews keep decoding behind the scrim otherwise, and they are
     // muted, so nothing on screen would explain the extra load.
-    document.querySelectorAll<HTMLVideoElement>('video.clip-preview').forEach(v => v.pause());
+    stopHoverPreview();
     setViewerSlug(slug);
   }, []);
 
@@ -65,7 +66,7 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
     return () => {live = false;};
   }, [viewerSlug, dispatch]);
 
-  const openTrim = useCallback((slug: string) => setTrimSlug(slug), []);
+  const openTrim = useCallback((slug: string) => {stopHoverPreview(); setTrimSlug(slug);}, []);
 
   // Highlights belong to the clip on screen, so they reload whenever it does.
   useEffect(() => {
@@ -151,7 +152,7 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
     (clip: Clip) => void runShare(clip, discordFile, notify, setManualCopy),
     [discordFile, notify],
   );
-  const shareMenu = useCallback((clip: Clip) => setShareSlug(clip.slug), []);
+  const shareMenu = useCallback((clip: Clip) => {stopHoverPreview(); setShareSlug(clip.slug);}, []);
 
   const copyLink = useCallback(
     (clip: Clip) => void copyShareLink(clip, notify, setManualCopy),

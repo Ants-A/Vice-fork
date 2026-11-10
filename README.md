@@ -80,7 +80,7 @@ The native window has no system title bar. **Settings → Appearance → UI scal
 
 Video conversions try GPU encoders that pass a real capability check, then fall back to software if a job fails. This includes Discord-sized copies, timeline exports, preview conversions, and re-encoded trims. Audio operations and stream-copy remuxes retain their existing paths. `vice doctor` lists working GPU encoders.
 
-Playback shows buffered ranges and preparation progress. Previews stream during conversion and support range requests once cached. Large high-bitrate recordings default to a smaller preview, with **Original quality** available in the viewer. Engines without H.264 support use a WebM preview. Clip metadata and thumbnails are cached by file identity so large libraries do not need repeated probes.
+Playback shows buffered ranges and preparation progress. Previews stream during conversion and support range requests once cached. Playable recordings stream at their original quality with bounded read-ahead. **Smaller preview** is optional. Hover previews stop their downloads when the viewer opens. Native hardware decoding is enabled by default; Arch installs include `gst-plugin-va` for VA-API decoding on AMD and Intel. Engines without H.264 support use a WebM preview. Clip metadata and thumbnails are cached by file identity so large libraries do not need repeated probes.
 
 The interface retains the clip and image libraries, playlists, highlights, trim and rename controls, screenshots and frame capture, sharing, and the multi-track timeline editor. Exports use FFmpeg for video, text, transitions, detached audio, and optional recorded keys.
 

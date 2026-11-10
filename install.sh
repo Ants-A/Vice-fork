@@ -68,23 +68,23 @@ if ((install_deps)); then
         pacman_flags=(); (( !assume_yes )) || pacman_flags+=(--noconfirm)
         sudo pacman -S --needed "${pacman_flags[@]}" \
             base-devel rust cargo libayatana-appindicator gtk-layer-shell gtk3 webkit2gtk-4.1 ffmpeg gpu-screen-recorder \
-            gst-plugins-base gst-plugins-good gst-libav wl-clipboard xclip xdotool xorg-xprop wmctrl cloudflared
+            gst-plugins-base gst-plugins-good gst-plugin-va gst-libav wl-clipboard xclip xdotool xorg-xprop wmctrl cloudflared
     elif command -v apt-get >/dev/null; then
         sudo apt-get update
         apt_flags=(); (( !assume_yes )) || apt_flags+=(-y)
         sudo apt-get install "${apt_flags[@]}" build-essential pkg-config cargo rustc \
             libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-1 libgtk-layer-shell0 ffmpeg gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good gstreamer1.0-libav wl-clipboard xclip xdotool x11-utils wmctrl
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav wl-clipboard xclip xdotool x11-utils wmctrl
     elif command -v dnf >/dev/null; then
         dnf_flags=(); (( !assume_yes )) || dnf_flags+=(-y)
         sudo dnf install "${dnf_flags[@]}" gcc gcc-c++ pkgconf-pkg-config rust cargo \
             gtk3-devel webkit2gtk4.1-devel libayatana-appindicator-gtk3 gtk-layer-shell ffmpeg-free gstreamer1-plugins-base \
-            gstreamer1-plugins-good gstreamer1-plugin-libav wl-clipboard xclip xdotool xprop wmctrl
+            gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugin-libav wl-clipboard xclip xdotool xprop wmctrl
     elif command -v zypper >/dev/null; then
         zypper_flags=(); (( !assume_yes )) || zypper_flags+=(--non-interactive)
         sudo zypper "${zypper_flags[@]}" install gcc gcc-c++ pkgconf-pkg-config rust cargo \
             gtk3-devel webkit2gtk3-devel libappindicator3-1 gtk-layer-shell ffmpeg gstreamer-plugins-base \
-            gstreamer-plugins-good gstreamer-plugins-libav wl-clipboard xclip xdotool xprop wmctrl
+            gstreamer-plugins-good gstreamer-plugins-bad gstreamer-plugins-libav wl-clipboard xclip xdotool xprop wmctrl
     else
         printf 'No supported package manager. Install Rust, pkg-config, GTK3, WebKit2GTK 4.1 and FFmpeg, then use --no-deps.\n' >&2
         exit 1

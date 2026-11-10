@@ -147,9 +147,8 @@
   height: 24px;
 }
 
-/* Visible while paused, and on hover so the target is findable either way. */
-.viewer-play[data-paused],
-.viewer-stage:hover .viewer-play {
+/* Keep the picture clear during playback, including while hovered. */
+.viewer-play[data-paused] {
   opacity: 1;
   transform: scale(1);
 }
@@ -855,18 +854,9 @@ kbd {
   height: 74px;
 }
 
-/* Idle: the pointer has not moved for a few seconds. The play button is only
-   on screen because the cursor is over the stage, and at window size it always
-   is, so it never went away and sat over the middle of the clip. Paused is
-   different and keeps its button: that one is telling you why nothing is
-   moving. */
+/* Expanded playback hides the cursor and controls while idle. */
 .viewer-stage[data-idle] {
   cursor: none;
-}
-
-.viewer-stage[data-idle]:hover .viewer-play:not([data-paused]) {
-  opacity: 0;
-  transform: scale(0.85);
 }
 
 .viewer-stage[data-idle] .viewer-expanded-bar {

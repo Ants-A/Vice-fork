@@ -133,7 +133,7 @@ export function draftFromConfig(config: Config): Draft {
     display: str(r.display, ''),
     followMouse: Boolean(r.follow_mouse_display),
     windowCapture: Boolean(r.window_capture),
-    hardwareDecode: Boolean(ui.hardware_video_decode),
+    hardwareDecode: ui.hardware_video_decode !== false,
 
     captureAudio: r.capture_audio !== false,
     captureMic: Boolean(r.capture_microphone),

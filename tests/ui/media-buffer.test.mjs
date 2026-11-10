@@ -7,7 +7,7 @@ const load = async path => {
   return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 };
 const {bufferSnapshot} = await load('../../ui-src/lib/mediaBuffer.ts');
-const {supportsAnyVideo, previewFormat, preferSmallerPreview} = await load('../../ui-src/lib/mediaSupport.ts');
+const {supportsAnyVideo, previewFormat} = await load('../../ui-src/lib/mediaSupport.ts');
 
 test('seeking counts disconnected ranges without pretending gaps are buffered', () => {
   const state = bufferSnapshot([{start: 0, end: 10}, {start: 40, end: 50}], 100, 45);
@@ -39,9 +39,8 @@ test('codec support tries baseline and main rather than one high profile', () =>
   assert.equal(supportsAnyVideo(() => '', ['high', 'baseline']), false);
 });
 
-test('large high-bitrate recordings default to a smaller preview', () => {
-  assert.equal(preferSmallerPreview(340 * 1024 * 1024, 60), true);
-  assert.equal(preferSmallerPreview(20 * 1024 * 1024, 60), false);
-  assert.equal(preferSmallerPreview(340 * 1024 * 1024, 1200), false);
-  assert.equal(preferSmallerPreview(340 * 1024 * 1024, null), false);
+test('supported recordings use the original unless a smaller preview is explicitly requested', () => {
+  assert.equal(previewFormat('h264', true, false, true), null);
+  assert.equal(previewFormat('h264', true, false, true, true), 'mp4');
+  assert.equal(previewFormat('hevc', true, true, true), null);
 });

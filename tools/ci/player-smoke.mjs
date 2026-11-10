@@ -22,7 +22,8 @@ const screenshot = process.env.VICE_SMOKE_SCREENSHOT || path.join(os.tmpdir(), '
 let daemon, browser, cdp;
 let daemonLog = '', browserLog = '';
 const diagnostics = [];
-const autoPreview = process.env.VICE_SMOKE_MODE === "auto";
+const original = ["auto", "original"].includes(process.env.VICE_SMOKE_MODE);
+const autoPreview = original;
 const forceWebm = !autoPreview && process.env.VICE_SMOKE_MODE !== "small";
 const previewQuery = forceWebm ? "webm" : "small";
 const activity = [];
@@ -99,7 +100,7 @@ async function stop(child) {
 }
 try {
   for (const name of ['run', 'clips', 'images', 'bin', 'tmp']) await fs.mkdir(path.join(root, name));
-  const fixture = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=15', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '8', '-c:v', 'libx264', '-threads', '1', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', '-y', path.join(root, 'clips/smoke.mp4')], {encoding: 'utf8'});
+  const fixture = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', `testsrc2=size=${original ? '1280x720:rate=60' : '320x180:rate=15'}`, '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '8', '-c:v', 'libx264', '-preset', 'ultrafast', ...(original ? ['-b:v', '45M', '-minrate', '45M', '-maxrate', '45M', '-bufsize', '90M', '-x264-params', 'nal-hrd=cbr:force-cfr=1'] : []), '-threads', '1', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', '-y', path.join(root, 'clips/smoke.mp4')], {encoding: 'utf8'});
   assert.equal(fixture.status, 0, fixture.stderr);
   if (autoPreview) {
     const file = await fs.open(path.join(root, 'clips/smoke.mp4'), 'r+');
@@ -170,34 +171,59 @@ esac
   await until(() => cdp.evaluate(`Boolean(document.querySelector('.clip-card .clip-duration')?.textContent && !document.querySelector('.tutorial'))`), 'clip card and duration did not render');
   if (forceWebm) assert.equal(await cdp.evaluate(`document.createElement('video').canPlayType('video/mp4; codecs="avc1.640028"')`), '');
   assert.notEqual(await cdp.evaluate(`document.createElement('video').canPlayType('video/webm; codecs="vp8, opus"')`), '');
+  if (original) {
+    // A large file over a link with latency must stay original and avoid any
+    // conversion work. This catches the previous automatic 720p regression.
+    await cdp.send('Network.emulateNetworkConditions', {offline: false, latency: 60, downloadThroughput: 12_500_000, uploadThroughput: 12_500_000});
+  }
   viewerOpened=true;
+  const openedAt = Date.now();
   await cdp.evaluate(`document.querySelector('.clip-card .clip-thumb').click()`);
   if (!forceWebm && !autoPreview) {
     await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Smaller preview'))`), 'smaller preview control did not render');
     await cdp.evaluate(`window.__viceSmoke.bufferObserved=false;Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Smaller preview').click()`);
   }
-  await until(() => cdp.evaluate(`window.__viceSmoke.bufferObserved`), 'waiting state never displayed its buffering progress');
-  await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return Boolean(v&&v.currentSrc.includes('proxy=${previewQuery}')&&v.videoWidth>0&&v.currentTime>0&&!v.paused&&!v.error);})()`), 'WebM fallback never reached active video playback', 60000);
-  const initialCache = await fs.readdir(path.join(root, 'cache/proxies'));
-  assert(initialCache.some(name => name.startsWith('.vice-stream-')), 'playback must begin before the encoder finishes');
-  assert(!initialCache.some(name => !name.startsWith('.')), 'first playback must not wait for the completed preview');
-  const fullDuration = await cdp.evaluate(`document.querySelector('.viewer-timebadge').textContent`);
-  assert(fullDuration.includes('/ 8s'), `preview must show full clip duration: ${fullDuration}`);
-  await until(async () => (await fs.readdir(path.join(root, 'cache/proxies'))).some(name => !name.startsWith('.')), 'preview cache never completed');
-  await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return v && Number.isFinite(v.duration) && v.duration > 7;})()`), 'completed preview did not expose its full seekable duration');
-  const range = await fetch(`${base}/v/smoke?proxy=${previewQuery}`, {headers: {Range: 'bytes=0-1023'}});
+  if (!original) await until(() => cdp.evaluate(`window.__viceSmoke.bufferObserved`), 'waiting state never displayed its buffering progress');
+  await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return Boolean(v&&${original ? "!v.currentSrc.includes('proxy=')" : "v.currentSrc.includes('proxy=" + previewQuery + "')"}&&v.videoWidth>0&&v.currentTime>0&&!v.paused&&!v.error);})()`), 'WebM fallback never reached active video playback', 60000);
+  const firstFrameMs = Date.now() - openedAt;
+  const stage = await cdp.evaluate(`(()=>{const r=document.querySelector('.viewer-stage').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+  await cdp.send('Input.dispatchMouseEvent', {type: 'mouseMoved', ...stage});
+  await delay(400);
+  assert.equal(await cdp.evaluate(`getComputedStyle(document.querySelector('.viewer-play')).opacity`), '0', 'central control must stay hidden during playback, even under the pointer');
+  await cdp.evaluate(`document.querySelector('.viewer-video').pause()`);
+  await until(() => cdp.evaluate(`Number(getComputedStyle(document.querySelector('.viewer-play')).opacity) > 0.99`), 'paused player did not show the central control');
+  await cdp.evaluate(`document.querySelector('.viewer-video').play()`);
+
+  if (original) {
+    assert(firstFrameMs < 3000, `original playback took ${firstFrameMs} ms`);
+    assert(!requests.some(url => /[?&]proxy=/.test(url)), 'original playback must not start a conversion');
+  }
+  if (original) {
+    await until(() => cdp.evaluate(`document.querySelector('.viewer-video').currentTime > 6`), 'high-bitrate original did not sustain playback', 15000);
+    assert.equal(await cdp.evaluate(`Array.from(document.querySelectorAll('video.clip-preview')).some(v => v.getAttribute('src'))`), false, 'hover players must release downloads when the viewer opens');
+  }
+  if (!original) {
+    const initialCache = await fs.readdir(path.join(root, 'cache/proxies'));
+    assert(initialCache.some(name => name.startsWith('.vice-stream-')), 'playback must begin before the encoder finishes');
+    assert(!initialCache.some(name => !name.startsWith('.')), 'first playback must not wait for the completed preview');
+    const fullDuration = await cdp.evaluate(`document.querySelector('.viewer-timebadge').textContent`);
+    assert(fullDuration.includes('/ 8s'), `preview must show full clip duration: ${fullDuration}`);
+    await until(async () => (await fs.readdir(path.join(root, 'cache/proxies'))).some(name => !name.startsWith('.')), 'preview cache never completed');
+    await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return v && Number.isFinite(v.duration) && v.duration > 7;})()`), 'completed preview did not expose its full seekable duration');
+  }
+  const range = await fetch(`${base}/v/smoke${original ? '' : '?proxy=' + previewQuery}`, {headers: {Range: 'bytes=0-1023'}});
   assert.equal(range.status, 206, 'completed previews must support range requests');
   assert.equal((await range.arrayBuffer()).byteLength, 1024);
   await until(() => cdp.evaluate(`Boolean(document.querySelector('.viewer-buffered')?.getBoundingClientRect().width > 0)`), 'buffered timeline never rendered');
   const result = await cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return {source:v.currentSrc,width:v.videoWidth,height:v.videoHeight,duration:v.duration,currentTime:v.currentTime,error:v.error,bufferObserved:window.__viceSmoke.bufferObserved,bufferedColor:getComputedStyle(document.querySelector('.viewer-buffered')).backgroundColor,cardDuration:document.querySelector('.clip-card .clip-duration').textContent,banners:document.querySelector('.banners')?.innerText||''};})()`);
-  assert(result.source.includes(`proxy=${previewQuery}`));
+  assert(original ? !result.source.includes('proxy=') : result.source.includes(`proxy=${previewQuery}`));
   assert.notEqual(result.bufferedColor, 'rgba(0, 0, 0, 0)', 'buffered timeline is invisible');
-  assert(requests.some(url => url.includes(`proxy=${previewQuery}`)), 'browser never requested the selected preview');
+  if (!original) assert(requests.some(url => url.includes(`proxy=${previewQuery}`)), 'browser never requested the selected preview');
   assert.equal(result.banners.trim(), '', `unexpected hard warning: ${result.banners}`);
   assert.equal(diagnostics.length, 0, JSON.stringify(diagnostics));
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));
-  console.log(JSON.stringify({ok: true, playedBeforeConversionFinished: true, automaticSmallerPreview: autoPreview, rangeRequests: true, ...result, screenshot}, null, 2));
+  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
   if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }

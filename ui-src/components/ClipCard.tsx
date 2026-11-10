@@ -1,3 +1,4 @@
+import {startHoverPreview, stopHoverPreview} from '../lib/hoverPreview';
 import {memo, useEffect, useRef, useState} from 'react';
 
 import {endClipDrag, startClipDrag} from '../lib/clipDrag';
@@ -7,16 +8,6 @@ import {H264_SUPPORTED} from '../lib/env';
 import {playbackUrl, clipNeedsProxy} from '../lib/playback';
 import {t} from '../lib/i18n';
 import {InlineRename} from './InlineRename';
-
-/**
- * A video holds its decoded buffer for as long as a source is attached, so an
- * element that carries src from the moment the card is built gets a media
- * player whether or not it is ever hovered. The URL is parked until hover and
- * dropped again once the pointer has been gone a moment. Waiting rather than
- * releasing on the spot means sweeping across the grid, or coming straight
- * back to the card you just left, does not pay to attach twice.
- */
-const PREVIEW_RELEASE_MS = 4000;
 
 /**
  * Missing thumbnails are generated lazily, but the server deliberately drops
@@ -61,7 +52,6 @@ export const ClipCard = memo(function ClipCard({
   draggable?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const releaseTimer = useRef<number | undefined>(undefined);
   const thumbTimer = useRef<number | undefined>(undefined);
   const thumbAttempts = useRef(0);
   const [previewFailed, setPreviewFailed] = useState(false);
@@ -78,7 +68,10 @@ export const ClipCard = memo(function ClipCard({
   const broken = clip.unreadable;
   const canPreview = H264_SUPPORTED && !clipNeedsProxy(clip) && !broken && !previewFailed && Boolean(clip.thumb_url);
 
-  useEffect(() => () => window.clearTimeout(releaseTimer.current), []);
+  useEffect(() => {
+    const video = videoRef.current;
+    return () => {if (video) stopHoverPreview(video);};
+  }, [canPreview]);
 
   useEffect(() => {
     // A rename or a trim gives the clip a new thumbnail revision. Start over,
@@ -108,30 +101,12 @@ export const ClipCard = memo(function ClipCard({
 
   const attachPreview = () => {
     const video = videoRef.current;
-    if (!video || !canPreview) return;
-    window.clearTimeout(releaseTimer.current);
-    // Same source the viewer uses, so an H.265 library previews through the
-    // proxy instead of showing a black card.
-    if (!video.getAttribute('src')) video.src = playbackUrl(clip);
-    void video.play().catch(() => setPreviewFailed(true));
+    if (video && canPreview) startHoverPreview(video, playbackUrl(clip), () => setPreviewFailed(true));
   };
 
   const releasePreview = () => {
     const video = videoRef.current;
-    if (!video) return;
-    video.pause();
-    window.clearTimeout(releaseTimer.current);
-    releaseTimer.current = window.setTimeout(() => {
-      if (!video.getAttribute('src')) return;
-      video.removeAttribute('src');
-      // Dropping the attribute alone leaves the buffer in place; load() is
-      // what tears the player down.
-      try {
-        video.load();
-      } catch (err) {
-        console.debug('Releasing the preview buffer failed', err);
-      }
-    }, PREVIEW_RELEASE_MS);
+    if (video) stopHoverPreview(video);
   };
 
   const meta = [
@@ -198,7 +173,7 @@ export const ClipCard = memo(function ClipCard({
             loop
             playsInline
             preload="none"
-            onError={() => setPreviewFailed(true)}
+            onError={e => {if (e.currentTarget.getAttribute('src')) setPreviewFailed(true);}}
           />
         ) : null}
 

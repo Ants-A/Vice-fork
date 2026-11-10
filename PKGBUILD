@@ -9,7 +9,7 @@ license=('GPL-3.0-or-later')
 install=vice-clipper.install
 depends=(
     'systemd' 'libayatana-appindicator' 'gtk-layer-shell' 'gtk3' 'webkit2gtk-4.1' 'ffmpeg' 'gpu-screen-recorder'
-    'gstreamer' 'gst-plugins-base' 'gst-plugins-good' 'gst-libav'
+    'gstreamer' 'gst-plugins-base' 'gst-plugins-good' 'gst-plugin-va' 'gst-libav'
     'wl-clipboard' 'xclip' 'cloudflared' 'xdotool' 'xorg-xprop' 'wmctrl'
 )
 optdepends=(

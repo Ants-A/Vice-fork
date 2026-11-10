@@ -76,7 +76,7 @@ section!(NotificationsConfig {
     screenshot_sound: Option<String> = None
 });
 section!(UIConfig {
-    hardware_video_decode: bool = false,
+    hardware_video_decode: bool = true,
     scale: f64 = 1.0
 });
 section!(OverlayConfig {
@@ -385,6 +385,7 @@ mod tests {
     }
     #[test]
     fn ui_scale_is_persistent_and_bounded() {
+        assert!(Config::default().ui.hardware_video_decode);
         let mut cfg = Config::default();
         cfg.ui.scale = 1.5;
         let parsed: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
