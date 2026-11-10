@@ -187,7 +187,7 @@ export type WsMessage =
   | {type: 'session_stop'}
   | {type: 'session_highlight'; time?: number}
   | {type: 'preview_ready'; slug: string}
-  | {type: 'preview_progress' | 'discord_progress'; slug: string; progress: number}
+  | {type: 'preview_progress' | 'discord_progress'; slug: string; progress: number; encoder?: string}
   | {type: 'export_progress'; [key: string]: unknown}
   | {type: 'export_done'; [key: string]: unknown}
   | {type: 'export_error'; [key: string]: unknown}

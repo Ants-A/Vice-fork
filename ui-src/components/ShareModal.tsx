@@ -40,8 +40,12 @@ export function ShareModal({
   const [copy, setCopy] = useState<DiscordCopy | null>(null);
   const [failed, setFailed] = useState('');
   const [progress, setProgress] = useState<number | null>(null);
+  const [encoder, setEncoder] = useState('');
   useEffect(() => onWsMessage(msg => {
-    if (msg.type === 'discord_progress' && msg.slug === clip?.slug) setProgress(msg.progress);
+    if (msg.type === 'discord_progress' && msg.slug === clip?.slug) {
+      setProgress(msg.progress);
+      setEncoder(msg.encoder ?? '');
+    }
   }), [clip?.slug]);
   const slug = clip?.slug;
 
@@ -53,6 +57,7 @@ export function ShareModal({
     setCopy(null);
     setFailed('');
     setProgress(null);
+    setEncoder('');
     void api
       .discordCopy(slug)
       .then(result => {
@@ -134,7 +139,7 @@ export function ShareModal({
                 ? `${t('viewer.shareDragHint')} · ${t('viewer.shareDiscordSize', {
                     size: formatBytes(copy.size),
                   })}`
-                : t('viewer.sharePreparing')}
+                : `${t('viewer.sharePreparing')}${progress === null ? '' : ` · ${Math.round(progress * 100)}%`}${encoder ? ` · ${encoder}` : ''}`}
           </span>
         </div>
 

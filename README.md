@@ -78,7 +78,7 @@ F9 saves a clip; a double tap starts or ends a session. During a session, a sing
 
 The native window has no system title bar. **Settings → Appearance → UI scale** adjusts the desktop client from 75% to 200% and remembers the choice.
 
-Video conversions try GPU encoders that pass a real capability check, then fall back to software if a job fails. This includes Discord-sized copies, timeline exports, preview conversions, and re-encoded trims. Audio operations and stream-copy remuxes retain their existing paths. `vice doctor` lists working GPU encoders.
+Video conversions try GPU encoders that pass a real capability check, then fall back to software if a job fails. This includes Discord-sized copies, timeline exports, preview conversions, and re-encoded trims. Audio operations and stream-copy remuxes retain their existing paths. `vice doctor` lists working GPU encoders. Discord-copy progress shows the active encoder, and newly encoded copies use 8-bit H.264 for compatibility.
 
 Playback shows buffered ranges and preparation progress. Previews stream during conversion and support range requests once cached. Playable recordings stream at their original quality with bounded read-ahead. **Smaller preview** is optional. Hover previews stop their downloads when the viewer opens. Native hardware decoding is enabled by default; Arch installs include `gst-plugin-va` for VA-API decoding on AMD and Intel. Engines without H.264 support use a WebM preview. Clip metadata and thumbnails are cached by file identity so large libraries do not need repeated probes.
 

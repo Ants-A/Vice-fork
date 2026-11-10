@@ -221,9 +221,23 @@ esac
   if (!original) assert(requests.some(url => url.includes(`proxy=${previewQuery}`)), 'browser never requested the selected preview');
   assert.equal(result.banners.trim(), '', `unexpected hard warning: ${result.banners}`);
   assert.equal(diagnostics.length, 0, JSON.stringify(diagnostics));
+  let discordEncoderShown = null;
+  if (process.env.VICE_SMOKE_DISCORD_PROGRESS === '1') {
+    await cdp.evaluate(`
+      window.__viceDiscordEncoder=null;
+      new MutationObserver(()=>{
+        const label=document.querySelector('.share-sheet')?.innerText.match(/h264_(?:nvenc|vaapi|qsv|vulkan)|libx264/);
+        if(label)window.__viceDiscordEncoder=label[0];
+      }).observe(document.body,{childList:true,subtree:true,characterData:true});
+      Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Share').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}));
+    `);
+    await until(() => cdp.evaluate(`window.__viceDiscordEncoder`), 'Discord conversion never displayed its actual encoder');
+    await until(() => cdp.evaluate(`Boolean(document.querySelector('.share-copy-file:not(:disabled)'))`), 'Discord conversion did not publish a completed copy', 60000);
+    discordEncoderShown = await cdp.evaluate(`window.__viceDiscordEncoder`);
+  }
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));
-  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
+  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
   if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }

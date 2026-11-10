@@ -1289,13 +1289,16 @@ async fn run_preview_process(
 ) -> Result<()> {
     let mut failure = None;
     for candidate in crate::encoding::command_candidates(&args).await {
+        let encoder = crate::encoding::video_encoder(&candidate)
+            .unwrap_or("unknown")
+            .to_owned();
         match run_media_attempt(state, source, candidate, seconds, event).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 if *state.shutdown.borrow() {
                     return Err(error);
                 }
-                tracing::warn!(%error, "preview encoder failed; trying the next available encoder");
+                tracing::warn!(%encoder, %error, task=event, "video encoder failed; trying the next available encoder");
                 failure = Some(error);
             }
         }
@@ -1329,6 +1332,10 @@ async fn run_media_attempt(
         .await
         .and_then(|v| v["duration"].as_f64())
         .unwrap_or(0.0);
+    let encoder = crate::encoding::video_encoder(&args)
+        .unwrap_or("unknown")
+        .to_owned();
+    tracing::info!(%encoder, task=event, %slug, "Preparing video conversion");
     args.splice(1..1, ["-progress".into(), "pipe:1".into()]);
     let mut command = Command::new(&args[0]);
     command
@@ -1340,7 +1347,7 @@ async fn run_media_attempt(
     let mut child = command.spawn()?;
     let mut lines = BufReader::new(child.stdout.take().context("preview stdout")?).lines();
     let mut stderr = child.stderr.take().context("preview stderr")?;
-    state.emit(json!({"type":event,"slug":slug,"progress":0.0}));
+    state.emit(json!({"type":event,"slug":slug,"encoder":encoder,"progress":0.0}));
     let advanced = std::sync::Mutex::new(Instant::now());
     let progress = async {
         let mut furthest = -1.0_f64;
@@ -1352,7 +1359,9 @@ async fn run_media_attempt(
                     *advanced.lock().unwrap() = Instant::now();
                 }
                 if last.elapsed() >= Duration::from_millis(200) {
-                    state.emit(json!({"type":event,"slug":slug,"progress":fraction}));
+                    state.emit(
+                        json!({"type":event,"slug":slug,"encoder":encoder,"progress":fraction}),
+                    );
                     last = Instant::now();
                 }
             }
@@ -1397,7 +1406,7 @@ async fn run_media_attempt(
             String::from_utf8_lossy(&errors)
         );
     }
-    state.emit(json!({"type":event,"slug":slug,"progress":1.0}));
+    state.emit(json!({"type":event,"slug":slug,"encoder":encoder,"progress":1.0}));
     Ok(())
 }
 pub async fn run_command(args: Vec<String>, seconds: u64) -> Result<()> {
@@ -2187,6 +2196,10 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         "scale='min(1280,iw)':-2".into(),
         "-c:v".into(),
         "libx264".into(),
+        // Discord-compatible 8-bit 4:2:0, including when the recording is
+        // 10-bit. Older NVIDIA cards cannot accept 10-bit H.264 encode input.
+        "-pix_fmt".into(),
+        "yuv420p".into(),
         "-preset".into(),
         "fast".into(),
         "-b:v".into(),

@@ -23,8 +23,25 @@ fn script(path: &Path, text: &str) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
     Ok(())
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Actual,
+    SimulatedNvenc,
+    SimulatedNvencFailure,
+}
 #[tokio::test]
 async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> Result<()> {
+    discord_case(Backend::Actual).await
+}
+#[tokio::test]
+async fn nvidia_minimum_resolution_probe_keeps_nvenc_for_discord_copy() -> Result<()> {
+    discord_case(Backend::SimulatedNvenc).await
+}
+#[tokio::test]
+async fn nvidia_job_failure_retries_cpu_and_reports_the_failed_encoder() -> Result<()> {
+    discord_case(Backend::SimulatedNvencFailure).await
+}
+async fn discord_case(backend: Backend) -> Result<()> {
     let Some(ffmpeg) = vice::runtime::which("ffmpeg") else {
         return Ok(());
     };
@@ -37,7 +54,9 @@ async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> R
         std::fs::create_dir(root.join(name))?;
     }
     let source = root.join("clips/clip.mp4");
-    if let Some(real_source) = std::env::var_os("VICE_TEST_DISCORD_SOURCE") {
+    if let Some(real_source) =
+        std::env::var_os("VICE_TEST_DISCORD_SOURCE").filter(|_| backend == Backend::Actual)
+    {
         std::fs::copy(real_source, &source)?;
     } else {
         let output = Command::new(&ffmpeg)
@@ -55,6 +74,12 @@ async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> R
                 "sine=frequency=440:duration=2",
                 "-c:v",
                 "libx264",
+                "-pix_fmt",
+                if backend == Backend::Actual {
+                    "yuv420p"
+                } else {
+                    "yuv420p10le"
+                },
                 "-preset",
                 "ultrafast",
                 "-c:a",
@@ -79,11 +104,75 @@ async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> R
     let original_size = std::fs::metadata(&source)?.len();
     let original_mtime = std::fs::metadata(&source)?.modified()?;
     let invocation_log = root.join("ffmpeg.log");
+    let forward = if backend == Backend::Actual {
+        ffmpeg.clone()
+    } else {
+        root.join("bin/nvenc-driver")
+    };
+    if backend != Backend::Actual {
+        // Simulate the NVIDIA size restriction and failure mode only. Successful
+        // NVENC requests are rendered by the real software encoder so ffprobe
+        // can validate the resulting video; this does not claim hardware testing.
+        script(
+            &forward,
+            r#"#!/bin/sh
+for argument do
+    if [ "$argument" = -encoders ]; then
+        printf ' V..... h264_nvenc NVIDIA NVENC H.264 encoder\n'
+        exit 0
+    fi
+done
+codec= input= pixel= previous=
+for argument do
+    [ "$previous" = -c:v ] && codec=$argument
+    [ "$previous" = -i ] && input=$argument
+    [ "$previous" = -pix_fmt ] && pixel=$argument
+    previous=$argument
+done
+if [ "$codec" = h264_nvenc ]; then
+    case "$input" in
+        color=*)
+            size=${input##*s=}
+            size=${size%%:*}
+            width=${size%x*}
+            height=${size#*x}
+            if [ "$width" -lt 145 ] || [ "$height" -lt 49 ]; then
+                echo 'NVENC: probe resolution is below hardware minimum' >&2
+                exit 1
+            fi
+            exit 0
+            ;;
+    esac
+    if [ "$pixel" != yuv420p ]; then
+        echo 'NVENC: 10-bit H.264 input is not supported on this GPU' >&2
+        exit 1
+    fi
+    if [ "$VICE_TEST_NVENC_FAIL" = 1 ]; then
+        echo 'simulated NVIDIA encoder initialization failure' >&2
+        exit 42
+    fi
+    count=$#
+    while [ "$count" -gt 0 ]; do
+        argument=$1
+        shift
+        count=$((count-1))
+        case "$argument" in
+            -c:v) shift; count=$((count-1)); set -- "$@" -c:v libx264 ;;
+            -preset) shift; count=$((count-1)); set -- "$@" -preset fast ;;
+            -rc) shift; count=$((count-1)) ;;
+            *) set -- "$@" "$argument" ;;
+        esac
+    done
+fi
+exec "$VICE_REAL_FFMPEG" "$@"
+"#,
+        )?;
+    }
     script(
         &root.join("bin/ffmpeg"),
         &format!(
             "#!/bin/sh\nprintf 'START\\t%s\\t%s\\n' \"$$\" \"$*\" >> \"$VICE_TEST_ENCODER_LOG\"\n'{}' \"$@\"\nresult=$?\nprintf 'END\\t%s\\t%s\\n' \"$$\" \"$result\" >> \"$VICE_TEST_ENCODER_LOG\"\nexit \"$result\"\n",
-            ffmpeg.to_string_lossy().replace('\'', "'\\''")
+            forward.to_string_lossy().replace('\'', "'\\''")
         ),
     )?;
     script(
@@ -120,6 +209,15 @@ async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> R
         .env("VICE_CACHE_DIR", root.join("cache"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
         .env("VICE_TEST_ENCODER_LOG", &invocation_log)
+        .env("VICE_REAL_FFMPEG", &ffmpeg)
+        .env(
+            "VICE_TEST_NVENC_FAIL",
+            if backend == Backend::SimulatedNvencFailure {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("VICE_TEST_CLIPBOARD", root.join("clipboard"))
         .env(
             "PATH",
@@ -173,6 +271,26 @@ async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> R
     assert_eq!(info.vcodec, "h264");
     assert_eq!(info.audio_streams, 1);
     assert!(info.duration > 1.8);
+    let pixel = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=pix_fmt",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(&path)
+        .output()?;
+    assert!(pixel.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&pixel.stdout).trim(),
+        "yuv420p",
+        "Discord copies must stay 8-bit, including from a 10-bit recording"
+    );
+
     assert!(std::fs::metadata(&path)?.len() <= vice::editor::DISCORD_MAX_BYTES);
     let encoded_mtime = std::fs::metadata(&path)?.modified()?;
     let log_before = std::fs::read_to_string(&invocation_log)?;
@@ -203,6 +321,25 @@ async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> R
         "Discord API conversion completed with {encoder}; valid H.264/audio copy stays under 20 MB"
     );
     let daemon_log = std::fs::read_to_string(root.join("daemon.log"))?;
+    match backend {
+        Backend::SimulatedNvenc => {
+            assert_eq!(
+                encoder, "h264_nvenc",
+                "a supported NVIDIA GPU must not be lost to an invalid tiny probe"
+            );
+            assert!(
+                !jobs.iter().any(|line| line.contains("-c:v libx264")),
+                "no CPU video encoding should be requested after successful NVENC"
+            );
+        }
+        Backend::SimulatedNvencFailure => {
+            assert!(jobs[0].contains("-c:v h264_nvenc"));
+            assert_eq!(encoder, "libx264");
+            assert!(daemon_log.contains("simulated NVIDIA encoder initialization failure"));
+            assert!(daemon_log.contains("encoder=h264_nvenc"));
+        }
+        Backend::Actual => {}
+    }
     if daemon_log
         .lines()
         .any(|line| line.contains("GPU video encoding available") && line.contains("h264_"))

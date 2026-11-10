@@ -85,6 +85,9 @@ fn encoder_position(args: &[String]) -> Option<usize> {
     args.iter()
         .position(|a| matches!(a.as_str(), "-c:v" | "-c:v:0" | "-codec:v" | "-vcodec"))
 }
+pub fn video_encoder(args: &[String]) -> Option<&str> {
+    args.get(encoder_position(args)? + 1).map(String::as_str)
+}
 fn family_for(codec: &str) -> Option<Family> {
     match codec {
         "libx264" => Some(Family::H264),
@@ -589,6 +592,11 @@ pub fn rewrite_video_args(args: &[String], encoder: &VideoEncoder) -> Result<Vec
 }
 
 async fn probe_encoder(encoder: &VideoEncoder) -> bool {
+    // Turing and newer NVENC hardware rejects 128-pixel-wide H.264 input
+    // (minimum width 145). A tiny invalid probe incorrectly disabled healthy
+    // NVIDIA cards for the daemon's entire lifetime. Keep this above the
+    // hardware minimum for every supported codec, with an explicit 8-bit input.
+    // https://forums.developer.nvidia.com/t/minimum-width-in-turing-gpus/155566
     let original = strings(&[
         "ffmpeg",
         "-hide_banner",
@@ -597,7 +605,9 @@ async fn probe_encoder(encoder: &VideoEncoder) -> bool {
         "-f",
         "lavfi",
         "-i",
-        "color=c=black:s=128x128:r=10",
+        "color=c=black:s=256x256:r=30",
+        "-pix_fmt",
+        "yuv420p",
         "-frames:v",
         "3",
         "-c:v",
@@ -767,6 +777,7 @@ mod tests {
         assert_eq!(value(&command, &["-c:v"]), Some("h264_nvenc"));
         assert!(!command.iter().any(|s| s == "-cq" || s == "-crf"));
         assert_eq!(value(&command, &["-c:a"]), Some("aac"));
+        assert_eq!(value(&command, &["-pix_fmt"]), Some("yuv420p"));
     }
     #[test]
     fn vaapi_upload_follows_all_cpu_filters() {

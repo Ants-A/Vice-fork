@@ -62,7 +62,7 @@ export async function shareClip(
   notify({kind: 'info', title: t('card.discordPreparing'), tone: 'neutral', holdMs: 600_000});
   const unsubscribe = onWsMessage(msg => {
     if (msg.type === 'discord_progress' && msg.slug === clip.slug) {
-      notify({kind: 'info', title: t('card.discordPreparing'), detail: `${Math.round(msg.progress * 100)}%`, tone: 'neutral', holdMs: 600_000});
+      notify({kind: 'info', title: t('card.discordPreparing'), detail: `${Math.round(msg.progress * 100)}%${msg.encoder ? ` · ${msg.encoder}` : ''}`, tone: 'neutral', holdMs: 600_000});
     }
   });
   try {
