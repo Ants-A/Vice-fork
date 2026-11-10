@@ -798,7 +798,7 @@
     "colour8": "8-bit (standard)",
     "colour10": "10-bit (HEVC or AV1)",
     "hardwareDecode": "Hardware video decoding",
-    "hardwareDecodeHelp": "Use your GPU to decode clips in the desktop window. Enabled by default; software decoding remains available for unsupported hardware. Changes take effect when you reopen Vice.",
+    "hardwareDecodeHelp": "Use GPU decoding where compatible. NVIDIA desktop playback uses a compatibility path to avoid green frames; recording and video conversions can still use NVENC. Changes take effect when you reopen Vice.",
     "backend": "Recording backend",
     "backendHelp": "Screen capture method",
     "backendWf": "wf-recorder (Wayland)",

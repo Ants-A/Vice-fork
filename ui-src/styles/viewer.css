@@ -20,6 +20,33 @@
   overflow: hidden;
 }
 
+/* Halve the previous outside gaps: at desktop sizes the 880px viewer's
+   horizontal margins become (viewport - 880px) / 4; small windows use half
+   the scrim's original padding. Keep controls inside short viewports. */
+.video-viewer-scrim {
+  padding: calc(var(--spacing-5) / 2);
+}
+
+.video-viewer-scrim .viewer-stack {
+  width: min(calc(50vw + 440px), 100%);
+  min-height: 0;
+}
+
+.video-viewer-scrim .viewer {
+  max-height: none;
+}
+
+.video-viewer-scrim .viewer-head,
+.video-viewer-scrim .viewer-bottom,
+.video-viewer-scrim .player-bar {
+  flex-shrink: 0;
+}
+
+.video-viewer-scrim .viewer-stage:not([data-expanded]) {
+  min-height: 0;
+  flex-shrink: 1;
+}
+
 .viewer-head {
   display: flex;
   align-items: center;

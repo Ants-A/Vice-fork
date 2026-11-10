@@ -197,6 +197,7 @@ export const ClipCard = memo(function ClipCard({
             className="clip-rename"
             label={t('card.nameLabel')}
             initial={clipTitle(clip)}
+            literal
             onCancel={stopRenaming}
             onSubmit={async name => {
               stopRenaming();

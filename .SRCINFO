@@ -20,6 +20,7 @@ pkgbase = vice-clipper
 	depends = gst-plugins-base
 	depends = gst-plugins-good
 	depends = gst-plugin-va
+	depends = gst-plugin-dav1d
 	depends = gst-libav
 	depends = wl-clipboard
 	depends = xclip

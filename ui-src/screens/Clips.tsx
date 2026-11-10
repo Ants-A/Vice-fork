@@ -57,16 +57,31 @@ export function Clips() {
     const node = loadMoreRef.current;
     if (!node) return;
     const root = node.closest('.frame-content');
-    const observer = new IntersectionObserver(
-      entries => {
-        if (entries.some(entry => entry.isIntersecting)) {
-          setClipLimit(limit => limit + CLIP_PAGE);
+    // Recheck on scrolling as well: inserting a newly saved card can move the
+    // sentinel without WebKit delivering another intersection notification.
+    let frame = 0;
+    const check = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const bounds = node.getBoundingClientRect();
+        const viewport = root?.getBoundingClientRect();
+        if (bounds.top <= (viewport?.bottom ?? window.innerHeight) + 1200 &&
+            bounds.bottom >= (viewport?.top ?? 0) - 1200) {
+          setClipLimit(limit => limit === clipLimit ? limit + CLIP_PAGE : limit);
         }
-      },
-      {root, rootMargin: '1200px 0px'},
-    );
+      });
+    };
+    const observer = new IntersectionObserver(check, {root, rootMargin: '1200px 0px'});
     observer.observe(node);
-    return () => observer.disconnect();
+    root?.addEventListener('scroll', check, {passive: true});
+    window.addEventListener('resize', check);
+    check();
+    return () => {
+      observer.disconnect();
+      root?.removeEventListener('scroll', check);
+      window.removeEventListener('resize', check);
+      cancelAnimationFrame(frame);
+    };
   }, [clipLimit, visibleClips.length]);
 
   const fail = (title: string) => (err: Error) =>

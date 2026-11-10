@@ -1,3 +1,4 @@
+import {stopHoverPreview} from '../lib/hoverPreview';
 import {createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode} from 'react';
 
 import {api} from '../lib/api';
@@ -127,7 +128,7 @@ export function AppFrame({children}: {children: ReactNode}) {
         onShowWhatsNew={notedVersion ? () => setWhatsNew(notedVersion) : undefined}
       />
       <Melt />
-      <div className="frame-content" ref={contentRef}
+      <div className="frame-content" ref={contentRef} onScroll={() => stopHoverPreview()}
         data-home-wide={state.view === 'home' && homeLayout !== 'narrow' || undefined}
         data-home-rail={state.view === 'home' && homeLayout === 'rail' || undefined}
         data-native={IS_NATIVE || undefined}>

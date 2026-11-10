@@ -1,3 +1,4 @@
+import {ListSnapshots} from '../lib/listSnapshots';
 import {
   createContext,
   useCallback,
@@ -122,9 +123,9 @@ type Action =
   | {
       type: 'loaded';
       config: Config;
-      clips: Clip[];
-      images: Image[];
-      playlists: Playlist[];
+      clips: Clip[] | null;
+      images: Image[] | null;
+      playlists: Playlist[] | null;
       status: Status;
     }
   | {type: 'loadFailed'; error: string}
@@ -139,9 +140,9 @@ type Action =
   | {type: 'setPlaylists'; playlists: Playlist[]}
   | {
       type: 'libraryReloaded';
-      clips: Clip[];
-      images: Image[];
-      playlists: Playlist[];
+      clips: Clip[] | null;
+      images: Image[] | null;
+      playlists: Playlist[] | null;
       status: Status;
     }
   | {type: 'event'; event: Omit<IslandEvent, 'id'>}
@@ -164,9 +165,9 @@ function reduce(state: State, action: Action): State {
         ready: true,
         loadError: null,
         config: action.config,
-        clips: action.clips,
-        images: action.images,
-        playlists: action.playlists,
+        clips: action.clips ?? state.clips,
+        images: action.images ?? state.images,
+        playlists: action.playlists ?? state.playlists,
         status: action.status,
         tunnelUrl: action.status.public_url ?? null,
         update: action.status.update ?? null,
@@ -223,9 +224,9 @@ function reduce(state: State, action: Action): State {
     case 'libraryReloaded':
       return {
         ...state,
-        clips: action.clips,
-        images: action.images,
-        playlists: action.playlists,
+        clips: action.clips ?? state.clips,
+        images: action.images ?? state.images,
+        playlists: action.playlists ?? state.playlists,
         status: action.status,
         tunnelUrl: action.status.public_url ?? state.tunnelUrl,
         update: action.status.update ?? state.update,
@@ -494,6 +495,25 @@ const StoreContext = createContext<Store | null>(null);
 export function StoreProvider({children}: {children: ReactNode}) {
   const [state, dispatch] = useReducer(reduce, initialState);
 
+  const clipSnapshots = useRef(new ListSnapshots<Clip>());
+  const imageSnapshots = useRef(new ListSnapshots<Image>());
+  const playlistEvents = useRef(0);
+  const loadClips = useCallback(async () => {
+    const mark = clipSnapshots.current.begin();
+    try {return clipSnapshots.current.finish(mark, await api.clips());}
+    catch (error) {clipSnapshots.current.finish(mark, null); throw error;}
+  }, []);
+  const loadImages = useCallback(async () => {
+    const mark = imageSnapshots.current.begin();
+    try {return imageSnapshots.current.finish(mark, await api.images());}
+    catch (error) {imageSnapshots.current.finish(mark, null); throw error;}
+  }, []);
+  const loadPlaylists = useCallback(async () => {
+    const seen = playlistEvents.current;
+    const list = await api.playlists();
+    return seen === playlistEvents.current ? list : null;
+  }, []);
+
   // First load. Everything the shell needs before it can show a screen.
   useEffect(() => {
     let cancelled = false;
@@ -501,9 +521,9 @@ export function StoreProvider({children}: {children: ReactNode}) {
       try {
         const [config, clips, images, playlists, status] = await Promise.all([
           api.getConfig(),
-          api.clips(),
-          api.images(),
-          api.playlists(),
+          loadClips(),
+          loadImages(),
+          loadPlaylists(),
           api.status(),
         ]);
         if (!cancelled) dispatch({type: 'loaded', config, clips, images, playlists, status});
@@ -539,9 +559,12 @@ export function StoreProvider({children}: {children: ReactNode}) {
   // Bumped by every picture event, so a list fetched before one can tell it is
   // out of date. Listing probes every file and takes about a second on a real
   // library, long enough to delete a picture while a stale copy is in flight.
-  const imageEvents = useRef(0);
   useEffect(() => connectWs(msg => {
-    if (msg.type === 'image_saved' || msg.type === 'image_deleted') imageEvents.current += 1;
+    if (msg.type === 'clip_saved') clipSnapshots.current.observe(msg.clip.slug, msg.clip);
+    if (msg.type === 'clip_deleted') clipSnapshots.current.observe(msg.slug, null);
+    if (msg.type === 'image_saved') imageSnapshots.current.observe(msg.image.slug, msg.image);
+    if (msg.type === 'image_deleted') imageSnapshots.current.observe(msg.slug, null);
+    if (msg.type === 'playlists_changed') playlistEvents.current++;
     // The daemon changed the config itself (the overlay was dragged, or its
     // key toggled it), so the copy here is stale.
     if (msg.type === 'config_changed') {
@@ -554,7 +577,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
       // The clip drive mounted after the window opened. Fetch the lists the
       // daemon just discovered; the alternative was an empty gallery until
       // the app was restarted.
-      void Promise.all([api.clips(), api.images(), api.playlists(), api.status()])
+      void Promise.all([loadClips(), loadImages(), loadPlaylists(), api.status()])
         .then(([clips, images, playlists, status]) =>
           dispatch({type: 'libraryReloaded', clips, images, playlists, status}),
         )
@@ -569,9 +592,9 @@ export function StoreProvider({children}: {children: ReactNode}) {
   useEffect(() => {
     if (!state.ready || state.clips.length > 0) return;
     const timer = window.setInterval(() => {
-      void Promise.all([api.clips(), api.images(), api.playlists(), api.status()])
+      void Promise.all([loadClips(), loadImages(), loadPlaylists(), api.status()])
         .then(([clips, images, playlists, status]) => {
-          if (clips.length) {
+          if (clips?.length) {
             dispatch({type: 'libraryReloaded', clips, images, playlists, status});
           }
         })
@@ -588,8 +611,8 @@ export function StoreProvider({children}: {children: ReactNode}) {
     let timer: number;
     const poll = async () => {
       try {
-        const clips = await api.clips();
-        if (!cancelled) dispatch({type: 'setClips', clips});
+        const clips = await loadClips();
+        if (!cancelled && clips) dispatch({type: 'setClips', clips});
       } catch (err) {console.debug('Refreshing clip details failed', err);}
       if (!cancelled) timer = window.setTimeout(poll, 5000);
     };
@@ -622,19 +645,19 @@ export function StoreProvider({children}: {children: ReactNode}) {
   }, [state.ready]);
 
   const refreshClips = useCallback(async () => {
-    dispatch({type: 'setClips', clips: await api.clips()});
-  }, []);
+    const clips = await loadClips();
+    if (clips) dispatch({type: 'setClips', clips});
+  }, [loadClips]);
 
   const refreshImages = useCallback(async () => {
-    const seen = imageEvents.current;
-    const images = await api.images();
-    // The events that arrived meanwhile are newer than this list and already applied.
-    if (imageEvents.current === seen) dispatch({type: 'setImages', images});
-  }, []);
+    const images = await loadImages();
+    if (images) dispatch({type: 'setImages', images});
+  }, [loadImages]);
 
   const refreshPlaylists = useCallback(async () => {
-    dispatch({type: 'setPlaylists', playlists: await api.playlists()});
-  }, []);
+    const playlists = await loadPlaylists();
+    if (playlists) dispatch({type: 'setPlaylists', playlists});
+  }, [loadPlaylists]);
 
   const notify = useCallback((event: Omit<IslandEvent, 'id'>) => {
     dispatch({type: 'event', event});

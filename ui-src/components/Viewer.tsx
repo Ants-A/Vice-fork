@@ -187,12 +187,15 @@ export function Viewer(props: ViewerProps) {
   // Reopening the clip that was last shown hands back the same object, so
   // open is a dependency too: the element is new and has no source (#249).
   const trimOpen = props.trimOpen;
+  const wasTrimming = useRef(trimOpen);
   useLayoutEffect(() => {
     const video = videoRef.current;
+    const resumeAfterTrim = wasTrimming.current && !trimOpen;
+    wasTrimming.current = trimOpen;
     if (!open || !video || !clip) return;
     const src = source;
     if (video.getAttribute('src') === src) {
-      if (!trimOpen) playQuietly(video);
+      if (resumeAfterTrim) playQuietly(video);
       return;
     }
     video.pause();
@@ -543,7 +546,7 @@ export function Viewer(props: ViewerProps) {
 
   return (
     <div
-      className="scrim viewer-scrim"
+      className="scrim viewer-scrim video-viewer-scrim"
       data-closing={closing || undefined}
       onMouseDown={e => e.target === e.currentTarget && onClose()}>
       <div className="viewer-stack">
@@ -560,6 +563,7 @@ export function Viewer(props: ViewerProps) {
                   className="viewer-rename"
                   label={t('card.nameLabel')}
                   initial={clipTitle(clip)}
+                  literal
                   onCancel={() => setRenamingTitle(false)}
                   onSubmit={name => {
                     setRenamingTitle(false);

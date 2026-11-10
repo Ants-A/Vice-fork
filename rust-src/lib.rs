@@ -25,3 +25,7 @@ pub mod encoding;
 pub mod stream_preview;
 
 pub mod media_stream;
+
+pub mod native_video;
+
+pub mod media_names;

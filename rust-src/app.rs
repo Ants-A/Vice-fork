@@ -72,28 +72,20 @@ fn main() -> Result<()> {
             std::env::set_var("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC", "1000000000");
         }
     }
-    // WebKit uses GStreamer's autoplugger. Apply the persisted decode preference
-    // before either GTK or a WebKit subprocess starts. See:
-    // https://gstreamer.freedesktop.org/documentation/tutorials/playback/hardware-accelerated-video-decoding.html
-    if !config::load()?.ui.hardware_video_decode {
-        let software = [
-            "avdec_h264",
-            "avdec_h265",
-            "avdec_av1",
-            "dav1ddec",
-            "avdec_vp9",
-        ];
-        let mut ranks = std::env::var("GST_PLUGIN_FEATURE_RANK").unwrap_or_default();
-        for decoder in software {
-            if !ranks.is_empty() {
-                ranks.push(',');
-            }
-            ranks.push_str(&format!("{decoder}:MAX"));
-        }
-        // This process is still single-threaded; children inherit these ranks.
+    let nvidia = vice::native_video::nvidia_gpu();
+    let ranks = std::env::var("GST_PLUGIN_FEATURE_RANK").unwrap_or_default();
+    for (key, value) in
+        vice::native_video::environment(config::load()?.ui.hardware_video_decode, nvidia, &ranks)
+    {
+        // Apply before GTK/WebKit or any video subprocess starts.
         unsafe {
-            std::env::set_var("GST_PLUGIN_FEATURE_RANK", ranks);
+            std::env::set_var(key, value);
         }
+    }
+    if nvidia {
+        eprintln!(
+            "[vice-app] NVIDIA compatibility playback: system-memory video frames; FFmpeg GPU encoding remains available"
+        );
     }
     let url = ensure_server()?;
     #[cfg(feature = "desktop")]

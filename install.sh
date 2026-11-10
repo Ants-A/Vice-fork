@@ -68,7 +68,7 @@ if ((install_deps)); then
         pacman_flags=(); (( !assume_yes )) || pacman_flags+=(--noconfirm)
         sudo pacman -S --needed "${pacman_flags[@]}" \
             base-devel rust cargo libayatana-appindicator gtk-layer-shell gtk3 webkit2gtk-4.1 ffmpeg gpu-screen-recorder \
-            gst-plugins-base gst-plugins-good gst-plugin-va gst-libav wl-clipboard xclip xdotool xorg-xprop wmctrl cloudflared
+            gst-plugins-base gst-plugins-good gst-plugin-va gst-plugin-dav1d gst-libav wl-clipboard xclip xdotool xorg-xprop wmctrl cloudflared
     elif command -v apt-get >/dev/null; then
         sudo apt-get update
         apt_flags=(); (( !assume_yes )) || apt_flags+=(-y)

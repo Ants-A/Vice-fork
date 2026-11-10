@@ -171,7 +171,7 @@ fn spawn(state: Shared, source: PathBuf, args: Vec<String>, job: Arc<PreviewJob>
                     if source_key != current { bail!("clip changed during preview preparation; reopen it"); }
                     tokio::fs::rename(&job.temporary,&job.target).await?;
                     job.phase.send_replace(Phase::Complete(i+1));
-                    state.emit(serde_json::json!({"type":"preview_ready","slug":source.file_stem().unwrap_or_default().to_string_lossy()}));
+                    state.emit(serde_json::json!({"type":"preview_ready","slug":state.media_id(&source, false).await}));
                     return Ok(());
                 },Err(error)=>{tracing::warn!(%error,"preview encoder failed; retrying");failure=Some(error);}}
             }

@@ -176,7 +176,7 @@ pub async fn run(open_ui: bool) -> Result<()> {
                         s.emit(json!({"type":"session_highlight","time":time,"label":label,"color":"#f59e0b"}));
                         crate::audio::play("highlight",cfg.notifications.sound_volume,cfg.notifications.highlight_sound.as_deref());return;
                     }
-                    if let Ok(path)=s.save_clip(Some(duration as u64)).await {let cfg=s.cfg.read().await.clone();if cfg.overlay.keys_in_clips{let _=crate::keys::save_sidecar(path.file_stem().unwrap().to_str().unwrap_or(""),&intervals);}}
+                    if let Ok(path)=s.save_clip(Some(duration as u64)).await {let cfg=s.cfg.read().await.clone();if cfg.overlay.keys_in_clips{let _=crate::keys::save_sidecar(&s.media_id(&path, false).await,&intervals);}}
                 });},
                 HotkeyEvent::SessionToggle=>{let s=state.clone();tokio::spawn(async move {if !hotkeys_suppressed(&s).await {let _=toggle_session(&s).await;}});},
                 HotkeyEvent::RecordingToggle=>{let s=state.clone();tokio::spawn(async move {
@@ -259,6 +259,7 @@ async fn toggle_session(state: &Shared) -> Result<()> {
         let mut highlights = state.session_highlights.lock().await;
         let entries = std::mem::take(&mut *highlights);
         drop(highlights);
+        state.saved(&p, false).await?;
         if !entries.is_empty() {
             let entries: Vec<_> = entries
                 .into_iter()
@@ -268,7 +269,7 @@ async fn toggle_session(state: &Shared) -> Result<()> {
                     value
                 })
                 .collect();
-            let slug = p.file_stem().context("session filename")?.to_string_lossy();
+            let slug = state.media_id(&p, false).await;
             server::write_json(
                 &server::data_dir()
                     .join("highlights")
@@ -276,7 +277,6 @@ async fn toggle_session(state: &Shared) -> Result<()> {
                 &json!(entries),
             )?;
         }
-        state.saved(&p, false).await?;
         crate::audio::play(
             "session_end",
             cfg.notifications.sound_volume,

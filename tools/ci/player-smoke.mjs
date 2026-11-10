@@ -109,7 +109,16 @@ try {
   }
   // This executable only answers capability probes and sleeps. It captures
   // no screen, audio, or input, and is never installed outside the temp tree.
-  await fs.writeFile(path.join(root, 'bin/gpu-screen-recorder'), '#!/bin/sh\ncase "$1" in\n--info) printf "section=video_codecs\\nh264\\n"; exit 0;;\n--help) printf "-w -f -r -c -a -o\\n"; exit 0;;\n--list-*) exit 0;;\nesac\ntrap "exit 0" INT TERM\nwhile :; do sleep 1 & wait $!; done\n', {mode: 0o755});
+  await fs.writeFile(path.join(root, 'bin/gpu-screen-recorder'), `#!/bin/sh
+case "$1" in
+--info) printf 'section=video_codecs\\nh264\\n'; exit 0;;
+--help) printf '%s\\n' '-w -f -r -c -a -o'; exit 0;;
+--list-*) exit 0;;
+esac
+trap 'printf partial > "$VICE_SMOKE_CLIPS/2026-replay.mp4"; sleep 2; cp "$VICE_SMOKE_FIXTURE" "$VICE_SMOKE_CLIPS/2026-replay.mp4"' USR1
+trap 'exit 0' INT TERM
+while :; do sleep 0.1 & wait $!; done
+`, {mode: 0o755});
   const ffmpegBinary = spawnSync('which', ['ffmpeg'], {encoding: 'utf8'}).stdout.trim();
   // Slow only preview encodes to real time. Playback must start while the
   // output is still incomplete, rather than passing from a completed cache.
@@ -123,7 +132,7 @@ esac
   const base = `http://127.0.0.1:${port}`;
   const config = `[recording]\nbackend="gsr"\ngsr_source="native"\ncapture_audio=false\n[output]\ndirectory=${JSON.stringify(path.join(root, 'clips'))}\nimage_directory=${JSON.stringify(path.join(root, 'images'))}\nauto_playlist_by_game=false\n[sharing]\nenabled=false\ncloudflare_tunnel=false\nport=${port}\n[discord]\nenabled=false\n[updates]\ncheck_on_start=false\n[hotkeys]\nclip=""\n[notifications]\nsound_volume=0.0\n`;
   await fs.writeFile(path.join(root, 'config.toml'), config);
-  const env = {...process.env, VICE_CONFIG: path.join(root, 'config.toml'), VICE_DATA_DIR: path.join(root, 'data'), VICE_CACHE_DIR: path.join(root, 'cache'), VICE_RESOURCE_DIR: path.join(repo, 'vice'), XDG_RUNTIME_DIR: path.join(root, 'run'), TMPDIR: path.join(root, 'tmp'), PATH: `${path.join(root, 'bin')}:${process.env.PATH}`};
+  const env = {...process.env, VICE_SMOKE_FIXTURE: path.join(root, 'clips/smoke.mp4'), VICE_SMOKE_CLIPS: path.join(root, 'clips'), VICE_CONFIG: path.join(root, 'config.toml'), VICE_DATA_DIR: path.join(root, 'data'), VICE_CACHE_DIR: path.join(root, 'cache'), VICE_RESOURCE_DIR: path.join(repo, 'vice'), XDG_RUNTIME_DIR: path.join(root, 'run'), TMPDIR: path.join(root, 'tmp'), PATH: `${path.join(root, 'bin')}:${process.env.PATH}`};
   delete env.INVOCATION_ID; delete env.JOURNAL_STREAM;
   daemon = spawn(binary, ['start', '--no-open-ui'], {env, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
   daemon.stdout.on('data', data => { daemonLog += data; }); daemon.stderr.on('data', data => { daemonLog += data; });
@@ -235,9 +244,79 @@ esac
     await until(() => cdp.evaluate(`Boolean(document.querySelector('.share-copy-file:not(:disabled)'))`), 'Discord conversion did not publish a completed copy', 60000);
     discordEncoderShown = await cdp.evaluate(`window.__viceDiscordEncoder`);
   }
+  const viewerLayouts = [];
+  if (original) {
+    for (const [width, height] of [[1920, 1080], [1280, 820], [800, 600]]) {
+      await cdp.send('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: false});
+      await delay(400);
+      const layout = await cdp.evaluate(`(()=>{
+        const rect=selector=>{const r=document.querySelector(selector).getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,bottom:r.bottom,right:r.right};};
+        return {stack:rect('.viewer-stack'),video:rect('.viewer-stage'),controls:rect('.player-bar'),actions:rect('.viewer-foot-btns'),close:rect('.viewer-head .modal-close'),padding:parseFloat(getComputedStyle(document.querySelector('.video-viewer-scrim')).paddingLeft)};
+      })()`);
+      const margin = Math.max(layout.padding, (width - 880) / 4);
+      assert(Math.abs(layout.stack.x - margin) < 1, `viewer should halve its old side margins at ${width}px: ${JSON.stringify(layout)}`);
+      for (const key of ['stack','video','controls','actions','close']) {
+        assert(layout[key].y >= layout.padding - 1 && layout[key].bottom <= height - layout.padding + 1, `${key} is clipped at ${width}x${height}: ${JSON.stringify(layout)}`);
+      }
+      assert(layout.video.height > 80, 'the enlarged viewer must retain visible video');
+      viewerLayouts.push({width, height, margin: layout.stack.x, videoWidth: layout.video.width, videoHeight: layout.video.height});
+      if (width === 1920) {
+        const large = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
+        await fs.writeFile('/tmp/vice-viewer-large.png', Buffer.from(large.data, 'base64'));
+      }
+    }
+  }
+  let lifecycle = null;
+  if (process.env.VICE_SMOKE_LIFECYCLE === '1') {
+    await cdp.evaluate(`document.querySelector('.viewer-head .modal-close').click()`);
+    await until(() => cdp.evaluate(`!document.querySelector('.viewer-video')`), 'viewer did not close');
+    await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='All Clips').click()`);
+    await Promise.all(Array.from({length: 100}, (_, i) => fs.link(path.join(root, 'clips/smoke.mp4'), path.join(root, `clips/gallery-${i}.mp4`))));
+    assert((await fetch(`${base}/api/library/rescan`, {method: 'POST'})).ok);
+    await until(() => cdp.evaluate(`document.querySelectorAll('.clip-card').length >= 96`), 'gallery did not refresh');
+    for (let i = 0; i < 5; i++) {
+      await cdp.evaluate(`{const pane=document.querySelector('.frame-content');pane.scrollTop=pane.scrollHeight;pane.dispatchEvent(new Event('scroll'));}`);
+      await delay(200);
+    }
+    await until(() => cdp.evaluate(`document.querySelectorAll('.clip-card').length === 101`), 'scrolling stopped at the first page');
+    assert((await fetch(`${base}/api/trigger`, {method: 'POST'})).ok);
+    await until(async () => {try {return (await fs.stat(path.join(root, 'clips/2026-replay.mp4'))).size === 7;} catch {return false;}}, 'fake replay never began writing');
+    const statusStarted = Date.now();
+    assert((await fetch(`${base}/api/status`)).ok);
+    const statusMs = Date.now() - statusStarted;
+    assert(statusMs < 500, `saving a replay blocked status for ${statusMs}ms`);
+    assert((await fetch(`${base}/api/library/rescan`, {method: 'POST'})).ok);
+    const during = await (await fetch(`${base}/api/clips`)).json();
+    assert.equal(during.clips.length, 101, 'unfinished replay leaked into the library');
+    await until(() => cdp.evaluate(`Array.from(document.querySelectorAll('.clip-name')).some(n=>n.textContent==='Vice_Clip_1')`), 'saved replay did not reach the gallery');
+    const clips = (await (await fetch(`${base}/api/clips`)).json()).clips;
+    const saved = clips.find(c => c.name === 'Vice_Clip_1.mp4');
+    assert(saved && saved.duration > 7, 'published replay must have its finalized duration');
+    await cdp.evaluate(`{const card=Array.from(document.querySelectorAll('.clip-card')).find(c=>c.querySelector('.clip-name')?.textContent==='Vice_Clip_1');card.querySelector('.clip-thumb').click();}`);
+    await until(() => cdp.evaluate(`{const v=document.querySelector('.viewer-video');v&&v.currentTime>0.2&&v.videoWidth>0&&!v.error}`), 'new replay stuck buffering', 30000);
+    await cdp.evaluate(`document.querySelector('.viewer-video').pause()`);
+    const after = saved.video_url;
+    const renamed = await (await fetch(`${base}/api/clips/${saved.slug}/rename`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:' .Exact name! #1?  '})})).json();
+    assert.equal(renamed.name, ' .Exact name! #1?  .mp4');
+    assert.equal(renamed.slug, saved.slug);
+    await delay(500);
+    assert(await cdp.evaluate(`document.querySelector('.viewer-video').paused`), 'metadata/rename update restarted paused playback');
+    const trimStarted = Date.now();
+    const replaced = await fetch(`${base}/api/clips/${saved.slug}/trim`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({start:0.25,end:1.75,copy:false})});
+    assert(replaced.ok, await replaced.text());
+    const trimmed = await (await fetch(`${base}/api/clips/${saved.slug}`)).json();
+    assert(Math.abs(trimmed.duration - 1.5) < 0.15, JSON.stringify(trimmed));
+    const trimMs = Date.now() - trimStarted;
+    const noOpStarted = Date.now();
+    assert((await fetch(`${base}/api/clips/${saved.slug}/trim`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({start:0,end:trimmed.duration,copy:false})})).ok);
+    const noOpMs = Date.now() - noOpStarted;
+    assert(noOpMs < 500, `unchanged trim took ${noOpMs}ms`);
+    assert.notEqual(trimmed.video_url, after, 'replace must invalidate the old playback revision');
+    lifecycle = {statusMs, galleryCards: 102, trimMs, noOpMs, literalName: renamed.name};
+  }
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));
-  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
+  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
   if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }

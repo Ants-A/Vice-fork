@@ -229,6 +229,7 @@ export function TrimModal({
                 className="trim-rename"
                 label={t('card.nameLabel')}
                 initial={pendingName ?? clipTitle(clip)}
+                literal
                 onCancel={() => setRenamingTitle(false)}
                 onSubmit={name => {
                   setRenamingTitle(false);

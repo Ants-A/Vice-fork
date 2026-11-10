@@ -505,7 +505,7 @@ function ExportModal({
   const summary = t('editor.exportSummary', {
     seconds: Math.round(duration),
     format: discordOptimized ? t('editor.exportFormatDiscord') : t('editor.exportFormatDefault'),
-    path: `${dir || t('editor.exportFolderUnpicked')}/${(name.trim() || 'Vice_Edit_N').replace(/\.mp4$/i, '')}.mp4`,
+    path: `${dir || t('editor.exportFolderUnpicked')}/${name ? `${name}.mp4` : 'Vice_Edit_N.mp4'}`,
   });
 
   const start = async () => {
@@ -522,7 +522,7 @@ function ExportModal({
       discord_optimized: discordOptimized,
       keys: projectHasKeys && showKeys,
     };
-    if (name.trim()) body.filename = name.trim();
+    if (name) body.filename = name;
     if (location === 'custom') body.path = custom.trim();
     try {
       const result = (await api.startExport(body)) as {

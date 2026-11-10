@@ -66,6 +66,10 @@ pub struct AppState {
     pub metadata: Mutex<HashMap<PathBuf, (u64, u128, Value)>>,
     pub media_jobs: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     pub edits: Mutex<()>,
+    pub clip_writing: std::sync::atomic::AtomicBool,
+    clip_saves: Mutex<()>,
+    status_cache: std::sync::Mutex<Option<Value>>,
+    managed_names: RwLock<crate::media_names::Names>,
     pub transcodes: Semaphore,
     pub preview_jobs: Mutex<HashMap<PathBuf, Arc<crate::stream_preview::PreviewJob>>>,
 }
@@ -209,13 +213,30 @@ impl AppState {
         let (events, _) = broadcast::channel(256);
         let (shutdown, _) = watch::channel(false);
         let port = cfg.sharing.port;
-        let (files, mut identities) = scan_indexed(
+        let (mut files, mut identities) = scan_indexed(
             &runtime::resolve_path(&cfg.output.directory),
             &["mp4", "mkv", "mov", "webm"],
         );
-        let (images, image_identities) = scan_indexed(
+        let (mut images, mut image_identities) = scan_indexed(
             &runtime::resolve_path(&cfg.output.image_directory),
             &["png", "jpg", "jpeg"],
+        );
+        let managed_names: crate::media_names::Names =
+            serde_json::from_value(read_json(&data_dir().join("media_names.json"), json!({})))
+                .unwrap_or_default();
+        crate::media_names::apply(
+            &managed_names,
+            &runtime::resolve_path(&cfg.output.directory),
+            false,
+            &mut files,
+            &mut identities,
+        );
+        crate::media_names::apply(
+            &managed_names,
+            &runtime::resolve_path(&cfg.output.image_directory),
+            true,
+            &mut images,
+            &mut image_identities,
         );
         identities.extend(image_identities);
         let (metadata, tags) =
@@ -259,6 +280,10 @@ impl AppState {
             metadata: Mutex::new(metadata),
             media_jobs: Mutex::new(HashMap::new()),
             edits: Mutex::new(()),
+            clip_writing: std::sync::atomic::AtomicBool::new(false),
+            clip_saves: Mutex::new(()),
+            status_cache: std::sync::Mutex::new(None),
+            managed_names: RwLock::new(managed_names),
             transcodes: Semaphore::new(1),
             preview_jobs: Mutex::new(HashMap::new()),
         })
@@ -267,6 +292,17 @@ impl AppState {
         let _ = self.events.send(value);
     }
     pub async fn rescan(&self) -> usize {
+        if self.clip_writing.load(std::sync::atomic::Ordering::Acquire) {
+            return 0;
+        }
+        let Ok(_edit) = self.edits.try_lock() else {
+            return 0;
+        };
+        let active_session = match self.recorder.try_lock() {
+            Ok(recorder) => recorder.session_output_path(),
+            Err(_) => return 0,
+        };
+        let managed = self.managed_names.read().await.clone();
         let cfg = self.cfg.read().await.clone();
         let directories = (
             runtime::resolve_path(&cfg.output.directory),
@@ -274,13 +310,44 @@ impl AppState {
         );
         let ((files, mut identities), (images, image_identities)) =
             tokio::task::spawn_blocking(move || {
-                (
-                    scan_indexed(&directories.0, &["mp4", "mkv", "mov", "webm"]),
-                    scan_indexed(&directories.1, &["png", "jpg", "jpeg"]),
-                )
+                let (mut files, mut identities) =
+                    scan_indexed(&directories.0, &["mp4", "mkv", "mov", "webm"]);
+                let (mut images, mut image_ids) =
+                    scan_indexed(&directories.1, &["png", "jpg", "jpeg"]);
+                crate::media_names::apply(
+                    &managed,
+                    &directories.0,
+                    false,
+                    &mut files,
+                    &mut identities,
+                );
+                crate::media_names::apply(
+                    &managed,
+                    &directories.1,
+                    true,
+                    &mut images,
+                    &mut image_ids,
+                );
+                if let Some(active) = active_session {
+                    files.retain(|_, path| path != &active);
+                    identities.remove(&active);
+                }
+                ((files, identities), (images, image_ids))
             })
             .await
             .unwrap_or_default();
+        if self.clip_writing.load(std::sync::atomic::Ordering::Acquire) {
+            return 0;
+        }
+        let active_session = match self.recorder.try_lock() {
+            Ok(recorder) => recorder.session_output_path(),
+            Err(_) => return 0,
+        };
+        let mut files = files;
+        if let Some(active) = active_session {
+            files.retain(|_, path| path != &active);
+            identities.remove(&active);
+        }
         identities.extend(image_identities);
         let mut old = self.files.write().await;
         let added = files.keys().filter(|s| !old.contains_key(*s)).count();
@@ -444,6 +511,12 @@ impl AppState {
                         continue;
                     }
                     let value = state.meta(&path).await;
+                    // A rename/delete/trim may have finished during the probe.
+                    // Publish only against the current library entry.
+                    let _edit = state.edits.lock().await;
+                    if state.files.read().await.get(&slug) != Some(&path) {
+                        continue;
+                    }
                     if let Some(raw) = value["tags"].get(crate::playlists::PLAYLIST_TAG) {
                         let mut store = state.playlists.lock().await;
                         if store
@@ -547,15 +620,34 @@ impl AppState {
         self.emit(json!({"type":"share_links_changed","links":links,"share_is_public":public}));
     }
     pub async fn status(&self) -> Value {
-        let mut rec = self.recorder.lock().await;
+        let mut rec = match self.recorder.try_lock() {
+            Ok(rec) => rec,
+            Err(_) => {
+                let cached = self
+                    .status_cache
+                    .lock()
+                    .ok()
+                    .and_then(|value| value.clone());
+                if let Some(mut cached) = cached {
+                    cached["clips"] = json!(self.files.read().await.len());
+                    cached["images"] = json!(self.images.read().await.len());
+                    return cached;
+                }
+                self.recorder.lock().await
+            }
+        };
         let recording = rec.is_healthy();
         let err = self.recorder_error.read().await.clone();
         let (base, public) = self.public_base().await;
-        json!({"running":true,"version":crate::VERSION,"clips":self.files.read().await.len(),"images":self.images.read().await.len(),
+        let value = json!({"running":true,"version":crate::VERSION,"clips":self.files.read().await.len(),"images":self.images.read().await.len(),
             "local_url":self.local_url,"public_url":base,"base_url":base,"public_is_tunnel":public,
             "recording":recording,"backend":rec.name(),"gsr":{"source":rec.gsr_source,"flatpak":rec.gsr_source.as_deref()==Some("flatpak")},"session_active":rec.session_elapsed()>0.0,
             "hotkeys_available":self.hotkeys_available.load(std::sync::atomic::Ordering::Relaxed),
-            "ready":recording,"recorder_error":err,"update":if self.cfg.read().await.updates.check_on_start{crate::updates::available(&crate::updates::UpdateCache::default().load(),crate::VERSION)}else{None},"key_overlay":self.overlay.lock().await.status(),"cpu_fallback":rec.cpu_fallback,"codec_fallback":rec.codec_fallback,"platform":crate::platform_info::detect_platform(),"window_capture_unavailable":if std::env::var_os("WAYLAND_DISPLAY").is_some() && self.cfg.read().await.recording.window_capture {Some("wayland")} else {None}})
+            "ready":recording,"recorder_error":err,"update":if self.cfg.read().await.updates.check_on_start{crate::updates::available(&crate::updates::UpdateCache::default().load(),crate::VERSION)}else{None},"key_overlay":self.overlay.lock().await.status(),"cpu_fallback":rec.cpu_fallback,"codec_fallback":rec.codec_fallback,"platform":crate::platform_info::detect_platform(),"window_capture_unavailable":if std::env::var_os("WAYLAND_DISPLAY").is_some() && self.cfg.read().await.recording.window_capture {Some("wayland")} else {None}});
+        if let Ok(mut cache) = self.status_cache.lock() {
+            *cache = Some(value.clone());
+        }
+        value
     }
     pub async fn meta(&self, path: &FsPath) -> Value {
         if let Some(value) = self.cached_meta(path).await {
@@ -702,13 +794,98 @@ impl AppState {
             "game":self.playlists.lock().await.game_for(&format!("img:{slug}")),"width":meta["width"],"height":meta["height"],
             "image_url":format!("/i/{}?v={size}-{mtime}",enc(slug)),"thumb_url":format!("/it/{}?v={size}-{mtime}",enc(slug))})
     }
+    async fn remember_name(
+        &self,
+        old: &FsPath,
+        path: &FsPath,
+        id: &str,
+        image: bool,
+        format: &str,
+    ) -> Result<()> {
+        let mut registry = self.managed_names.write().await;
+        let mut names = registry.clone();
+        names.remove(old);
+        names.insert(
+            path.into(),
+            crate::media_names::NamedMedia {
+                id: id.into(),
+                image,
+                format: format.into(),
+            },
+        );
+        write_json(
+            &data_dir().join("media_names.json"),
+            &serde_json::to_value(&names)?,
+        )?;
+        *registry = names;
+        Ok(())
+    }
+    async fn media_format(&self, path: &FsPath) -> String {
+        self.managed_names
+            .read()
+            .await
+            .get(path)
+            .map(|entry| entry.format.clone())
+            .unwrap_or_else(|| {
+                path.extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("mp4")
+                    .to_ascii_lowercase()
+            })
+    }
+    pub(crate) async fn media_id(&self, path: &FsPath, image: bool) -> String {
+        if let Some(id) = self
+            .managed_names
+            .read()
+            .await
+            .get(path)
+            .map(|entry| entry.id.clone())
+        {
+            return id;
+        }
+        let preferred = path.file_stem().unwrap_or_default().to_string_lossy();
+        let files = if image {
+            self.images.read().await
+        } else {
+            self.files.read().await
+        };
+        crate::media_names::available_id(path, &preferred, &files)
+    }
     pub async fn saved(&self, path: &FsPath, image: bool) -> Result<()> {
-        self.rescan().await;
-        let slug = path
+        let _edit = self.edits.lock().await;
+        self.saved_locked(path, image).await
+    }
+    async fn saved_locked(&self, path: &FsPath, image: bool) -> Result<()> {
+        let slug = self.media_id(path, image).await;
+        if path
             .file_stem()
-            .context("missing filename")?
-            .to_string_lossy()
-            .into_owned();
+            .is_none_or(|stem| stem.to_string_lossy() != slug)
+        {
+            let format = self.media_format(path).await;
+            self.remember_name(path, path, &slug, image, &format)
+                .await?;
+        }
+        let owned = path.to_path_buf();
+        let identity =
+            tokio::task::spawn_blocking(move || media::FileIdentity::read(&owned)).await??;
+        self.invalidate_media(path).await;
+        self.identities.write().await.insert(path.into(), identity);
+        if image {
+            let mut images = self.images.write().await;
+            images.retain(|id, candidate| candidate != path || id == &slug);
+            images.insert(slug.clone(), path.into());
+            drop(images);
+        } else {
+            let mut files = self.files.write().await;
+            files.retain(|id, candidate| candidate != path || id == &slug);
+            files.insert(slug.clone(), path.into());
+            drop(files);
+            let mut tokens = self.tokens.lock().await;
+            if tokens.get(&slug).is_none() {
+                tokens[&slug] = json!(uuid::Uuid::new_v4().simple().to_string());
+            }
+            write_json(&data_dir().join("share_tokens.json"), &tokens)?;
+        }
         let cfg = self.cfg.read().await.clone();
         if cfg.output.auto_playlist_by_game {
             let game = if let Some(win) = crate::active_window::get_active_window().await {
@@ -740,6 +917,17 @@ impl AppState {
         Ok(())
     }
     pub async fn save_clip(&self, duration: Option<u64>) -> Result<PathBuf> {
+        let _save = self.clip_saves.lock().await;
+        let _ = self.status().await;
+        struct Publishing<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Publishing<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.clip_writing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _publishing = Publishing(&self.clip_writing);
         let cfg = self.cfg.read().await.clone();
         crate::audio::play(
             "clip",
@@ -750,7 +938,8 @@ impl AppState {
         let result = self.recorder.lock().await.save_clip(duration).await;
         match result {
             Ok(path) => {
-                self.saved(&path, false).await?;
+                let _edit = self.edits.lock().await;
+                self.saved_locked(&path, false).await?;
                 Ok(path)
             }
             Err(e) => {
@@ -1186,7 +1375,15 @@ async fn serve_media(
         }
         return video_file(s, path, req).await;
     }
-    file(path, req).await
+    let mime = crate::media_names::mime(&s.media_format(&path).await);
+    let mut response = file(path, req).await?;
+    if let Some(mime) = mime {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(mime),
+        );
+    }
+    Ok(response)
 }
 pub(crate) async fn indexed_cache_key(s: &Shared, path: &FsPath) -> String {
     if let Some(identity) = s.identity(path).await {
@@ -1213,7 +1410,8 @@ impl Drop for VideoActivity {
     }
 }
 pub(crate) async fn video_file(state: Shared, path: PathBuf, req: Request<Body>) -> ApiResult {
-    let response = file(path, req).await?;
+    let mime = crate::media_names::mime(&state.media_format(&path).await);
+    let response = crate::media_stream::serve_as(path, req, mime).await?;
     state
         .active_video_streams
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1322,11 +1520,7 @@ async fn run_media_attempt(
     event: &str,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
-    let slug = source
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let slug = state.media_id(source, false).await;
     let duration = state
         .cached_meta(source)
         .await
@@ -1727,6 +1921,20 @@ async fn media_api(
                 .await
                 .map_err(anyhow::Error::from)?;
             s.invalidate_media(&path).await;
+            if image {
+                s.images.write().await.remove(slug);
+            } else {
+                s.files.write().await.remove(slug);
+            }
+            s.identities.write().await.remove(&path);
+            {
+                let mut names = s.managed_names.write().await;
+                names.remove(&path);
+                write_json(
+                    &data_dir().join("media_names.json"),
+                    &serde_json::to_value(&*names).map_err(anyhow::Error::from)?,
+                )?;
+            }
             let mut views = s.views.lock().await;
             if let Some(map) = views.as_object_mut() {
                 map.remove(slug);
@@ -1752,58 +1960,57 @@ async fn media_api(
             ok(json!({"ok":true}))
         }
         ("POST", ["rename"]) => {
-            let requested = body["name"]
+            let name = body["name"]
                 .as_str()
                 .ok_or_else(|| bad("name is required"))?;
-            let name = safe_name(requested).ok_or_else(|| bad("invalid filename"))?;
-            let ext = path.extension().unwrap_or_default().to_string_lossy();
-            let name = name.strip_suffix(&format!(".{ext}")).unwrap_or(&name);
-            let target = path.with_file_name(format!("{name}.{ext}"));
-            if target.exists() && target != path {
-                return Err(bad("a file with that name already exists"));
-            }
-            tokio::fs::rename(&path, &target)
-                .await
-                .map_err(anyhow::Error::from)?;
-            s.invalidate_media(&path).await;
-            s.invalidate_media(&target).await;
-            let new_member = if image {
-                format!("img:{name}")
-            } else {
-                name.into()
+            let name = match path.extension().and_then(|ext| ext.to_str()) {
+                Some(ext) => format!("{name}.{ext}"),
+                None => name.to_owned(),
             };
-            s.playlists
-                .lock()
-                .await
-                .on_clip_renamed(&member, &new_member)?;
-            if !image {
-                let mut tokens = s.tokens.lock().await;
-                if let Some(token) = tokens.as_object_mut().and_then(|o| o.remove(slug)) {
-                    tokens[name] = token;
-                }
-                write_json(&data_dir().join("share_tokens.json"), &tokens)?;
-                for dir in ["highlights", "keys"] {
-                    let from = data_dir().join(dir).join(format!("{slug}.json"));
-                    if from.exists() {
-                        tokio::fs::rename(from, data_dir().join(dir).join(format!("{name}.json")))
-                            .await
-                            .map_err(anyhow::Error::from)?;
-                    }
-                }
-                let mut views = s.views.lock().await;
-                if let Some(v) = views.as_object_mut().and_then(|o| o.remove(slug)) {
-                    views[name] = v;
-                    write_json(&data_dir().join("views.json"), &views)?;
-                }
-                editor::EditorProjectStore::new(data_dir().join("editor_project.json"))
-                    .on_clip_renamed(slug, name)?;
+            if !crate::media_names::valid_filename(&name) {
+                return Err(bad(
+                    "invalid filename: enter a filename, without a directory path or NUL",
+                ));
             }
-            s.rescan().await;
-            s.emit(json!({"type":if image{"image_deleted"}else{"clip_deleted"},"slug":slug}));
+            let target = path.with_file_name(&name);
+            if target != path {
+                if target.try_exists().map_err(anyhow::Error::from)? {
+                    return Err(bad("a file with that name already exists"));
+                }
+                let format = s.media_format(&path).await;
+                let cached = s.cached_meta(&path).await;
+                tokio::fs::rename(&path, &target)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                if let Err(error) = s.remember_name(&path, &target, slug, image, &format).await {
+                    let _ = tokio::fs::rename(&target, &path).await;
+                    return Err(error.into());
+                }
+                s.invalidate_media(&path).await;
+                s.identities.write().await.remove(&path);
+                let owned = target.clone();
+                let identity =
+                    tokio::task::spawn_blocking(move || media::FileIdentity::read(&owned))
+                        .await
+                        .map_err(anyhow::Error::from)?
+                        .map_err(anyhow::Error::from)?;
+                s.identities.write().await.insert(target.clone(), identity);
+                if image {
+                    s.images.write().await.insert(slug.into(), target.clone());
+                } else {
+                    s.files.write().await.insert(slug.into(), target.clone());
+                }
+                if let Some(cached) = cached {
+                    s.metadata
+                        .lock()
+                        .await
+                        .insert(target.clone(), (identity.size, identity.mtime_ns, cached));
+                }
+            }
             let value = if image {
-                s.image_json(name, &target).await
+                s.image_json(slug, &target).await
             } else {
-                s.clip_json(name, &target, true).await
+                s.clip_json(slug, &target, true).await
             };
             s.emit(json!({"type":if image{"image_saved"}else{"clip_saved"},if image{"image"}else{"clip"}:value}));
             ok(value)
@@ -1880,29 +2087,50 @@ async fn media_api(
                 return Err(bad("invalid trim range"));
             }
             let copy = body["copy"].as_bool().unwrap_or(false);
+            let before: media::MediaInfo =
+                serde_json::from_value(s.meta(&path).await).map_err(anyhow::Error::from)?;
+            if !copy && start <= 0.000_001 && (end - before.duration).abs() < 0.001 {
+                return ok(json!({"ok":true,"slug":slug,"copy":false}));
+            }
+            let wanted = s.playlists.lock().await.metadata_for(slug, None);
+            let tags = HashMap::from([("vice_playlists".into(), wanted)]);
+
             let final_path = if copy {
                 trimmed_copy_path(&path)
             } else {
                 path.clone()
             };
-            let ext = path.extension().unwrap_or_default().to_string_lossy();
+            let ext = s.media_format(&path).await;
             let tmp = MediaTemp(
                 path.with_file_name(format!(".{}.trimming.{ext}", uuid::Uuid::new_v4().simple())),
             );
+            let work_dir = cache_dir().join("trims");
+            tokio::fs::create_dir_all(&work_dir)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let work = MediaTemp(work_dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext)));
             let identity = cache_key(&path);
-            media::trim_range(&path, &tmp.0, start, end).await?;
+            let info =
+                media::trim_range_with_metadata(&path, &work.0, start, end, &before, &tags).await?;
+            tokio::fs::copy(&work.0, &tmp.0)
+                .await
+                .map_err(anyhow::Error::from)?;
             if cache_key(&path) != identity {
                 return Err(bad("the clip changed while it was being trimmed; retry"));
             }
-            let new_slug = final_path
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let new_slug = if copy {
+                uuid::Uuid::new_v4().simple().to_string()
+            } else {
+                slug.to_owned()
+            };
             tokio::fs::rename(&tmp.0, &final_path)
                 .await
                 .map_err(anyhow::Error::from)?;
-            s.invalidate_media(&path).await;
+            if copy {
+                s.remember_name(&final_path, &final_path, &new_slug, false, &ext)
+                    .await?;
+            }
+            s.invalidate_media(&final_path).await;
             if let Some(keys) = crate::keys::load_sidecar(slug) {
                 crate::keys::save_sidecar(
                     &new_slug,
@@ -1929,33 +2157,37 @@ async fn media_api(
                 }
                 s.emit(json!({"type":"playlists_changed","playlists":store.list_playlists()}));
             }
-            let wanted = s.playlists.lock().await.metadata_for(&new_slug, None);
-            let written = media::probe_container_tags(&final_path)
+            let owned = final_path.clone();
+            let identity = tokio::task::spawn_blocking(move || media::FileIdentity::read(&owned))
                 .await
-                .unwrap_or_default();
-            let normalize = |raw: &str| {
-                let mut records = crate::playlists::decode_playlist_metadata(&json!(raw));
-                for p in &mut records {
-                    p.as_object_mut().unwrap().remove("rev");
-                }
-                records
-            };
-            if normalize(
-                written
-                    .get("vice_playlists")
-                    .map(String::as_str)
-                    .unwrap_or(""),
-            ) != normalize(&wanted)
+                .map_err(anyhow::Error::from)?
+                .map_err(anyhow::Error::from)?;
+            s.files
+                .write()
+                .await
+                .insert(new_slug.clone(), final_path.clone());
+            s.identities
+                .write()
+                .await
+                .insert(final_path.clone(), identity);
+            s.metadata.lock().await.insert(
+                final_path.clone(),
+                (
+                    identity.size,
+                    identity.mtime_ns,
+                    serde_json::to_value(info).map_err(anyhow::Error::from)?,
+                ),
+            );
+            s.metadata_dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             {
-                media::write_metadata_tags(
-                    &final_path,
-                    &HashMap::from([("vice_playlists".into(), wanted)]),
-                    600.0,
-                    None,
-                )
-                .await?;
+                let mut tokens = s.tokens.lock().await;
+                if tokens.get(&new_slug).is_none() {
+                    tokens[&new_slug] = json!(uuid::Uuid::new_v4().simple().to_string());
+                }
+                write_json(&data_dir().join("share_tokens.json"), &tokens)?;
             }
-            s.rescan().await;
+            s.flush_metadata(false).await;
             s.emit(
                 json!({"type":"clip_saved","clip":s.clip_json(&new_slug,&final_path,true).await}),
             );
@@ -1990,9 +2222,7 @@ async fn media_api(
             )
             .await?;
             s.saved(&out, true).await?;
-            let mut value = s
-                .image_json(out.file_stem().unwrap().to_str().unwrap(), &out)
-                .await;
+            let mut value = s.image_json(&s.media_id(&out, true).await, &out).await;
             value["ok"] = json!(true);
             value["copied"] = json!(clipboard(&out, true).await.is_ok());
             ok(value)
@@ -2001,7 +2231,7 @@ async fn media_api(
             if !raw.starts_with(b"\x89PNG\r\n\x1a\n") {
                 return Err(bad("expected PNG image"));
             }
-            let target = path.with_extension("png");
+            let target = path.clone();
             let tmp = target.with_file_name(format!(".{}.png", uuid::Uuid::new_v4().simple()));
             tokio::fs::write(&tmp, raw)
                 .await
@@ -2010,12 +2240,8 @@ async fn media_api(
             tokio::fs::rename(&tmp, &target)
                 .await
                 .map_err(anyhow::Error::from)?;
-            if target != path {
-                tokio::fs::remove_file(path)
-                    .await
-                    .map_err(anyhow::Error::from)?;
-            }
-            s.saved(&target, true).await?;
+            s.remember_name(&path, &target, slug, true, "png").await?;
+            s.saved_locked(&target, true).await?;
             ok(s.image_json(slug, &target).await)
         }
         ("GET", ["discord"]) | ("POST", ["copy-file"]) => {
@@ -2078,19 +2304,9 @@ async fn media_api(
         _ => Err(missing()),
     }
 }
+#[cfg(test)]
 fn safe_name(name: &str) -> Option<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty()
-        || trimmed == "."
-        || trimmed == ".."
-        || trimmed.starts_with('.')
-        || trimmed.len() > 220
-        || trimmed.chars().any(|c| c.is_control() || "/\\".contains(c))
-    {
-        None
-    } else {
-        Some(trimmed.into())
-    }
+    crate::media_names::valid_filename(name).then(|| name.to_owned())
 }
 pub fn unique_path(dir: &FsPath, base: &str, ext: &str) -> PathBuf {
     for n in 1.. {
@@ -2608,14 +2824,11 @@ async fn start_export(s: Shared, body: Value) -> ApiResult {
             };
             let mut clip = Value::Null;
             if let Some(path) = target {
-                s.saved(&path, false).await?;
-                clip = s
-                    .clip_json(
-                        path.file_stem().unwrap().to_str().unwrap_or(""),
-                        &path,
-                        true,
-                    )
-                    .await;
+                let _edit = s.edits.lock().await;
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                s.remember_name(&path, &path, &id, false, "mp4").await?;
+                s.saved_locked(&path, false).await?;
+                clip = s.clip_json(&id, &path, true).await;
             }
             s.emit(json!({"type":"export_done","job_id":job_id,"path":final_path,"clip":clip}));
             Ok(())
@@ -2633,6 +2846,35 @@ async fn start_export(s: Shared, body: Value) -> ApiResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn status_stays_responsive_during_clip_finalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.output.directory = dir.path().join("clips").to_string_lossy().into();
+        cfg.output.image_directory = dir.path().join("images").to_string_lossy().into();
+        let state = AppState::new(cfg);
+        let initial = state.status().await;
+        let _recorder = state.recorder.lock().await;
+        let status = tokio::time::timeout(Duration::from_millis(100), state.status())
+            .await
+            .unwrap();
+        assert_eq!(status["recording"], initial["recording"]);
+        assert_eq!(status["clips"], 0);
+    }
+    #[tokio::test]
+    async fn rescan_never_publishes_a_recording_still_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.output.directory = dir.path().to_string_lossy().into();
+        cfg.output.image_directory = dir.path().join("images").to_string_lossy().into();
+        let state = AppState::new(cfg);
+        std::fs::write(dir.path().join("unfinished.mp4"), b"partial recording").unwrap();
+        state
+            .clip_writing
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(state.rescan().await, 0);
+        assert!(state.files.read().await.is_empty());
+    }
     #[test]
     fn trimmed_highlights_rebase_and_keep_user_fields() {
         assert_eq!(
@@ -2738,7 +2980,7 @@ mod tests {
     #[test]
     fn path_validation() {
         assert!(safe_name("../../passwd").is_none());
-        assert!(safe_name(".hidden").is_none());
+        assert_eq!(safe_name(".hidden"), Some(".hidden".into()));
         assert_eq!(safe_name("clip #1 + 2"), Some("clip #1 + 2".into()));
     }
     #[test]

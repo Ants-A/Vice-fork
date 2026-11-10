@@ -32,15 +32,6 @@ export function useRenameClip(): (clip: Clip, name: string) => Promise<Clip | nu
       try {
         const updated = await api.renameClip(clip.slug, name);
         await refreshClips();
-        if (updated?.name && clipTitle(updated) !== name) {
-          // Punctuation is normalised server side, so say what landed on disk.
-          notify({
-            kind: 'info',
-            title: t('card.savedAs', {name: clipTitle(updated)}),
-            tone: 'neutral',
-            holdMs: 4000,
-          });
-        }
         return updated ?? null;
       } catch (err) {
         notify({

@@ -431,6 +431,7 @@ export function ImageViewer(props: ImageViewerProps) {
                   className="viewer-rename"
                   label={t('card.nameLabel')}
                   initial={imageTitle(image)}
+                  literal
                   onCancel={() => setRenamingTitle(false)}
                   onSubmit={name => {
                     setRenamingTitle(false);

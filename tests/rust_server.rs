@@ -171,14 +171,35 @@ async fn daemon_api_media_lifecycle_and_public_isolation() {
     );
     let renamed: Value = client
         .post(format!("{base}/api/clips/test/rename"))
-        .json(&json!({"name":"renamed #1"}))
+        .json(&json!({"name":" .renamed #1?  "}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(renamed["slug"], "renamed #1");
+    assert_eq!(renamed["slug"], "test");
+    assert_eq!(renamed["name"], " .renamed #1?  .mp4");
+    assert!(root.join("clips/ .renamed #1?  .mp4").is_file());
+    let video = client.get(format!("{base}/v/test")).send().await.unwrap();
+    assert_eq!(video.headers()["content-type"], "video/mp4");
+    assert_eq!(video.bytes().await.unwrap().as_ref(), b"test-video-data");
+    let scan = client
+        .post(format!("{base}/api/library/rescan"))
+        .send()
+        .await
+        .unwrap();
+    assert!(scan.status().is_success());
+    let refreshed: Value = client
+        .get(format!("{base}/api/clips"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refreshed["clips"][0]["slug"], "test");
+    assert_eq!(refreshed["clips"][0]["name"], " .renamed #1?  .mp4");
     assert_eq!(
         client
             .get(format!("{public}/v/{token}"))
@@ -188,6 +209,42 @@ async fn daemon_api_media_lifecycle_and_public_isolation() {
             .status(),
         200
     );
+    // The recorder can reuse the filename freed by a rename. Both entries
+    // must remain visible and keep their identities across repeated rescans.
+    std::fs::write(root.join("clips/test.mp4"), b"second-recording").unwrap();
+    let mut second_id = String::new();
+    for _ in 0..2 {
+        assert!(
+            client
+                .post(format!("{base}/api/library/rescan"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        let rows: Value = client
+            .get(format!("{base}/api/clips"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = rows["clips"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let second = rows.iter().find(|row| row["name"] == "test.mp4").unwrap();
+        let id = second["slug"].as_str().unwrap();
+        assert_ne!(id, "test");
+        if !second_id.is_empty() {
+            assert_eq!(id, second_id);
+        }
+        second_id = id.to_owned();
+        assert!(
+            rows.iter()
+                .any(|row| row["slug"] == "test" && row["name"] == " .renamed #1?  .mp4")
+        );
+    }
     let lists: Value = client
         .get(format!("{base}/api/playlists"))
         .send()
@@ -196,7 +253,7 @@ async fn daemon_api_media_lifecycle_and_public_isolation() {
         .json()
         .await
         .unwrap();
-    assert_eq!(lists["playlists"][0]["clip_slugs"], json!(["renamed #1"]));
+    assert_eq!(lists["playlists"][0]["clip_slugs"], json!(["test"]));
     let state: Value = client
         .post(format!("{base}/api/app-state"))
         .json(&json!({"tutorial_done":true}))
@@ -209,7 +266,7 @@ async fn daemon_api_media_lifecycle_and_public_isolation() {
     assert_eq!(state["tutorial_done"], true);
     assert_eq!(
         client
-            .get(format!("{base}/api/clips/renamed%20%231/keys"))
+            .get(format!("{base}/api/clips/test/keys"))
             .send()
             .await
             .unwrap()
@@ -220,7 +277,7 @@ async fn daemon_api_media_lifecycle_and_public_isolation() {
     );
     assert!(
         client
-            .delete(format!("{base}/api/clips/renamed%20%231"))
+            .delete(format!("{base}/api/clips/test"))
             .send()
             .await
             .unwrap()

@@ -92,14 +92,7 @@ export function useImageActions(collection?: Image[]): {actions: ImageActionSet;
           setPendingRename(updated);
           setViewing(current => (current === image.slug ? updated.slug : current));
           setSequence(current => current?.map(slug => slug === image.slug ? updated.slug : slug) ?? null);
-          if (imageTitle(updated) !== name) {
-            notify({
-              kind: 'info',
-              title: t('card.savedAs', {name: imageTitle(updated)}),
-              tone: 'neutral',
-              holdMs: 4000,
-            });
-          }
+
         }
         await refreshImages();
       } catch (err) {

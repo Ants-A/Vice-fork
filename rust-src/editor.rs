@@ -893,7 +893,7 @@ fn windows(spans: &[(f64, f64)]) -> String {
         .join("+")
 }
 pub fn sanitize_export_name(name: &str) -> Option<String> {
-    crate::recorder::slugify_clip_name(name).map(|name| format!("{name}.mp4"))
+    crate::media_names::valid_filename(&format!("{name}.mp4")).then(|| format!("{name}.mp4"))
 }
 
 pub fn default_export_name(dir: &Path) -> String {
@@ -1088,11 +1088,12 @@ mod tests {
     }
     #[test]
     fn names_and_progress() {
+        assert_eq!(sanitize_export_name("../../evil.MP4"), None);
+        assert_eq!(sanitize_export_name("..."), Some("....mp4".into()));
         assert_eq!(
-            sanitize_export_name("../../evil.MP4"),
-            Some("evil.mp4".into())
+            sanitize_export_name(" My export! #1.MP4 "),
+            Some(" My export! #1.MP4 .mp4".into())
         );
-        assert_eq!(sanitize_export_name("..."), None);
         assert_eq!(parse_progress("out_time_us=5000000", 10.0), Some(0.5));
         assert_eq!(parse_progress("progress=end", 10.0), Some(1.0));
         assert_eq!(parse_progress("out_time_us=nan", 10.0), None);

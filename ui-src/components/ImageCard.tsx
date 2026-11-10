@@ -98,6 +98,7 @@ export function ImageCard({
             className="clip-rename"
             label={t('card.nameLabel')}
             initial={imageTitle(image)}
+            literal
             onCancel={stopRenaming}
             onSubmit={async name => {
               stopRenaming();

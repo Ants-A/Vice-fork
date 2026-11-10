@@ -21,6 +21,7 @@ export function InlineRename({
   label,
   emptyFallback,
   stopPropagation,
+  literal = false,
 }: {
   initial: string;
   onSubmit: (name: string) => void;
@@ -31,6 +32,8 @@ export function InlineRename({
   emptyFallback?: string;
   /** For a field inside something that is itself clickable, like a list row. */
   stopPropagation?: boolean;
+  /** File names keep all entered characters, including leading/trailing spaces. */
+  literal?: boolean;
 }) {
   const [value, setValue] = useState(initial);
   const done = useRef(false);
@@ -38,7 +41,7 @@ export function InlineRename({
   const submit = () => {
     if (done.current) return;
     done.current = true;
-    const next = value.trim() || emptyFallback || '';
+    const next = (literal ? value : value.trim()) || emptyFallback || '';
     if (!next || next === initial) onCancel();
     else onSubmit(next);
   };

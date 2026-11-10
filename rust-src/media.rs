@@ -429,10 +429,23 @@ pub fn cleanup_temp_files(directory: &Path) {
 /// first packet is independently decodable at zero; otherwise encode the cut.
 /// The caller owns the temporary output and commits it after this succeeds.
 pub async fn trim_range(source: &Path, target: &Path, start: f64, end: f64) -> Result<()> {
+    let before = probe_media(source).await?;
+    trim_range_with_metadata(source, target, start, end, &before, &HashMap::new())
+        .await
+        .map(|_| ())
+}
+
+pub async fn trim_range_with_metadata(
+    source: &Path,
+    target: &Path,
+    start: f64,
+    end: f64,
+    before: &MediaInfo,
+    tags: &HashMap<String, String>,
+) -> Result<MediaInfo> {
     if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
         bail!("invalid trim range");
     }
-    let before = probe_media(source).await?;
     if before.duration <= 0.0 || end > before.duration + 0.1 {
         bail!("trim extends beyond the clip");
     }
@@ -479,15 +492,24 @@ pub async fn trim_range(source: &Path, target: &Path, start: f64, end: f64) -> R
         } else {
             args.extend(["-c".into(), "copy".into()]);
         }
+        for (key, value) in tags {
+            args.extend(["-metadata".into(), format!("{key}={value}")]);
+        }
         if target.extension().is_some_and(|s| s == "mp4") {
             args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
         }
         args.extend(["-y".into(), target.to_string_lossy().into_owned()]);
         args
     };
-    let copied = run_command(&make(None), 120.0).await;
-    if copied.is_ok_and(|out| out.status.success()) && trim_is_playable(target, duration).await {
-        return Ok(());
+    // Most slider cuts start between keyframes. Do not copy an entire large
+    // interval only to discover at validation that it needs encoding anyway.
+    if starts_on_keyframe(source, start).await
+        && run_command(&make(None), 120.0)
+            .await
+            .is_ok_and(|out| out.status.success())
+        && let Some(info) = validated_trim(target, duration).await
+    {
+        return Ok(info);
     }
     let encoders = Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
@@ -506,8 +528,8 @@ pub async fn trim_range(source: &Path, target: &Path, start: f64, end: f64) -> R
     for args in crate::encoding::command_candidates(&make(Some(preferred))).await {
         match run_command(&args, 900.0).await {
             Ok(output) if output.status.success() => {
-                if trim_is_playable(target, duration).await {
-                    return Ok(());
+                if let Some(info) = validated_trim(target, duration).await {
+                    return Ok(info);
                 }
                 reason =
                     "the trimmed file does not decode correctly; the original has been kept".into();
@@ -523,12 +545,50 @@ pub async fn trim_range(source: &Path, target: &Path, start: f64, end: f64) -> R
     }
     bail!("trim failed: {reason}")
 }
-async fn trim_is_playable(path: &Path, expected: f64) -> bool {
-    let Ok(info) = probe_media(path).await else {
+async fn starts_on_keyframe(path: &Path, start: f64) -> bool {
+    if start <= 0.000_001 {
+        return true;
+    }
+    let interval = format!("{start:.6}%+#1");
+    let Ok(output) = capture(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            &interval,
+            "-show_entries",
+            "packet=pts_time,flags",
+            "-of",
+            "json",
+        ],
+        path,
+        2.0,
+    )
+    .await
+    else {
         return false;
     };
-    if info.duration < expected - 0.1 || info.duration > expected + 0.2 {
+    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
         return false;
+    };
+    let packet = &value["packets"][0];
+    packet["flags"]
+        .as_str()
+        .is_some_and(|flags| flags.contains('K'))
+        && packet["pts_time"]
+            .as_str()
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|pts| (pts - start).abs() < 0.000_5)
+}
+async fn validated_trim(path: &Path, expected: f64) -> Option<MediaInfo> {
+    let Ok(info) = probe_media(path).await else {
+        return None;
+    };
+    if info.duration < expected - 0.1 || info.duration > expected + 0.2 {
+        return None;
     }
     let packet = capture(
         "ffprobe",
@@ -554,7 +614,7 @@ async fn trim_is_playable(path: &Path, expected: f64) -> bool {
             && let Some((pts, flags)) = first.split_once(',')
             && (!flags.contains('K') || pts.parse::<f64>().is_ok_and(|n| n < 0.0))
         {
-            return false;
+            return None;
         }
     }
     let argv = vec![
@@ -574,6 +634,7 @@ async fn trim_is_playable(path: &Path, expected: f64) -> bool {
     run_command(&argv, 30.0)
         .await
         .is_ok_and(|out| out.status.success() && out.stderr.is_empty())
+        .then_some(info)
 }
 #[cfg(test)]
 mod tests {

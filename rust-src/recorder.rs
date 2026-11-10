@@ -780,6 +780,9 @@ impl Recorder {
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.)
     }
+    pub fn session_output_path(&self) -> Option<PathBuf> {
+        self.session_path.clone()
+    }
     pub fn session_active(&self) -> bool {
         self.session.is_some()
     }
