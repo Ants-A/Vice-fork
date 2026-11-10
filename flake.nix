@@ -26,7 +26,7 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.system}.vice-clipper ];
-          packages = [ pkgs.nodejs pkgs.python3Packages.pytest ];
+          packages = [ pkgs.nodejs pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy ];
         };
       });
     };

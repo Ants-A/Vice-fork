@@ -44,13 +44,13 @@ jobs:
 
       # Nobody here runs Nix day to day, so a version written into the flake
       # would go stale without anyone noticing.
-      - name: Flake version matches vice/__init__.py
+      - name: Flake version matches Cargo.toml
         if: steps.flake.outputs.present == 'true'
         run: |
           flake="$(nix eval --raw .#packages.x86_64-linux.default.version)"
-          source="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' vice/__init__.py)"
+          source="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           if [ "$flake" != "$source" ]; then
-            echo "::error::flake.nix builds $flake but vice/__init__.py says $source"
+            echo "::error::flake.nix builds $flake but Cargo.toml says $source"
             exit 1
           fi
           echo "Flake and source agree on $source"

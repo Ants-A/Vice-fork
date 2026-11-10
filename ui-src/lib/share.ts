@@ -1,3 +1,4 @@
+import {onWsMessage} from './ws';
 import {api} from './api';
 import {copyToClipboard} from './clipboard';
 import type {Clip} from './types';
@@ -58,7 +59,12 @@ export async function shareClip(
     await copyShareLink(clip, notify, onManualCopy);
     return;
   }
-  notify({kind: 'info', title: t('card.discordPreparing'), tone: 'neutral', holdMs: 2500});
+  notify({kind: 'info', title: t('card.discordPreparing'), tone: 'neutral', holdMs: 600_000});
+  const unsubscribe = onWsMessage(msg => {
+    if (msg.type === 'discord_progress' && msg.slug === clip.slug) {
+      notify({kind: 'info', title: t('card.discordPreparing'), detail: `${Math.round(msg.progress * 100)}%`, tone: 'neutral', holdMs: 600_000});
+    }
+  });
   try {
     await api.copyClipFile(clip.slug, {discord: true});
     notify({
@@ -76,6 +82,8 @@ export async function shareClip(
       tone: 'error',
       holdMs: 7000,
     });
+  } finally {
+    unsubscribe();
   }
 }
 

@@ -1,6 +1,7 @@
+import {previewFormat} from './mediaSupport';
 import {useEffect, useState, type RefObject} from 'react';
 
-import {H264_SUPPORTED, HEVC_SUPPORTED, nativeLog} from './env';
+import {H264_SUPPORTED, HEVC_SUPPORTED, WEBM_SUPPORTED, nativeLog} from './env';
 import type {Clip} from './types';
 import {t} from './i18n';
 
@@ -10,7 +11,7 @@ import {t} from './i18n';
  */
 export function clipNeedsProxy(clip: Clip | null | undefined): boolean {
   const codec = (clip?.vcodec ?? '').toLowerCase();
-  return (codec === 'hevc' || codec === 'h265') && !HEVC_SUPPORTED;
+  return Boolean(clip && previewFormat(codec, H264_SUPPORTED, HEVC_SUPPORTED, WEBM_SUPPORTED));
 }
 
 /**
@@ -18,15 +19,23 @@ export function clipNeedsProxy(clip: Clip | null | undefined): boolean {
  * the codec cannot play in this window. `video_url` already carries a content
  * revision, so it doubles as a cache key.
  */
-export function playbackUrl(clip: Clip | null | undefined): string {
+export function playbackUrl(clip: Clip | null | undefined, smaller = false): string {
   if (!clip?.video_url) return '';
-  return clipNeedsProxy(clip) ? `${clip.video_url}&proxy=1` : clip.video_url;
+  const format = previewFormat(clip.vcodec ?? '', H264_SUPPORTED, HEVC_SUPPORTED, WEBM_SUPPORTED, smaller);
+  return format ? `${clip.video_url}${clip.video_url.includes('?') ? '&' : '?'}proxy=${format === 'webm' ? 'webm' : smaller ? 'small' : '1'}` : clip.video_url;
 }
 
 /** Frame-accurate enough for a scrub, and cheap on engines that offer it. */
 export function seekTo(video: HTMLVideoElement | null, seconds: number): void {
   if (!video) return;
-  const target = Math.max(0, Number(seconds) || 0);
+  let target = Math.max(0, Number(seconds) || 0);
+  // An unfinished preview has no final seek index. Stay within its available
+  // data until the completed cached file can serve arbitrary byte ranges.
+  if (video.currentSrc.includes('proxy=') || !Number.isFinite(video.duration)) {
+    const available = video.seekable.length ? video.seekable : video.buffered;
+    if (available.length) target = Math.min(target, Math.max(0, available.end(available.length - 1) - 0.1));
+    else target = 0;
+  }
   try {
     if (typeof video.fastSeek === 'function') video.fastSeek(target);
     else video.currentTime = target;
@@ -60,7 +69,7 @@ function mediaErrorName(err: MediaError | null): string {
 }
 
 export function videoFailureMessage(): string {
-  return H264_SUPPORTED
+  return H264_SUPPORTED || WEBM_SUPPORTED
     ? t('viewer.playbackFailed')
     : t('viewer.noH264Decoder');
 }
@@ -87,6 +96,9 @@ export function useVideoFailure(
     const video = ref.current;
     if (!video) return;
     const hasSource = () => Boolean(video.getAttribute('src'));
+    let source = '';
+    let retries = 0;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     // Which of the two shapes it took, and on what, is the only thing that
     // makes a playback report diagnosable from the reporter's machine.
     const report = (why: string) =>
@@ -97,6 +109,20 @@ export function useVideoFailure(
     const onError = () => {
       if (!hasSource()) return;
       report(mediaErrorName(video.error));
+      if (video.getAttribute('src')?.includes('proxy=') && retries < 2) {
+        retries++;
+        const at = video.currentTime;
+        const expected = video.getAttribute('src');
+        retry = setTimeout(() => {
+          if (!hasSource() || video.getAttribute('src') !== expected) return;
+          video.addEventListener('loadeddata', () => {
+            if (video.getAttribute('src') !== expected) return;
+            seekTo(video, at); playQuietly(video);
+          }, {once: true});
+          video.load();
+        }, 700);
+        return;
+      }
       setFailed(true);
     };
     const onLoadedData = () => {
@@ -104,11 +130,17 @@ export function useVideoFailure(
       if (video.videoWidth === 0) report('NO_VIDEO_TRACK');
       setFailed(video.videoWidth === 0);
     };
-    const onLoadStart = () => hasSource() && setFailed(false);
+    const onLoadStart = () => {
+      if (!hasSource()) return;
+      const next = video.getAttribute('src') ?? '';
+      if (source !== next) { source = next; retries = 0; clearTimeout(retry); }
+      setFailed(false);
+    };
     video.addEventListener('error', onError);
     video.addEventListener('loadeddata', onLoadedData);
     video.addEventListener('loadstart', onLoadStart);
     return () => {
+      clearTimeout(retry);
       video.removeEventListener('error', onError);
       video.removeEventListener('loadeddata', onLoadedData);
       video.removeEventListener('loadstart', onLoadStart);

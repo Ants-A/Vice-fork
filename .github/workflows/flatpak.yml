@@ -17,10 +17,12 @@ jobs:
     if: github.event_name != 'release'
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.11
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Build the Flatpak
         run: tools/ci/flatpak.sh
@@ -35,7 +37,7 @@ jobs:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.11
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
     concurrency:
       group: flatpak-repo
@@ -51,6 +53,8 @@ jobs:
           repository: splitshotz/vice-flatpak
           ssh-key: ${{ secrets.FLATPAK_SITE_DEPLOY_KEY }}
           path: site
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Build, sign and publish
         env:

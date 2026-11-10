@@ -1,6 +1,8 @@
 import {useEffect, useRef, useState} from 'react';
 
 import {api} from '../lib/api';
+import {useVideoBuffer} from '../lib/useVideoBuffer';
+import {onWsMessage} from '../lib/ws';
 import {useEscape} from '../lib/escape';
 import {formatDuration} from '../lib/format';
 import {
@@ -53,6 +55,15 @@ export function TrimModal({
   const [playhead, setPlayhead] = useState(0);
   const [previewing, setPreviewing] = useState(false);
   const [preparing, setPreparing] = useState(false);
+  const [previewProgress, setPreviewProgress] = useState<number | null>(null);
+  const source = playbackUrl(clip);
+  const buffer = useVideoBuffer(videoRef, clip !== null, source, clip?.duration ?? 0);
+  useEffect(() => {setPreviewProgress(null);}, [source]);
+  useEffect(() => onWsMessage(msg => {
+    if (msg.type === 'preview_progress' && msg.slug === clip?.slug && Number.isFinite(msg.progress)) {
+      setPreviewProgress(Math.max(0, Math.min(1, msg.progress)));
+    }
+  }), [clip?.slug]);
   const [dragging, setDragging] = useState<'start' | 'end' | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -84,8 +95,8 @@ export function TrimModal({
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !clip) return;
-    setTotal(0);
-    setSelection({start: 0, end: 0});
+    setTotal(clip.duration ?? 0);
+    setSelection({start: 0, end: clip.duration ?? 0});
     setPlayhead(0);
     setPreviewing(false);
     setSaving(false);
@@ -100,7 +111,7 @@ export function TrimModal({
       video.removeAttribute('src');
       video.load();
     };
-  }, [clip]);
+  }, [clip?.slug, source]);
 
   if (!clip) return null;
 
@@ -265,10 +276,12 @@ export function TrimModal({
               onCanPlay={() => setPreparing(false)}
               onError={() => setPreparing(false)}
             />
-            {preparing ? (
-              <div className="video-overlay">
-                <span className="video-spinner" aria-hidden="true" />
-                <p>{t('trim.preparingPreview')}</p>
+            {!failed && (preparing || buffer.waiting) ? (
+              <div className="video-overlay video-buffering" role="status" aria-live="polite">
+                <p>{t(preparing ? 'trim.preparingPreview' : 'viewer.buffering')}</p>
+                <progress className="video-buffer-progress" aria-label={t('viewer.buffering')} max={100}
+                  value={preparing ? previewProgress === null ? undefined : previewProgress * 100 : buffer.percent || undefined} />
+                <span className="video-buffer-caption mono">{preparing && previewProgress !== null ? `${Math.floor(previewProgress * 100)}%` : !preparing && buffer.percent ? t('viewer.bufferedPercent', {percent: Math.floor(buffer.percent)}) : t('viewer.connecting')}</span>
               </div>
             ) : null}
             {failed ? (

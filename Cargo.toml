@@ -1,0 +1,57 @@
+[package]
+name = "vice"
+version = "2.17.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Instant-replay game clipping for Linux"
+default-run = "vice"
+
+[lib]
+path = "rust-src/lib.rs"
+
+[[bin]]
+name = "vice"
+path = "rust-src/main.rs"
+
+[[bin]]
+name = "vice-app"
+path = "rust-src/app.rs"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:wry", "dep:tao", "dep:gtk", "dep:cairo-rs"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "limit"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+shell-words = "1"
+futures-util = "0.3"
+base64 = "0.22"
+sha2 = "0.10"
+evdev = { version = "0.13", features = ["tokio"] }
+percent-encoding = "2"
+tower = { version = "0.5", features = ["util"] }
+wry = { version = "0.55", optional = true }
+tao = { version = "0.34", optional = true }
+cairo-rs = { version = "0.18", features = ["png"], optional = true }
+gtk = { version = "0.18", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

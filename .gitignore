@@ -39,3 +39,11 @@ node_modules/
 
 # Build output from tools/verify-custom-accent.mjs.
 tools/accent-parity/out/
+
+# Rust build artifacts
+/target/
+/vendor/
+/.cargo/config.toml
+
+# Staged Cargo sources for offline Flatpak builds
+/.flatpak-cargo/

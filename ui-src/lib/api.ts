@@ -60,6 +60,7 @@ export const api = {
 
   // The list endpoints wrap their payload in an envelope. Unwrapped here so
   // callers only ever see the list.
+  clipInfo: (slug: string) => request<Clip>(`/api/clips/${enc(slug)}`),
   clips: async () => (await request<{clips: Clip[]}>('/api/clips')).clips,
   /** Re-scan the output directory and repair playlist tags where needed. */
   rescanLibrary: () =>

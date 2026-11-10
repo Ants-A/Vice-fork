@@ -1,6 +1,11 @@
+import {preferSmallerPreview} from '../lib/mediaSupport';
 import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
 
 import {api} from '../lib/api';
+import {H264_SUPPORTED, WEBM_SUPPORTED} from '../lib/env';
+import {useVideoBuffer} from '../lib/useVideoBuffer';
+import {onWsMessage} from '../lib/ws';
+import type {BufferedRange} from '../lib/mediaBuffer';
 import {useEscape} from '../lib/escape';
 import {DEFAULT_MARK_COLOR, MARK_COLORS} from '../lib/palette';
 import {useExitTransition} from '../lib/exit';
@@ -125,6 +130,29 @@ export function Viewer(props: ViewerProps) {
   const [position, setPosition] = useState({current: 0, duration: 0});
   const [paused, setPaused] = useState(true);
   const [preparing, setPreparing] = useState(false);
+  const [previewProgress, setPreviewProgress] = useState<number | null>(null);
+  const [quality, setQuality] = useState<{slug: string; smaller: boolean} | null>(null);
+  const smaller = Boolean(clip && (quality?.slug === clip.slug ? quality.smaller : preferSmallerPreview(clip.size, clip.duration)));
+  const source = playbackUrl(clip, smaller);
+  const buffer = useVideoBuffer(videoRef, props.clip !== null, source, clip?.duration ?? 0);
+  useEffect(() => {setPreviewProgress(null);}, [source, props.clip?.slug]);
+  useEffect(() => onWsMessage(msg => {
+    if (msg.type === 'preview_progress' && msg.slug === clip?.slug && Number.isFinite(msg.progress)) {
+      setPreviewProgress(Math.max(0, Math.min(1, msg.progress)));
+    }
+    const video = videoRef.current;
+    if (msg.type === 'preview_ready' && msg.slug === clip?.slug && video?.currentSrc.includes('proxy=webm') && !Number.isFinite(video.duration)) {
+      const at = video.currentTime;
+      const playing = !video.paused;
+      const expected = video.getAttribute('src');
+      video.addEventListener('loadedmetadata', () => {
+        if (video.getAttribute('src') !== expected) return;
+        seekTo(video, at);
+        if (playing) playQuietly(video);
+      }, {once: true});
+      video.load();
+    }
+  }), [clip?.slug]);
   const [dragging, setDragging] = useState<string | null>(null);
   const [picker, setPicker] = useState<{id: string; color: string; at: {x: number; y: number}} | null>(
     null,
@@ -163,7 +191,7 @@ export function Viewer(props: ViewerProps) {
   useLayoutEffect(() => {
     const video = videoRef.current;
     if (!open || !video || !clip) return;
-    const src = playbackUrl(clip);
+    const src = source;
     if (video.getAttribute('src') === src) {
       if (!trimOpen) playQuietly(video);
       return;
@@ -171,13 +199,13 @@ export function Viewer(props: ViewerProps) {
     video.pause();
     video.src = src;
     video.load();
-    setPreparing(clipNeedsProxy(clip));
-    setPosition({current: 0, duration: 0});
+    setPreparing(clipNeedsProxy(clip) || smaller);
+    setPosition({current: 0, duration: clip.duration ?? 0});
     if (!trimOpen) playQuietly(video);
     void api
       .markViewed(clip.slug)
       .catch(err => console.debug('Recording the view failed', err));
-  }, [clip, trimOpen, open]);
+  }, [clip, trimOpen, open, source, smaller]);
 
   // The keys kept beside this clip, when there are any (#209).
   const keysSlug = clip?.keys ? clip.slug : null;
@@ -431,7 +459,7 @@ export function Viewer(props: ViewerProps) {
 
   if (!mounted || !clip) return null;
 
-  const duration = position.duration;
+  const duration = Math.max(position.duration, clip?.duration ?? 0);
   const percent = duration > 0 ? (position.current / duration) * 100 : 0;
 
   const seekFromPointer = (clientX: number) => {
@@ -634,10 +662,20 @@ export function Viewer(props: ViewerProps) {
               {formatDuration(position.current, true)} / {formatDuration(duration, true)}
             </span>
 
-            {preparing ? (
-              <div className="video-overlay" onClick={e => e.stopPropagation()}>
-                <span className="video-spinner" aria-hidden="true" />
-                <p>{t('viewer.preparingPreview')}</p>
+            {!failed && (preparing || buffer.waiting) ? (
+              <div className="video-overlay video-buffering" role="status" aria-live="polite" onClick={e => e.stopPropagation()}>
+                <p>{t(preparing ? 'viewer.preparingPreview' : 'viewer.buffering')}</p>
+                <progress
+                  className="video-buffer-progress"
+                  aria-label={t(preparing ? 'viewer.preparingPreview' : 'viewer.buffering')}
+                  max={100}
+                  value={preparing ? (previewProgress === null ? undefined : previewProgress * 100) : (buffer.percent ? buffer.percent : undefined)}
+                />
+                <span className="video-buffer-caption mono">
+                  {preparing
+                    ? previewProgress === null ? t('viewer.preparingWait') : `${Math.floor(previewProgress * 100)}%`
+                    : buffer.percent !== null && buffer.percent > 0 ? t('viewer.bufferedPercent', {percent: Math.floor(buffer.percent)}) : t('viewer.connecting')}
+                </span>
               </div>
             ) : null}
 
@@ -651,6 +689,8 @@ export function Viewer(props: ViewerProps) {
                 <span className="mono player-tc">{formatDuration(position.current, true)}</span>
                 <Scrubber
                   percent={percent}
+                  ranges={buffer.ranges}
+                  duration={duration}
                   onSeek={ratio => seekTo(videoRef.current, ratio * duration)}
                 />
                 <span className="mono player-tc">{formatDuration(duration, true)}</span>
@@ -700,6 +740,7 @@ export function Viewer(props: ViewerProps) {
               className="viewer-timeline"
               ref={timelineRef}
               onClick={e => seekFromPointer(e.clientX)}>
+              <BufferedTrack ranges={buffer.ranges} duration={duration} />
               <div className="viewer-progress" style={{width: `${percent}%`}} />
               <div className="viewer-playhead" style={{left: `${percent}%`}} />
               {highlights.map(h => (
@@ -822,6 +863,13 @@ export function Viewer(props: ViewerProps) {
                   }}>
                   {t('viewer.playlist')}
                 </button>
+                {H264_SUPPORTED && WEBM_SUPPORTED ? (
+                  <button type="button" className="btn btn-quiet btn-sm" aria-pressed={smaller}
+                    title={t('viewer.smallerPreviewHint')}
+                    onClick={() => setQuality({slug: clip.slug, smaller: !smaller})}>
+                    {t(smaller ? 'viewer.originalQuality' : 'viewer.smallerPreview')}
+                  </button>
+                ) : null}
                 <button type="button" className="btn btn-quiet btn-sm" onClick={() => props.onTrim(clip)}>
                   {t('viewer.trim')}
                 </button>
@@ -1004,7 +1052,12 @@ function PlayerBar({
 }
 
 /** A seekable track. Click anywhere, or press and drag along it. */
-function Scrubber({percent, onSeek}: {percent: number; onSeek: (ratio: number) => void}) {
+function BufferedTrack({ranges, duration}: {ranges: BufferedRange[]; duration: number}) {
+  if (!(duration > 0)) return null;
+  return <>{ranges.map((range, i) => <div key={i} className="viewer-buffered" style={{left: `${range.start / duration * 100}%`, width: `${(range.end - range.start) / duration * 100}%`}} />)}</>;
+}
+
+function Scrubber({percent, ranges, duration, onSeek}: {percent: number; ranges: BufferedRange[]; duration: number; onSeek: (ratio: number) => void}) {
   const trackRef = useRef<HTMLDivElement>(null);
 
   const ratioAt = (clientX: number): number | null => {
@@ -1035,6 +1088,7 @@ function Scrubber({percent, onSeek}: {percent: number; onSeek: (ratio: number) =
 
   return (
     <div className="player-track" ref={trackRef} onPointerDown={begin}>
+      <BufferedTrack ranges={ranges} duration={duration} />
       <div className="player-fill" style={{width: `${percent}%`}} />
       <div className="player-knob" style={{left: `${percent}%`}} />
     </div>

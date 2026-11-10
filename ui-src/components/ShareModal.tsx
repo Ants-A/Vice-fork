@@ -1,3 +1,4 @@
+import {onWsMessage} from '../lib/ws';
 import {useEffect, useRef, useState} from 'react';
 
 import {api} from '../lib/api';
@@ -38,6 +39,10 @@ export function ShareModal({
 }) {
   const [copy, setCopy] = useState<DiscordCopy | null>(null);
   const [failed, setFailed] = useState('');
+  const [progress, setProgress] = useState<number | null>(null);
+  useEffect(() => onWsMessage(msg => {
+    if (msg.type === 'discord_progress' && msg.slug === clip?.slug) setProgress(msg.progress);
+  }), [clip?.slug]);
   const slug = clip?.slug;
 
   // The file has to exist on disk before the drag starts: a dragstart handler
@@ -47,6 +52,7 @@ export function ShareModal({
     let cancelled = false;
     setCopy(null);
     setFailed('');
+    setProgress(null);
     void api
       .discordCopy(slug)
       .then(result => {
@@ -116,7 +122,7 @@ export function ShareModal({
           {shown.duration ? (
             <span className="share-drag-time mono">{formatDuration(shown.duration)}</span>
           ) : null}
-          {copy ? null : <span className="share-drag-veil">{t('viewer.sharePreparing')}</span>}
+          {copy ? null : <span className="share-drag-veil">{failed || t('viewer.sharePreparing')}</span>}
         </div>
 
         <div className="share-drag-copy">
@@ -132,6 +138,7 @@ export function ShareModal({
           </span>
         </div>
 
+        {!copy && !failed && <progress aria-label={t('viewer.sharePreparing')} max={1} value={progress ?? undefined} style={{width: '100%'}} />}
         <button
           type="button"
           className="btn btn-sm share-copy-file"

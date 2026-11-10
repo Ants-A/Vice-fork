@@ -32,7 +32,7 @@ post_upgrade() {
         echo ":: Links you shared before this update no longer work; copy a"
         echo ":: fresh link from Vice for any clip you want to share again."
     fi
-    # The daemon holds the old Python in memory until it restarts, and nothing
+    # The daemon keeps the old executable in memory until it restarts, and nothing
     # here can reach the user's session bus to do it for them.
     echo ":: A running daemon keeps the previous version until it restarts:"
     echo "::   systemctl --user restart vice.service"

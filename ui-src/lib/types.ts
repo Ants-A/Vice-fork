@@ -16,6 +16,7 @@ export interface Clip {
   /** Keys were kept beside this clip for the viewer's keyboard overlay. */
   keys?: boolean;
   duration: number | null;
+  metadata_pending?: boolean;
   width: number | null;
   height: number | null;
   vcodec: string | null;
@@ -185,6 +186,8 @@ export type WsMessage =
   | {type: 'session_start'}
   | {type: 'session_stop'}
   | {type: 'session_highlight'; time?: number}
+  | {type: 'preview_ready'; slug: string}
+  | {type: 'preview_progress' | 'discord_progress'; slug: string; progress: number}
   | {type: 'export_progress'; [key: string]: unknown}
   | {type: 'export_done'; [key: string]: unknown}
   | {type: 'export_error'; [key: string]: unknown}

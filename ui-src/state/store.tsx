@@ -12,7 +12,7 @@ import {
 import {api} from '../lib/api';
 import {connectWs} from '../lib/ws';
 import {formatDuration, hotkeyLabel} from '../lib/format';
-import {H264_SUPPORTED} from '../lib/env';
+import {H264_SUPPORTED, WEBM_SUPPORTED} from '../lib/env';
 import {ACCENT_NAMES, DEFAULT_ACCENT} from '../theme/accents';
 import type {AccentChoice} from '../theme/viceTheme';
 import {clipTitle, imageSlug, imageTitle, type KeyOverlayState} from '../lib/types';
@@ -580,6 +580,23 @@ export function StoreProvider({children}: {children: ReactNode}) {
     return () => window.clearInterval(timer);
   }, [state.ready, state.clips.length]);
 
+  // Recover metadata updates even when hydration finishes before the socket opens.
+  const metadataPending = state.clips.some(clip => clip.metadata_pending || (clip.duration === null && !clip.unreadable));
+  useEffect(() => {
+    if (!state.ready || !metadataPending) return;
+    let cancelled = false;
+    let timer: number;
+    const poll = async () => {
+      try {
+        const clips = await api.clips();
+        if (!cancelled) dispatch({type: 'setClips', clips});
+      } catch (err) {console.debug('Refreshing clip details failed', err);}
+      if (!cancelled) timer = window.setTimeout(poll, 5000);
+    };
+    timer = window.setTimeout(poll, 1500);
+    return () => {cancelled = true; window.clearTimeout(timer);};
+  }, [state.ready, metadataPending]);
+
   // Transient island events expire on their own.
   useEffect(() => {
     if (!state.event) return;
@@ -590,7 +607,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
 
   // Say it once, on the machines where it is true: clips will never play here.
   useEffect(() => {
-    if (state.ready && !H264_SUPPORTED) {
+    if (state.ready && !H264_SUPPORTED && !WEBM_SUPPORTED) {
       dispatch({
         type: 'event',
         event: {

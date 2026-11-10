@@ -34,7 +34,7 @@ const PlaybackContext = createContext<Playback | null>(null);
  * than inside a screen because the viewer has to survive a change of view.
  */
 export function PlaybackProvider({children}: {children: ReactNode}) {
-  const {state, notify, refreshClips} = useStore();
+  const {state, dispatch, notify, refreshClips} = useStore();
   const {clips} = state;
 
   const [viewerSlug, setViewerSlug] = useState<string | null>(null);
@@ -54,6 +54,16 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
     document.querySelectorAll<HTMLVideoElement>('video.clip-preview').forEach(v => v.pause());
     setViewerSlug(slug);
   }, []);
+
+  // Prioritize the selected clip if its library metadata is still cold.
+  useEffect(() => {
+    if (!viewerSlug) return;
+    let live = true;
+    void api.clipInfo(viewerSlug).then(clip => {
+      if (live) dispatch({type: 'ws', msg: {type: 'clip_saved', clip}});
+    }).catch(err => console.debug('Reading clip details failed', err));
+    return () => {live = false;};
+  }, [viewerSlug, dispatch]);
 
   const openTrim = useCallback((slug: string) => setTrimSlug(slug), []);
 

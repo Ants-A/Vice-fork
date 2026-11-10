@@ -10,7 +10,7 @@ set -euo pipefail
 repo="$(pwd)"
 srcinfo_field() { sed -n "s/^\t$1 = //p" "$repo/.SRCINFO"; }
 
-pacman -Syu --noconfirm --needed git $(srcinfo_field makedepends) >/dev/null
+pacman -Syu --noconfirm --needed git $(srcinfo_field makedepends) $(srcinfo_field depends) >/dev/null
 
 # makepkg refuses to run as root.
 id builder &>/dev/null || useradd -m builder
@@ -59,9 +59,15 @@ for path in usr/bin/vice usr/bin/vice-app \
         exit 1
     fi
 done
-built="$(tar -xOf "$pkg" --wildcards '*/site-packages/vice/__init__.py' | sed -n 's/^__version__ = "\(.*\)"/\1/p')"
+for path in usr/share/vice/ui/index.html usr/share/vice/fonts/Geist-Regular.ttf usr/share/vice/data/games.json; do
+    if ! grep -qx "$path" <<<"$listing"; then
+        echo "::error::the package is missing $path"
+        exit 1
+    fi
+done
+built="$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -1)"
 if [ "$built" != "$pkgver" ]; then
-    echo "::error::PKGBUILD says $pkgver but the package reports $built"
+    echo "::error::PKGBUILD says $pkgver but Cargo.toml reports $built"
     exit 1
 fi
 echo "Built $(basename "$pkg")"

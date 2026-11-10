@@ -4,7 +4,7 @@ import {endClipDrag, startClipDrag} from '../lib/clipDrag';
 import {formatBytes, formatDuration} from '../lib/format';
 import {clipTitle, type Clip} from '../lib/types';
 import {H264_SUPPORTED} from '../lib/env';
-import {playbackUrl} from '../lib/playback';
+import {playbackUrl, clipNeedsProxy} from '../lib/playback';
 import {t} from '../lib/i18n';
 import {InlineRename} from './InlineRename';
 
@@ -23,7 +23,7 @@ const PREVIEW_RELEASE_MS = 4000;
  * those requests while a clip is playing so playback gets the network share
  * to itself. The card then asks again, backing off, until the frame is ready.
  */
-const THUMB_RETRY_MS = [2000, 5000, 10000, 20000, 30000];
+const THUMB_RETRY_MS = [1000, 2000, 4000, 8000, 15000];
 
 export interface ClipActions {
   onOpen?: (clip: Clip) => void;
@@ -76,7 +76,7 @@ export const ClipCard = memo(function ClipCard({
   };
 
   const broken = clip.unreadable;
-  const canPreview = H264_SUPPORTED && !broken && !previewFailed && Boolean(clip.thumb_url);
+  const canPreview = H264_SUPPORTED && !clipNeedsProxy(clip) && !broken && !previewFailed && Boolean(clip.thumb_url);
 
   useEffect(() => () => window.clearTimeout(releaseTimer.current), []);
 

@@ -6,7 +6,7 @@
 # .flatpakref and .flatpakrepo that point at it. The bundle then carries the
 # repo's address, so anyone who installed it gets updates with flatpak update.
 #
-# Runs in the flatpak-github-actions KDE container, in CI and by hand.
+# Runs in the flatpak-github-actions GNOME container, in CI and by hand.
 set -euo pipefail
 
 APP_ID=io.github.splitshotz.Vice
@@ -18,6 +18,12 @@ BUILD_DIR=${BUILD_DIR:-build/flatpak-app}
 STATE_DIR=${STATE_DIR:-.flatpak-builder}
 
 flatpak remote-add --if-not-exists flathub "$FLATHUB"
+
+# flatpak-builder builds without network access. Download exactly Cargo.lock's
+# sources before entering its sandbox, then expose them as .cargo/vendor.
+mkdir -p .flatpak-cargo
+cargo vendor --locked --versioned-dirs .flatpak-cargo/vendor > .flatpak-cargo/config.toml
+sed -i 's|".flatpak-cargo/vendor"|".cargo/vendor"|' .flatpak-cargo/config.toml
 
 # build REPO [export options]: build, check, and only then export, so a
 # build that fails the check never reaches the repo.
@@ -31,21 +37,22 @@ build() {
     flatpak build-export "$@" "$repo" "$BUILD_DIR" "$BRANCH"
 }
 
-# Everything Vice imports or runs has to be in the build, not just compile.
+# Run the compiled CLI and check all installed assets and media tools.
 smoke() {
     flatpak build "$BUILD_DIR" sh -c '
         set -e
-        python3 -c "
-import gi, cairo, evdev, aiohttp, webview, qtpy, vice.main
-gi.require_version(\"Gtk\", \"3.0\")
-gi.require_version(\"GtkLayerShell\", \"0.1\")
-from gi.repository import Gtk, GtkLayerShell
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-"
-        for tool in xdotool xprop wmctrl wl-copy xclip ffmpeg ffprobe paplay flatpak-spawn vice vice-app; do
+        vice --version
+        vice --help >/dev/null
+        for tool in xdotool xprop wmctrl wl-copy xclip ffmpeg ffprobe flatpak-spawn vice vice-app; do
             command -v "$tool" >/dev/null || { echo "missing in the Flatpak: $tool"; exit 1; }
         done
-        test -x /app/bin/QtWebEngineProcess
+        test -e /app/lib/libayatana-appindicator3.so.1
+        test -e /app/lib/libgtk-layer-shell.so.0
+        test -s /app/share/vice/ui/index.html
+        test -s /app/share/vice/fonts/Geist-Regular.ttf
+        for encoder in libx264 libvpx libopus; do
+            ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "$encoder"
+        done
     '
 }
 

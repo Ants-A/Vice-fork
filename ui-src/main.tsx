@@ -14,7 +14,7 @@ import './styles/settings.css';
 import './styles/editor.css';
 
 import {initLocale, subscribeLocale, t} from './lib/i18n';
-import {setNativeTrayLabels} from './lib/env';
+import {setNativeTrayLabels, setNativeScale} from './lib/env';
 import {accentVars, resolveAccent} from './theme/viceTheme';
 import {StoreProvider, useStore} from './state/store';
 import {PlaybackProvider} from './state/playback';
@@ -46,6 +46,10 @@ function App() {
       syncNativeTrayLabels();
     });
   }, []);
+
+  useEffect(() => {
+    setNativeScale(Number(state.config?.ui?.scale ?? 1));
+  }, [state.config?.ui?.scale]);
 
   // The boot cover is in index.html so it paints before this bundle parses.
   // It goes once there is real data behind it, not merely once React mounted.

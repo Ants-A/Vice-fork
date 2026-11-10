@@ -1,3 +1,5 @@
+import {supportsAnyVideo} from './mediaSupport';
+
 /**
  * Facts about the window we are running in, decided once at module load.
  *
@@ -6,9 +8,8 @@
  */
 
 /**
- * The pywebview native window. vice-app passes ?native=1 in the URL because
- * window.pywebview is only injected after DOMContentLoaded, which is too late
- * to get the quit row right on the first paint.
+ * The Rust native window exposes the existing pywebview-compatible bridge.
+ * vice-app also passes ?native=1 so native controls are correct on first paint.
  */
 export const IS_NATIVE: boolean = (() => {
   try {
@@ -34,20 +35,22 @@ export const IS_SOFTWARE_RENDER: boolean = (() => {
 
 /**
  * Whether this engine can decode H.264 at all. Every Vice clip is H.264, but
- * QtWebEngine builds without proprietary codecs (the PyPI PyQt6-WebEngine
- * wheels) silently render video as a blank rectangle, so the UI has to say
+ * A media engine without the GStreamer codecs can render video as a blank
+ * rectangle, so the UI has to say
  * what is wrong instead of showing grey (#79).
  */
-export const H264_SUPPORTED: boolean = (() => {
-  try {
-    return document.createElement('video').canPlayType('video/mp4; codecs="avc1.640028"') !== '';
-  } catch {
-    return true; // Assume capable: a false banner is worse than no banner.
-  }
-})();
+export const H264_SUPPORTED: boolean = supportsAnyVideo(
+  type => document.createElement('video').canPlayType(type),
+  ['video/mp4; codecs="avc1.42E01E"', 'video/mp4; codecs="avc1.4D401F"', 'video/mp4; codecs="avc1.640028"'],
+);
+
+export const WEBM_SUPPORTED: boolean = supportsAnyVideo(
+  type => document.createElement('video').canPlayType(type),
+  ['video/webm; codecs="vp8, opus"'],
+);
 
 /**
- * H.265 clips usually cannot decode in the native WebEngine. When they cannot,
+ * H.265 clips usually cannot decode in the native media engine. When they cannot,
  * the UI asks the daemon for an H.264 preview proxy instead of the raw file.
  */
 export const HEVC_SUPPORTED: boolean = (() => {
@@ -64,6 +67,7 @@ export const HEVC_SUPPORTED: boolean = (() => {
 
 interface PyWebView {
   api: {
+    set_ui_scale?: (scale: number) => void;
     keep_running: () => void;
     quit_app: () => void;
     set_tray_labels?: (openLabel: string, quitLabel: string) => void;
@@ -138,4 +142,17 @@ export function quitVice(): void {
   } else {
     void fetch('/api/quit', {method: 'POST'}).catch(() => {});
   }
+}
+
+/** Native page zoom scales the viewport and pointer coordinates together. */
+export function setNativeScale(scale: number): void {
+  if (!IS_NATIVE) return;
+  const value = Number.isFinite(scale) ? Math.min(2, Math.max(0.75, scale)) : 1;
+  const apply = () => {
+    const bridge = (window as unknown as {pywebview?: PyWebView}).pywebview;
+    if (!bridge?.api?.set_ui_scale) return false;
+    bridge.api.set_ui_scale(value);
+    return true;
+  };
+  if (!apply()) window.addEventListener('pywebviewready', apply, {once: true});
 }

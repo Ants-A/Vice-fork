@@ -1134,6 +1134,19 @@ export function Settings() {
 
         {/* ── Appearance ────────────────────────────────────────── */}
         <Card id="appearance" title={t('settings.secAppearance')} register={register('appearance')}>
+          <Row label={t('settings.uiScale')} help={t('settings.uiScaleHelp')}>
+            <Select
+              label={t('settings.uiScale')}
+              value={String(Math.round(Number(config?.ui?.scale ?? 1) * 100))}
+              options={[75, 90, 100, 110, 125, 150, 175, 200].map(value => [String(value), `${value}%`] as [string, string])}
+              onChange={value => {
+                void saveConfig({ui: {scale: Number(value) / 100}}).catch(err =>
+                  notify({kind: 'error', title: t('settings.scaleFailed'), detail: err.message, tone: 'error', holdMs: 6000}),
+                );
+              }}
+            />
+          </Row>
+
           <Row label={t('settings.language')} help={t('settings.languageHelp')}>
             <Select
               label={t('settings.language')}

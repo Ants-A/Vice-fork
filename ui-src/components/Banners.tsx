@@ -1,5 +1,5 @@
 import {useStore, type BannerId} from '../state/store';
-import {H264_SUPPORTED} from '../lib/env';
+import {H264_SUPPORTED, WEBM_SUPPORTED} from '../lib/env';
 import {IconClose, IconWarning} from './Icons';
 import {t} from '../lib/i18n';
 import {needsGsrSetup} from './GsrSetup';
@@ -61,13 +61,13 @@ export function Banners() {
         </Banner>
       ) : null}
 
-      {!H264_SUPPORTED && showing('codec-h264') ? (
+      {!H264_SUPPORTED && !WEBM_SUPPORTED && showing('codec-h264') ? (
         <Banner tone="warning" onDismiss={dismiss('codec-h264')}>
           <strong>{t('banners.cannotPlay')}</strong>
           <span>{t('banners.cannotPlayHelp')}</span>
-          <span className="banner-mono">sudo apt install python3-pyqt6.qtwebengine</span>
-          <span className="banner-mono">sudo dnf install python3-pyqt6-webengine</span>
-          <span className="banner-mono">sudo zypper install python3-qt6-webengine</span>
+          <span className="banner-mono">sudo apt install gstreamer1.0-libav gstreamer1.0-plugins-good</span>
+          <span className="banner-mono">sudo dnf install gstreamer1-plugins-good gstreamer1-plugin-libav</span>
+          <span className="banner-mono">sudo zypper install gstreamer-plugins-libav</span>
         </Banner>
       ) : null}
     </div>
