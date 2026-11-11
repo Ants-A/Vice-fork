@@ -61,6 +61,8 @@ export interface Highlight {
 export interface Playlist {
   id: string;
   kind: 'auto' | 'custom' | string;
+  /** Original game-tag precedence, independent of sidebar sorting. */
+  game_priority?: number;
   /** Automatic game artwork, an uploaded PNG data URL, or empty for emoji. */
   icon?: string;
   name: string;

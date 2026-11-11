@@ -132,6 +132,13 @@ esac
   const base = `http://127.0.0.1:${port}`;
   const config = `[recording]\nbackend="gsr"\ngsr_source="native"\ncapture_audio=false\n[output]\ndirectory=${JSON.stringify(path.join(root, 'clips'))}\nimage_directory=${JSON.stringify(path.join(root, 'images'))}\nauto_playlist_by_game=false\n[sharing]\nenabled=false\ncloudflare_tunnel=false\nport=${port}\n[discord]\nenabled=false\n[updates]\ncheck_on_start=false\n[hotkeys]\nclip=""\n[notifications]\nsound_volume=0.0\n`;
   await fs.writeFile(path.join(root, 'config.toml'), config);
+  if (process.env.VICE_SMOKE_LIVE_TAGS === '1') {
+    await fs.mkdir(path.join(root,'data'), {recursive:true});
+    await fs.writeFile(path.join(root,'data/playlists.json'), JSON.stringify({version:1,dismissed_auto:[],playlists:[{
+      id:'auto:live-tag',kind:'auto',name:'Live tag game',game:'Live tag game',emoji:'',icon:'',edited:true,
+      color1:'#ff5722',color2:'#111111',clip_slugs:[],created_at:'2026-01-01T00:00:00'
+    }]}));
+  }
   const env = {...process.env, VICE_SMOKE_FIXTURE: path.join(root, 'clips/smoke.mp4'), VICE_SMOKE_CLIPS: path.join(root, 'clips'), VICE_CONFIG: path.join(root, 'config.toml'), VICE_DATA_DIR: path.join(root, 'data'), VICE_CACHE_DIR: path.join(root, 'cache'), VICE_RESOURCE_DIR: path.join(repo, 'vice'), XDG_RUNTIME_DIR: path.join(root, 'run'), TMPDIR: path.join(root, 'tmp'), PATH: `${path.join(root, 'bin')}:${process.env.PATH}`};
   delete env.INVOCATION_ID; delete env.JOURNAL_STREAM;
   daemon = spawn(binary, ['start', '--no-open-ui'], {env, detached: true, stdio: ['ignore', 'pipe', 'pipe']});
@@ -369,9 +376,20 @@ esac
     await fs.writeFile('/tmp/vice-dark-theme.png', Buffer.from(darkPng.data, 'base64'));
     lifecycle.darkTheme = true; lifecycle.playlistIcon = true;
   }
+  let liveTags = false;
+  if (process.env.VICE_SMOKE_LIVE_TAGS === '1') {
+    const sourceBeforeTags = await cdp.evaluate(`document.querySelector('.viewer-video').getAttribute('src')`);
+    assert((await fetch(`${base}/api/playlists/auto%3Alive-tag/clips`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({slug:'smoke'})})).ok);
+    await until(() => cdp.evaluate(`document.querySelector('.clip-game')?.textContent==='Live tag game'&&document.querySelector('.player-titles .mono')?.textContent==='Live tag game'`), 'adding a game tag did not update the card and open viewer immediately', 2000);
+    assert.equal(await cdp.evaluate(`document.querySelector('.viewer-video').getAttribute('src')`), sourceBeforeTags, 'a tag update must not reload the video');
+    assert((await fetch(`${base}/api/playlists/auto%3Alive-tag/clips/smoke`, {method:'DELETE'})).ok);
+    await until(() => cdp.evaluate(`Boolean(document.querySelector('.clip-game[data-untagged]'))&&document.querySelector('.player-titles .mono')?.textContent===''`), 'removing a tag left stale labels', 2000);
+    assert.equal(await cdp.evaluate(`document.querySelector('.viewer-video').getAttribute('src')`), sourceBeforeTags, 'removing a tag must not reload the video');
+    liveTags = true;
+  }
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));
-  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
+  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
   if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }

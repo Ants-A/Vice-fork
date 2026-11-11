@@ -28,6 +28,7 @@ enum Backend {
     Actual,
     SimulatedNvenc,
     SimulatedNvencFailure,
+    SimulatedAsyncInputFailure,
 }
 #[tokio::test]
 async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> Result<()> {
@@ -41,6 +42,10 @@ async fn nvidia_minimum_resolution_probe_keeps_nvenc_for_discord_copy() -> Resul
 async fn nvidia_job_failure_retries_cpu_and_reports_the_failed_encoder() -> Result<()> {
     discord_case(Backend::SimulatedNvencFailure).await
 }
+#[tokio::test]
+async fn asynchronous_input_failure_retries_raw_input_with_the_same_gpu_encoder() -> Result<()> {
+    discord_case(Backend::SimulatedAsyncInputFailure).await
+}
 async fn discord_case(backend: Backend) -> Result<()> {
     let Some(ffmpeg) = vice::runtime::which("ffmpeg") else {
         return Ok(());
@@ -48,7 +53,9 @@ async fn discord_case(backend: Backend) -> Result<()> {
     if vice::runtime::which("ffprobe").is_none() {
         return Ok(());
     }
-    let temp = tempfile::tempdir()?;
+    let temp = tempfile::Builder::new()
+        .prefix("vice-discord + ? ")
+        .tempdir()?;
     let root = temp.path();
     for name in ["bin", "clips", "images", "run"] {
         std::fs::create_dir(root.join(name))?;
@@ -67,7 +74,11 @@ async fn discord_case(backend: Backend) -> Result<()> {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc2=duration=2:size=320x180:rate=30",
+                if backend == Backend::Actual {
+                    "testsrc2=duration=2:size=1440x810:rate=30"
+                } else {
+                    "testsrc2=duration=2:size=320x180:rate=30"
+                },
                 "-f",
                 "lavfi",
                 "-i",
@@ -101,6 +112,7 @@ async fn discord_case(backend: Backend) -> Result<()> {
             .open(&source)?
             .set_len(24 * 1024 * 1024)?;
     }
+    let original_info = vice::media::probe_media(&source).await?;
     let original_size = std::fs::metadata(&source)?.len();
     let original_mtime = std::fs::metadata(&source)?.modified()?;
     let invocation_log = root.join("ffmpeg.log");
@@ -129,6 +141,14 @@ for argument do
     [ "$previous" = -pix_fmt ] && pixel=$argument
     previous=$argument
 done
+case "$input" in
+    async:file:*)
+        if [ "$VICE_TEST_ASYNC_FAIL" = 1 ]; then
+            echo 'simulated asynchronous file read unavailable' >&2
+            exit 43
+        fi
+        ;;
+esac
 if [ "$codec" = h264_nvenc ]; then
     case "$input" in
         color=*)
@@ -218,6 +238,14 @@ exec "$VICE_REAL_FFMPEG" "$@"
                 "0"
             },
         )
+        .env(
+            "VICE_TEST_ASYNC_FAIL",
+            if backend == Backend::SimulatedAsyncInputFailure {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("VICE_TEST_CLIPBOARD", root.join("clipboard"))
         .env(
             "PATH",
@@ -269,7 +297,22 @@ exec "$VICE_REAL_FFMPEG" "$@"
     assert!(path.starts_with(root.join("cache")));
     let info = vice::media::probe_media(&path).await?;
     assert_eq!(info.vcodec, "h264");
-    assert_eq!(info.audio_streams, 1);
+    assert_eq!(
+        info.audio_streams, original_info.audio_streams,
+        "Discord copies retain every audio track"
+    );
+    assert!(info.width <= 1280 && info.width <= original_info.width);
+    assert_eq!(info.width % 2, 0);
+    assert_eq!(info.height % 2, 0);
+    let expected_width = original_info.width.min(1280) / 2 * 2;
+    assert_eq!(info.width, expected_width);
+    assert!(
+        (info.height as f64
+            - original_info.height as f64 * info.width as f64 / original_info.width as f64)
+            .abs()
+            <= 2.0,
+        "resizing must retain aspect ratio within even-pixel rounding"
+    );
     assert!(info.duration > 1.8);
     let pixel = Command::new("ffprobe")
         .args([
@@ -295,10 +338,13 @@ exec "$VICE_REAL_FFMPEG" "$@"
     let encoded_mtime = std::fs::metadata(&path)?.modified()?;
     let log_before = std::fs::read_to_string(&invocation_log)?;
     let source_arg = format!("-i {}", source.display());
+    let async_source_arg = format!("-i async:file:{}", source.display());
     let jobs: Vec<_> = log_before
         .lines()
         .filter(|line| {
-            line.starts_with("START\t") && line.contains(&source_arg) && line.contains("-c:v ")
+            line.starts_with("START\t")
+                && (line.contains(&source_arg) || line.contains(&async_source_arg))
+                && line.contains("-c:v ")
         })
         .collect();
     assert!(!jobs.is_empty(), "Discord API must invoke the encoder");
@@ -318,7 +364,9 @@ exec "$VICE_REAL_FFMPEG" "$@"
         .and_then(|s| s.split_whitespace().next())
         .unwrap_or("unknown");
     eprintln!(
-        "Discord API conversion completed with {encoder}; valid H.264/audio copy stays under 20 MB"
+        "Discord API conversion completed with {encoder}; direct GPU decode/resize={}; async input={}; valid H.264/audio copy stays under 20 MB",
+        completed.contains("-hwaccel_output_format"),
+        completed.contains("-i async:file:")
     );
     let daemon_log = std::fs::read_to_string(root.join("daemon.log"))?;
     match backend {
@@ -337,6 +385,16 @@ exec "$VICE_REAL_FFMPEG" "$@"
             assert_eq!(encoder, "libx264");
             assert!(daemon_log.contains("simulated NVIDIA encoder initialization failure"));
             assert!(daemon_log.contains("encoder=h264_nvenc"));
+        }
+        Backend::SimulatedAsyncInputFailure => {
+            assert_eq!(
+                encoder, "h264_nvenc",
+                "failed async reads must retry the same GPU encoder before CPU encoding"
+            );
+            assert!(!completed.contains("-i async:file:"));
+            assert!(jobs[0].contains("-i async:file:"));
+            assert!(daemon_log.contains("simulated asynchronous file read unavailable"));
+            assert!(!jobs.iter().any(|line| line.contains("-c:v libx264")));
         }
         Backend::Actual => {}
     }
@@ -368,7 +426,7 @@ exec "$VICE_REAL_FFMPEG" "$@"
         .json()
         .await?;
     assert!(
-        copied_at.elapsed() < Duration::from_secs(5),
+        copied_at.elapsed() < Duration::from_millis(250),
         "clipboard owner must not block the response"
     );
     assert_eq!(copy["ok"], true);
@@ -380,6 +438,54 @@ exec "$VICE_REAL_FFMPEG" "$@"
     );
     assert_eq!(std::fs::metadata(&source)?.len(), original_size);
     assert_eq!(std::fs::metadata(&source)?.modified()?, original_mtime);
+    // Renaming changes presentation only. Keep already copied clipboard paths
+    // usable, and reuse the encoded bytes under the clip's new filename.
+    let renamed: Value = client
+        .post(format!("{base}/api/clips/clip/rename"))
+        .json(&serde_json::json!({"name":"Renamed Discord clip"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(renamed["slug"], "clip");
+    let renamed_source = root.join("clips/Renamed Discord clip.mp4");
+    assert!(renamed_source.is_file());
+    assert_eq!(std::fs::metadata(&renamed_source)?.len(), original_size);
+    assert_eq!(
+        std::fs::metadata(&renamed_source)?.modified()?,
+        original_mtime
+    );
+    assert!(
+        path.is_file(),
+        "renaming must not break the file URI already placed on the clipboard"
+    );
+    let started = std::time::Instant::now();
+    let after_rename: Value = client
+        .get(format!("{base}/api/clips/clip/discord"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "rename caused a slow Discord copy: {elapsed:?}"
+    );
+    let renamed_copy =
+        std::path::PathBuf::from(after_rename["path"].as_str().context("renamed copy path")?);
+    assert_eq!(
+        std::fs::read(&renamed_copy)?,
+        std::fs::read(&path)?,
+        "renaming should reuse exactly the existing encoded bytes"
+    );
+    assert_eq!(std::fs::metadata(&path)?.modified()?, encoded_mtime);
+    assert_eq!(
+        std::fs::read_to_string(&invocation_log)?,
+        log_before,
+        "renaming an unchanged video must not launch another FFmpeg job"
+    );
     client
         .post(format!("{base}/api/quit"))
         .send()

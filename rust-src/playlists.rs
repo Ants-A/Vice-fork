@@ -206,7 +206,18 @@ impl PlaylistStore {
         )
     }
     pub fn list_playlists(&self) -> Vec<Value> {
-        let mut ps = self.playlists.clone();
+        let mut ps: Vec<_> = self
+            .playlists
+            .iter()
+            .enumerate()
+            .map(|(priority, playlist)| {
+                let mut value = playlist.clone();
+                if value["kind"] == "auto" {
+                    value["game_priority"] = json!(priority);
+                }
+                value
+            })
+            .collect();
         ps.sort_by_key(|p| std::cmp::Reverse(slugs(p).len()));
         ps
     }
@@ -518,6 +529,28 @@ mod tests {
         PlaylistStore::new(
             std::env::temp_dir().join(format!("vice-playlists-{}.json", uuid::Uuid::new_v4())),
         )
+    }
+    #[test]
+    fn game_priority_survives_count_sorting_without_changing_persisted_metadata() {
+        let mut s = store();
+        s.record_auto("First game", "shared", None, false).unwrap();
+        s.record_auto("Second game", "shared", None, false).unwrap();
+        s.record_auto("Second game", "another", None, false)
+            .unwrap();
+        let listed = s.list_playlists();
+        assert_eq!(listed[0]["game"], "Second game");
+        assert!(
+            listed[1]["game_priority"].as_u64().unwrap()
+                < listed[0]["game_priority"].as_u64().unwrap()
+        );
+        assert_eq!(s.game_for("shared"), Some("First game".into()));
+        assert!(
+            s.playlists
+                .iter()
+                .all(|playlist| playlist.get("game_priority").is_none())
+        );
+        assert!(!s.metadata_for("shared", Some(1)).contains("game_priority"));
+        let _ = std::fs::remove_file(s.path);
     }
     #[test]
     fn icon_changes_persist_without_growing_embedded_video_metadata() {

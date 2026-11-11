@@ -1,9 +1,10 @@
 //! GPU-first FFmpeg encoding selected by actual synthetic encode probes.
 //!
-//! Decode and CPU filters stay unchanged. Hardware frames are uploaded only
-//! after the final video filter, including complex editor graphs. Each codec
-//! family is probed once; a failed real job still retries its original CPU
-//! command because a working small probe cannot guarantee every resolution.
+//! Generic jobs keep their decode and CPU filters, uploading hardware frames
+//! after the final filter. Specialized trims and Discord copies can keep frames
+//! on the GPU where suitable; integrated-GPU Discord jobs retain the faster
+//! measured CPU decode/scale path. Each codec family is probed once, and failed
+//! real jobs retry the original CPU command.
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashSet,
@@ -77,6 +78,7 @@ static VP8: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
 static VP9: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
 static ENCODERS: OnceCell<HashSet<String>> = OnceCell::const_new();
 static DECODERS: OnceCell<Vec<Hardware>> = OnceCell::const_new();
+static ASYNC_INPUT: OnceCell<bool> = OnceCell::const_new();
 
 fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).into()).collect()
@@ -269,6 +271,130 @@ pub async fn command_candidates(args: &[String]) -> Vec<Vec<String>> {
     }
     commands.push(args.to_vec());
     commands
+}
+
+/// CUDA copies resize and convert to 8-bit on the decoder's GPU. VAAPI uses
+/// the faster measured CPU decode/scale path first. Keep both pipelines so
+/// narrower hardware decode support can still use a working GPU encoder.
+pub async fn discord_command_candidates(args: &[String]) -> Vec<Vec<String>> {
+    if job_family(args) != Some(Family::H264) {
+        return command_candidates(args).await;
+    }
+    let mut commands = Vec::new();
+    for encoder in probed(Family::H264)
+        .await
+        .into_iter()
+        .filter(VideoEncoder::is_hardware)
+    {
+        if encoder.hardware == Hardware::Nvenc
+            && let Ok(command) = rewrite_discord_args(args, &encoder)
+        {
+            commands.push(command);
+        }
+        // Radeon 680M benchmarks with ongoing replay recording are faster
+        // using CPU decode/scale + VAAPI encode than sharing VCN for both
+        // decode and encode. Keep that path first on VAAPI devices.
+        if let Ok(command) = rewrite_video_args(args, &encoder) {
+            commands.push(command);
+        }
+        if matches!(encoder.hardware, Hardware::Vaapi(_))
+            && let Ok(command) = rewrite_discord_args(args, &encoder)
+        {
+            commands.push(command);
+        }
+    }
+    commands.push(args.to_vec());
+    if !async_input_available().await {
+        return commands;
+    }
+    let mut overlapped = Vec::new();
+    for command in commands {
+        if let Some(wrapped) = async_file_input(&command) {
+            overlapped.push(wrapped);
+        }
+        // A protocol/read failure can retry this same encoder with its raw
+        // file input before falling back to a slower encoder.
+        overlapped.push(command);
+    }
+    overlapped
+}
+async fn async_input_available() -> bool {
+    *ASYNC_INPUT
+        .get_or_init(|| async {
+            let mut command = Command::new("ffmpeg");
+            command
+                .args(["-hide_banner", "-protocols"])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            tokio::time::timeout(Duration::from_secs(3), command.output())
+                .await
+                .is_ok_and(|result| {
+                    result.is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout)
+                                .lines()
+                                .any(|line| line.trim() == "async")
+                    })
+                })
+        })
+        .await
+}
+fn async_file_input(args: &[String]) -> Option<Vec<String>> {
+    let position = args.iter().position(|arg| arg == "-i")? + 1;
+    let path = args.get(position)?;
+    // file: takes literal paths, including spaces, %, + and ?. It is not a
+    // percent-encoded URI; async simply opens this inner file protocol.
+    if !Path::new(path).is_absolute() {
+        return None;
+    }
+    let mut command = args.to_vec();
+    command[position] = format!("async:file:{path}");
+    Some(command)
+}
+
+fn rewrite_discord_args(args: &[String], encoder: &VideoEncoder) -> Result<Vec<String>> {
+    if job_family(args) != Some(Family::H264)
+        || !budgeted(args)
+        || args.iter().filter(|a| *a == "-i").count() != 1
+    {
+        bail!("direct Discord resizing requires one budgeted H.264 output");
+    }
+    let filter =
+        value(args, &["-vf", "-filter:v", "-filter:v:0"]).context("Discord resize filter")?;
+    if ![
+        "scale='min(1280,iw)':-2",
+        "scale=w='trunc(min(1280,iw)/2)*2':h=-2",
+        "scale='trunc(min(1280,iw)/2)*2':-2",
+    ]
+    .contains(&filter)
+    {
+        bail!("retain the software path for additional/custom video filters");
+    }
+    let hardware_scale = match encoder.hardware {
+        Hardware::Nvenc => {
+            "scale_cuda=w='trunc(min(1280,iw)/2)*2':h=-2:format=nv12:interp_algo=bicubic"
+        }
+        Hardware::Vaapi(_) => "scale_vaapi=w='trunc(min(1280,iw)/2)*2':h=-2:format=nv12",
+        // QSV/Vulkan retain the existing tested CPU-decode/upload path until
+        // their resize/format-conversion capabilities can be checked together.
+        _ => bail!("direct Discord resize is unavailable on this backend"),
+    };
+    let mut unfiltered = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if matches!(
+            args[index].as_str(),
+            "-vf" | "-filter:v" | "-filter:v:0" | "-pix_fmt" | "-pix_fmt:v"
+        ) {
+            index += 2;
+        } else {
+            unfiltered.push(args[index].clone());
+            index += 1;
+        }
+    }
+    let mut command = rewrite_trim_args(&unfiltered, encoder)?;
+    append_video_filter(&mut command, hardware_scale)?;
+    Ok(command)
 }
 
 /// Plain cuts have no software filters: keep decoded frames on the same GPU
@@ -846,6 +972,88 @@ mod tests {
             "-y",
             "output.mp4",
         ])
+    }
+    #[test]
+    fn async_input_preserves_literal_filenames_and_other_arguments() {
+        let original = strings(&[
+            "ffmpeg",
+            "-i",
+            "/clips/My + 50% clip?.mp4",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "h264_vaapi",
+            "-b:v",
+            "900k",
+            "output.mp4",
+        ]);
+        let wrapped = async_file_input(&original).unwrap();
+        assert_eq!(wrapped[2], "async:file:/clips/My + 50% clip?.mp4");
+        for (index, (actual, expected)) in wrapped.iter().zip(&original).enumerate() {
+            if index != 2 {
+                assert_eq!(actual, expected);
+            }
+        }
+        let relative = strings(&["ffmpeg", "-i", "pipe:0", "out.mp4"]);
+        assert!(async_file_input(&relative).is_none());
+    }
+    #[test]
+    fn discord_gpu_resize_keeps_video_on_device_and_preserves_budget_and_audio() {
+        let mut args = discord_args();
+        let scale = args.iter().position(|arg| arg == "-vf").unwrap();
+        args[scale + 1] = "scale=w='trunc(min(1280,iw)/2)*2':h=-2".into();
+        let output = args.len() - 1;
+        args.splice(output..output, ["-movflags".into(), "+faststart".into()]);
+        for (name, hardware, filter) in [
+            ("h264_nvenc", Hardware::Nvenc, "scale_cuda"),
+            (
+                "h264_vaapi",
+                Hardware::Vaapi("/dev/dri/renderD128".into()),
+                "scale_vaapi",
+            ),
+        ] {
+            let result =
+                rewrite_discord_args(&args, &encoder(name, hardware, Family::H264)).unwrap();
+            assert_eq!(value(&result, &["-c:v"]), Some(name));
+            for option in ["-b:v", "-maxrate", "-bufsize", "-c:a", "-b:a", "-movflags"] {
+                assert_eq!(
+                    value(&result, &[option]),
+                    value(&args, &[option]),
+                    "must preserve {option}"
+                );
+            }
+            let maps = |command: &[String]| {
+                command
+                    .windows(2)
+                    .filter(|a| a[0] == "-map")
+                    .map(|a| a[1].clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(maps(&result), maps(&args));
+            let scale = value(&result, &["-vf"]).unwrap();
+            assert!(scale.starts_with(filter));
+            assert!(
+                scale.contains("trunc(min(1280,iw)/2)*2")
+                    && scale.contains("h=-2")
+                    && scale.contains("format=nv12")
+            );
+            assert!(
+                !result
+                    .iter()
+                    .any(|a| a.contains("hwupload") || a.contains("hwdownload"))
+            );
+            assert!(value(&result, &["-hwaccel_output_format"]).is_some());
+            assert!(
+                value(&result, &["-pix_fmt"]).is_none(),
+                "hardware surfaces choose their 8-bit format in the GPU scaler"
+            );
+        }
+        let index = args.iter().position(|a| a == "-vf").unwrap();
+        args[index + 1].push_str(",drawtext=text=keep-me");
+        assert!(
+            rewrite_discord_args(&args, &encoder("h264_nvenc", Hardware::Nvenc, Family::H264))
+                .is_err()
+        );
     }
     #[test]
     fn gpu_trims_keep_frames_on_device_and_preserve_selected_interval() {

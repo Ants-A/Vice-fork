@@ -172,6 +172,65 @@ printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"h264","width":128
 }
 
 #[tokio::test]
+async fn cached_discord_copy_does_not_wait_for_cold_metadata_or_busy_probes() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let library = Library::start(2, false, "2").await?;
+    let source = library.root.path().join("clips/clip-0.mp4");
+    let identity = vice::media::FileIdentity::read(&source)?;
+    let prefix = format!(
+        "{:x}",
+        Sha256::digest(source.as_os_str().as_encoded_bytes())
+    );
+    let cache = library.root.path().join("cache/discord");
+    std::fs::create_dir_all(&cache)?;
+    let ready = cache.join(format!(
+        "{}-{}-{}-{}.mp4",
+        &prefix[..24],
+        identity.size,
+        identity.mtime_ns,
+        identity.inode
+    ));
+    std::fs::write(&ready, b"completed-discord-copy")?;
+
+    // Hydration owns one probe. A detail request fills the other slot. The
+    // ready copy must bypass both the source's metadata lock and probe queue.
+    let pending: Vec<_> = (0..2)
+        .map(|number| {
+            let client = library.client.clone();
+            let detail = format!("{}/api/clips/clip-{number}", library.base);
+            tokio::spawn(async move { client.get(detail).send().await })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while library.full_probes().len() < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        library.full_probes().len(),
+        2,
+        "both cold metadata probes must be in progress"
+    );
+    let started = Instant::now();
+    let result = library.get("/api/clips/clip-0/discord").await?;
+    let elapsed = started.elapsed();
+    for request in pending {
+        request.abort();
+    }
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "an existing local copy waited {elapsed:?} for unrelated probing"
+    );
+    assert_eq!(result["path"], ready.to_string_lossy().as_ref());
+    assert_eq!(result["size"], b"completed-discord-copy".len());
+    assert_eq!(
+        library.full_probes().len(),
+        2,
+        "ready Discord copies must not start another probe"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_cache_gives_first_list_durations_without_websocket() -> Result<()> {
     let library = Library::start(24, true, "0.2").await?;
     for _ in 0..4 {

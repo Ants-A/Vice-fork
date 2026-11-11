@@ -115,12 +115,19 @@ fn cache_prefix(path: &FsPath) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()))[..24].to_owned() + "-"
 }
-pub(crate) fn cache_key(path: &FsPath) -> String {
-    use std::os::unix::fs::MetadataExt;
-    let (size, mtime) = revision(path);
-    let inode = std::fs::metadata(path).map(|m| m.ino()).unwrap_or(0);
-    format!("{}{size}-{mtime}-{inode}", cache_prefix(path))
+fn identity_cache_key(path: &FsPath, identity: media::FileIdentity) -> String {
+    format!(
+        "{}{}-{}-{}",
+        cache_prefix(path),
+        identity.size,
+        identity.mtime_ns,
+        identity.inode
+    )
 }
+pub(crate) fn cache_key(path: &FsPath) -> String {
+    identity_cache_key(path, media::FileIdentity::read(path).unwrap_or_default())
+}
+
 struct MediaTemp(PathBuf);
 impl Drop for MediaTemp {
     fn drop(&mut self) {
@@ -572,12 +579,18 @@ impl AppState {
             .clone()
     }
     async fn invalidate_media(&self, path: &FsPath) {
+        self.invalidate_media_caches(path, true).await;
+    }
+    async fn invalidate_media_caches(&self, path: &FsPath, discard_discord: bool) {
         self.metadata.lock().await.remove(path);
         self.tag_cache.lock().await.remove(path);
         self.metadata_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let prefix = cache_prefix(path);
         for dir in ["thumbs", "proxies", "audio", "discord"] {
+            if dir == "discord" && !discard_discord {
+                continue;
+            }
             if let Ok(mut entries) = tokio::fs::read_dir(cache_dir().join(dir)).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let name = entry.file_name().to_string_lossy().into_owned();
@@ -1422,13 +1435,7 @@ async fn serve_media(
 }
 pub(crate) async fn indexed_cache_key(s: &Shared, path: &FsPath) -> String {
     if let Some(identity) = s.identity(path).await {
-        format!(
-            "{}{}-{}-{}",
-            cache_prefix(path),
-            identity.size,
-            identity.mtime_ns,
-            identity.inode
-        )
+        identity_cache_key(path, identity)
     } else {
         cache_key(path)
     }
@@ -1521,7 +1528,12 @@ async fn run_preview_process(
     event: &str,
 ) -> Result<()> {
     let mut failure = None;
-    for candidate in crate::encoding::command_candidates(&args).await {
+    let candidates = if event == "discord_progress" {
+        crate::encoding::discord_command_candidates(&args).await
+    } else {
+        crate::encoding::command_candidates(&args).await
+    };
+    for candidate in candidates {
         let encoder = crate::encoding::video_encoder(&candidate)
             .unwrap_or("unknown")
             .to_owned();
@@ -2036,8 +2048,10 @@ async fn media_api(
             let cached = s.cached_meta(&path).await;
             let source = path.clone();
             let title = name.to_owned();
-            let target = tokio::task::spawn_blocking(move || {
+            let (target, original_identity) = tokio::task::spawn_blocking(move || {
+                let identity = media::FileIdentity::read(&source)?;
                 crate::media_names::rename_numbered(&source, &title)
+                    .map(|target| (target, identity))
             })
             .await
             .map_err(anyhow::Error::from)?
@@ -2047,14 +2061,23 @@ async fn media_api(
                     let _ = tokio::fs::rename(&target, &path).await;
                     return Err(error.into());
                 }
-                s.invalidate_media(&path).await;
-                s.identities.write().await.remove(&path);
                 let owned = target.clone();
                 let identity =
                     tokio::task::spawn_blocking(move || media::FileIdentity::read(&owned))
                         .await
                         .map_err(anyhow::Error::from)?
                         .map_err(anyhow::Error::from)?;
+                if !image && identity == original_identity {
+                    reuse_discord_after_rename(
+                        &identity_cache_key(&path, original_identity),
+                        &identity_cache_key(&target, identity),
+                    )
+                    .await;
+                }
+                // Existing clipboard URIs refer to the old cache filename.
+                // Keep those files and link the unchanged result to its new key.
+                s.invalidate_media_caches(&path, false).await;
+                s.identities.write().await.remove(&path);
                 s.identities.write().await.insert(target.clone(), identity);
                 if image {
                     s.images.write().await.insert(slug.into(), target.clone());
@@ -2430,16 +2453,23 @@ async fn clipboard(path: &FsPath, image: bool) -> Result<()> {
     }
     Ok(())
 }
-async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
-    let meta = s.meta(path).await;
-    let size = revision(path).0;
-    if size > 0
-        && size <= editor::DISCORD_MAX_BYTES
-        && path.extension().is_some_and(|e| e == "mp4")
-        && meta["vcodec"] == "h264"
-    {
-        return Ok(path.into());
+async fn reuse_discord_after_rename(old_key: &str, new_key: &str) {
+    let directory = cache_dir().join("discord");
+    for suffix in ["-budget2", "-budget1", ""] {
+        let old = directory.join(format!("{old_key}{suffix}.mp4"));
+        let new = directory.join(format!("{new_key}{suffix}.mp4"));
+        match tokio::fs::hard_link(&old, &new).await {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+                ) => {}
+            Err(error) => tracing::debug!(%error, "could not reuse Discord copy after rename"),
+        }
     }
+}
+async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
     // A lower-budget retry is just as reusable as the first output. Prefer
     // it before launching another encode if this driver's VBR overshot once.
     let key = indexed_cache_key(s, path).await;
@@ -2451,6 +2481,15 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         if bytes > 0 && bytes <= editor::DISCORD_MAX_BYTES {
             return Ok(cached);
         }
+    }
+    let meta = s.meta(path).await;
+    let size = revision(path).0;
+    if size > 0
+        && size <= editor::DISCORD_MAX_BYTES
+        && path.extension().is_some_and(|e| e == "mp4")
+        && meta["vcodec"] == "h264"
+    {
+        return Ok(path.into());
     }
     let duration = meta["duration"]
         .as_f64()
@@ -2471,7 +2510,7 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         "-map".into(),
         "0:a?".into(),
         "-vf".into(),
-        "scale='min(1280,iw)':-2".into(),
+        "scale='trunc(min(1280,iw)/2)*2':-2".into(),
         "-c:v".into(),
         "libx264".into(),
         // Discord-compatible 8-bit 4:2:0, including when the recording is

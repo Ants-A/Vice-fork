@@ -1,3 +1,4 @@
+import {applyPlaylistGames} from '../lib/playlistGames';
 import {ListSnapshots} from '../lib/listSnapshots';
 import {
   createContext,
@@ -59,6 +60,8 @@ interface State {
   clips: Clip[];
   images: Image[];
   playlists: Playlist[];
+  /** Distinguish an authoritative empty list from startup before playlists load. */
+  playlistsKnown: boolean;
   status: Status;
   tunnelUrl: string | null;
   update: UpdateInfo | null;
@@ -103,6 +106,7 @@ const initialState: State = {
   clips: [],
   images: [],
   playlists: [],
+  playlistsKnown: false,
   status: INITIAL_STATUS,
   tunnelUrl: null,
   update: null,
@@ -158,6 +162,15 @@ function withEvent(state: State, event: Omit<IslandEvent, 'id'>): State {
 }
 
 function reduce(state: State, action: Action): State {
+  const next = reduceState(state, action);
+  if (!next.playlistsKnown || (next.clips === state.clips && next.images === state.images &&
+      next.playlists === state.playlists && next.playlistsKnown === state.playlistsKnown)) return next;
+  const clips = applyPlaylistGames(next.clips, next.playlists);
+  const images = applyPlaylistGames(next.images, next.playlists, true);
+  return clips === next.clips && images === next.images ? next : {...next, clips, images};
+}
+
+function reduceState(state: State, action: Action): State {
   switch (action.type) {
     case 'loaded':
       return {
@@ -168,6 +181,7 @@ function reduce(state: State, action: Action): State {
         clips: action.clips ?? state.clips,
         images: action.images ?? state.images,
         playlists: action.playlists ?? state.playlists,
+        playlistsKnown: action.playlists !== null || state.playlistsKnown,
         status: action.status,
         tunnelUrl: action.status.public_url ?? null,
         update: action.status.update ?? null,
@@ -219,7 +233,7 @@ function reduce(state: State, action: Action): State {
       return {...state, images: action.images};
 
     case 'setPlaylists':
-      return {...state, playlists: action.playlists};
+      return {...state, playlists: action.playlists, playlistsKnown: true};
 
     case 'libraryReloaded':
       return {
@@ -227,6 +241,7 @@ function reduce(state: State, action: Action): State {
         clips: action.clips ?? state.clips,
         images: action.images ?? state.images,
         playlists: action.playlists ?? state.playlists,
+        playlistsKnown: action.playlists !== null || state.playlistsKnown,
         status: action.status,
         tunnelUrl: action.status.public_url ?? state.tunnelUrl,
         update: action.status.update ?? state.update,
@@ -331,7 +346,7 @@ function reduceWs(state: State, msg: WsMessage): State {
       });
 
     case 'playlists_changed':
-      return {...state, playlists: msg.playlists ?? []};
+      return {...state, playlists: msg.playlists ?? [], playlistsKnown: true};
 
     // Handled in the socket listener: it refetches the lists rather than
     // trusting a delta, because a late-mounted drive can bring hundreds of
