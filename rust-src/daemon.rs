@@ -191,11 +191,13 @@ pub async fn run(open_ui: bool) -> Result<()> {
             }},
             _=interval.tick()=>{
                 let cfg=state.cfg.read().await.clone();
+                let win=crate::active_window::get_active_window().await;
+                let game=win.as_ref().and_then(|win|crate::active_window::match_game(win,&cfg.discord.custom_games));
+                state.observe_game(game.as_deref()).await;
                 if let Ok(mut rec)=state.recorder.try_lock(){
                     let paused=state.paused.load(std::sync::atomic::Ordering::Relaxed);
                     if !paused && !rec.is_healthy() {match rec.start().await{Ok(())=>*state.recorder_error.write().await=None,Err(e)=>*state.recorder_error.write().await=Some(e.to_string())}}
-                    let win=crate::active_window::get_active_window().await;
-                    rec.game_tag=win.as_ref().and_then(|win|crate::active_window::match_game(win,&cfg.discord.custom_games));
+                    rec.game_tag=game;
                     let mut retarget=false;
                     if !rec.session_active() {
                     if cfg.recording.follow_mouse_display&& let Some(display)=crate::active_window::pointer_display().await&& rec.display_override.as_ref()!=Some(&display){rec.display_override=Some(display);retarget=true;}

@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod discord_rpc;
 pub mod editor;
+pub mod game_context;
 pub mod game_icons;
 pub mod hotkey;
 pub mod keys;

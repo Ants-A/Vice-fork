@@ -184,6 +184,43 @@ async fn daemon_api_media_lifecycle_and_public_isolation() {
     let video = client.get(format!("{base}/v/test")).send().await.unwrap();
     assert_eq!(video.headers()["content-type"], "video/mp4");
     assert_eq!(video.bytes().await.unwrap().as_ref(), b"test-video-data");
+    let first = root.join("clips/Duplicate.mp4");
+    let second = root.join("clips/Duplicate 2.mp4");
+    std::fs::write(&first, b"first existing clip").unwrap();
+    std::fs::write(&second, b"second existing clip").unwrap();
+    let numbered: Value = client
+        .post(format!("{base}/api/clips/test/rename"))
+        .json(&json!({"name":"Duplicate"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(numbered["name"], "Duplicate 3.mp4");
+    assert_eq!(numbered["slug"], "test");
+    assert_eq!(std::fs::read(&first).unwrap(), b"first existing clip");
+    assert_eq!(std::fs::read(&second).unwrap(), b"second existing clip");
+    assert_eq!(
+        std::fs::read(root.join("clips/Duplicate 3.mp4")).unwrap(),
+        b"test-video-data"
+    );
+    let restored: Value = client
+        .post(format!("{base}/api/clips/test/rename"))
+        .json(&json!({"name":" .renamed #1?  "}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restored["name"], " .renamed #1?  .mp4");
+    std::fs::remove_file(first).unwrap();
+    std::fs::remove_file(second).unwrap();
     let scan = client
         .post(format!("{base}/api/library/rescan"))
         .send()

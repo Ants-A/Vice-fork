@@ -68,6 +68,7 @@ pub struct AppState {
     pub edits: Mutex<()>,
     pub clip_writing: std::sync::atomic::AtomicBool,
     clip_saves: Mutex<()>,
+    game_context: Mutex<crate::game_context::GameContext>,
     status_cache: std::sync::Mutex<Option<Value>>,
     managed_names: RwLock<crate::media_names::Names>,
     pub transcodes: Semaphore,
@@ -282,6 +283,7 @@ impl AppState {
             edits: Mutex::new(()),
             clip_writing: std::sync::atomic::AtomicBool::new(false),
             clip_saves: Mutex::new(()),
+            game_context: Mutex::new(crate::game_context::GameContext::default()),
             status_cache: std::sync::Mutex::new(None),
             managed_names: RwLock::new(managed_names),
             transcodes: Semaphore::new(1),
@@ -856,6 +858,18 @@ impl AppState {
         self.saved_locked(path, image).await
     }
     async fn saved_locked(&self, path: &FsPath, image: bool) -> Result<()> {
+        let cfg = self.cfg.read().await.clone();
+        let game = crate::active_window::get_active_window()
+            .await
+            .and_then(|win| crate::active_window::match_game(&win, &cfg.discord.custom_games));
+        self.saved_locked_with_game(path, image, game).await
+    }
+    async fn saved_locked_with_game(
+        &self,
+        path: &FsPath,
+        image: bool,
+        game: Option<String>,
+    ) -> Result<()> {
         let slug = self.media_id(path, image).await;
         if path
             .file_stem()
@@ -887,22 +901,17 @@ impl AppState {
             write_json(&data_dir().join("share_tokens.json"), &tokens)?;
         }
         let cfg = self.cfg.read().await.clone();
-        if cfg.output.auto_playlist_by_game {
-            let game = if let Some(win) = crate::active_window::get_active_window().await {
-                crate::active_window::match_game(&win, &cfg.discord.custom_games)
+        if cfg.output.auto_playlist_by_game
+            && let Some(game) = game
+        {
+            let member = if image {
+                format!("img:{slug}")
             } else {
-                None
+                slug.clone()
             };
-            if let Some(game) = game {
-                let member = if image {
-                    format!("img:{slug}")
-                } else {
-                    slug.clone()
-                };
-                let mut ps = self.playlists.lock().await;
-                ps.record_auto(&game, &member, None, false)?;
-                self.emit(json!({"type":"playlists_changed","playlists":ps.list_playlists()}));
-            }
+            let mut ps = self.playlists.lock().await;
+            ps.record_auto(&game, &member, None, false)?;
+            self.emit(json!({"type":"playlists_changed","playlists":ps.list_playlists()}));
         }
         if image {
             crate::audio::play(
@@ -916,7 +925,29 @@ impl AppState {
         }
         Ok(())
     }
+    pub async fn observe_game(&self, game: Option<&str>) {
+        self.game_context.lock().await.observe(game, Instant::now());
+    }
+    async fn replay_game(&self, seconds: u64, cfg: &Config) -> Option<String> {
+        let game = crate::active_window::get_active_window()
+            .await
+            .and_then(|win| crate::active_window::match_game(&win, &cfg.discord.custom_games));
+        let mut context = self.game_context.lock().await;
+        let now = Instant::now();
+        context.observe(game.as_deref(), now);
+        context.game(now, Duration::from_secs(seconds.max(1)))
+    }
     pub async fn save_clip(&self, duration: Option<u64>) -> Result<PathBuf> {
+        // Snapshot before waiting on the recorder or doing any post-processing.
+        // The replay still contains the game even when focus moves to Vice or
+        // a different workspace while the resulting file is being finalized.
+        let cfg = self.cfg.read().await.clone();
+        let game = self
+            .replay_game(
+                duration.unwrap_or(cfg.recording.clip_duration.max(1) as u64),
+                &cfg,
+            )
+            .await;
         let _save = self.clip_saves.lock().await;
         let _ = self.status().await;
         struct Publishing<'a>(&'a std::sync::atomic::AtomicBool);
@@ -935,11 +966,15 @@ impl AppState {
             cfg.notifications.clip_sound.as_deref(),
         );
         self.emit(json!({"type":"clip_saving"}));
-        let result = self.recorder.lock().await.save_clip(duration).await;
+        let result = {
+            let mut recorder = self.recorder.lock().await;
+            recorder.game_tag = game.clone();
+            recorder.save_clip(duration).await
+        };
         match result {
             Ok(path) => {
                 let _edit = self.edits.lock().await;
-                self.saved_locked(&path, false).await?;
+                self.saved_locked_with_game(&path, false, game).await?;
                 Ok(path)
             }
             Err(e) => {
@@ -1992,25 +2027,22 @@ async fn media_api(
             let name = body["name"]
                 .as_str()
                 .ok_or_else(|| bad("name is required"))?;
-            let name = match path.extension().and_then(|ext| ext.to_str()) {
-                Some(ext) => format!("{name}.{ext}"),
-                None => name.to_owned(),
-            };
-            if !crate::media_names::valid_filename(&name) {
+            if name.is_empty() || name.contains(['/', '\0']) {
                 return Err(bad(
-                    "invalid filename: enter a filename, without a directory path or NUL",
+                    "invalid clip title: enter a name without a directory path or NUL",
                 ));
             }
-            let target = path.with_file_name(&name);
+            let format = s.media_format(&path).await;
+            let cached = s.cached_meta(&path).await;
+            let source = path.clone();
+            let title = name.to_owned();
+            let target = tokio::task::spawn_blocking(move || {
+                crate::media_names::rename_numbered(&source, &title)
+            })
+            .await
+            .map_err(anyhow::Error::from)?
+            .map_err(anyhow::Error::from)?;
             if target != path {
-                if target.try_exists().map_err(anyhow::Error::from)? {
-                    return Err(bad("a file with that name already exists"));
-                }
-                let format = s.media_format(&path).await;
-                let cached = s.cached_meta(&path).await;
-                tokio::fs::rename(&path, &target)
-                    .await
-                    .map_err(anyhow::Error::from)?;
                 if let Err(error) = s.remember_name(&path, &target, slug, image, &format).await {
                     let _ = tokio::fs::rename(&target, &path).await;
                     return Err(error.into());

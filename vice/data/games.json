@@ -11,7 +11,7 @@
   {"name": "Overwatch 2", "matches": ["overwatch.exe", "overwatch"]},
   {"name": "World of Warcraft", "matches": ["wow.exe", "wowclassic.exe"]},
   {"name": "Final Fantasy XIV", "matches": ["ffxiv_dx11.exe", "ffxiv"]},
-  {"name": "Cyberpunk 2077", "matches": ["cyberpunk2077.exe"]},
+  {"name": "Cyberpunk 2077", "matches": ["cyberpunk2077.exe", "steam_app_1091500"]},
   {"name": "Elden Ring", "matches": ["eldenring.exe"]},
   {"name": "The Witcher 3", "matches": ["witcher3.exe"]},
   {"name": "Hades II", "matches": ["Hades2.exe", "hades2", "steam_app_1145350"]},

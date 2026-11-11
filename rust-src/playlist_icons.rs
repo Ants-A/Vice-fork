@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "steam_catalog.rs"]
+mod steam_catalog;
+
 pub const MAX_ICON_LENGTH: usize = 65_536;
 /// Store only a bounded raster image. Never accept executable SVG or external URLs.
 pub fn valid_icon(icon: &str) -> bool {
@@ -38,9 +41,8 @@ pub fn valid_icon(icon: &str) -> bool {
 }
 
 fn steam_app_ids(game: &str, roots: &[PathBuf]) -> Vec<String> {
-    let wanted = game.trim().to_lowercase();
     let pattern = regex::Regex::new(r#""name"\s+"([^\"]+)""#).unwrap();
-    let mut ids = Vec::new();
+    let mut apps = Vec::new();
     for root in roots {
         if let Ok(entries) = std::fs::read_dir(root.join("steamapps")) {
             for entry in entries.flatten() {
@@ -51,27 +53,28 @@ fn steam_app_ids(game: &str, roots: &[PathBuf]) -> Vec<String> {
                 else {
                     continue;
                 };
-                if !id.bytes().all(|b| b.is_ascii_digit()) {
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
                     continue;
                 }
                 if let Ok(text) = std::fs::read_to_string(entry.path())
-                    && pattern
-                        .captures(&text)
-                        .is_some_and(|c| c[1].trim().to_lowercase() == wanted)
+                    && let Some(name) = pattern.captures(&text)
                 {
-                    ids.push(id.to_owned());
+                    apps.push(steam_catalog::App {
+                        id: id.into(),
+                        name: name[1].into(),
+                        icon: None,
+                    });
                 }
             }
         }
+        apps.extend(steam_catalog::read(&root.join("appcache/appinfo.vdf")));
     }
-    // Known Steam process IDs also work when a game is currently uninstalled,
-    // as long as Steam still has its artwork cached.
+    // Built-in aliases retain a known app's identity even when its Steam name
+    // includes a longer subtitle. Catalog names also cover uninstalled games.
     let games: Vec<serde_json::Value> =
         serde_json::from_str(include_str!("../vice/data/games.json")).unwrap_or_default();
     for entry in games {
-        if entry["name"]
-            .as_str()
-            .is_some_and(|s| s.to_lowercase() == wanted)
+        if let Some(name) = entry["name"].as_str()
             && let Some(matches) = entry["matches"].as_array()
         {
             for value in matches {
@@ -79,14 +82,16 @@ fn steam_app_ids(game: &str, roots: &[PathBuf]) -> Vec<String> {
                     && !id.is_empty()
                     && id.bytes().all(|b| b.is_ascii_digit())
                 {
-                    ids.push(id.into());
+                    apps.push(steam_catalog::App {
+                        id: id.into(),
+                        name: name.into(),
+                        icon: None,
+                    });
                 }
             }
         }
     }
-    ids.sort();
-    ids.dedup();
-    ids
+    steam_catalog::matching_ids(game, &apps)
 }
 
 pub fn steam_icon_at(home: &Path, game: &str) -> Option<(Vec<u8>, &'static str)> {
@@ -100,6 +105,18 @@ pub fn steam_icon_at(home: &Path, game: &str) -> Option<(Vec<u8>, &'static str)>
         }
         for root in &roots {
             let cache = root.join("appcache/librarycache");
+            // Appinfo survives uninstalls and gives the precise small-icon
+            // hash, avoiding an arbitrary header/cover with a hash filename.
+            if let Some(hash) = steam_catalog::read(&root.join("appcache/appinfo.vdf"))
+                .iter()
+                .find(|app| app.id == id)
+                .and_then(|app| app.icon.as_deref())
+            {
+                for ext in ["jpg", "png"] {
+                    candidates.push(cache.join(&id).join(format!("{hash}.{ext}")));
+                    candidates.push(cache.join(format!("{id}_{hash}.{ext}")));
+                }
+            }
             candidates.push(cache.join(format!("{id}_icon.jpg")));
             // Current Steam places the small icon under its content hash.
             if let Ok(entries) = std::fs::read_dir(cache.join(&id)) {
