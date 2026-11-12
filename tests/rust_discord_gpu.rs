@@ -29,6 +29,9 @@ enum Backend {
     SimulatedNvenc,
     SimulatedNvencFailure,
     SimulatedAsyncInputFailure,
+    SimulatedHevcNvenc,
+    SimulatedHevcFailure,
+    SimulatedHevcCorruption,
 }
 #[tokio::test]
 async fn discord_copy_encodes_compatible_file_and_reuses_it_for_clipboard() -> Result<()> {
@@ -46,6 +49,31 @@ async fn nvidia_job_failure_retries_cpu_and_reports_the_failed_encoder() -> Resu
 async fn asynchronous_input_failure_retries_raw_input_with_the_same_gpu_encoder() -> Result<()> {
     discord_case(Backend::SimulatedAsyncInputFailure).await
 }
+#[tokio::test]
+async fn hevc_gpu_copy_retains_hvc1_and_compatibility_selects_h264() -> Result<()> {
+    discord_case(Backend::SimulatedHevcNvenc).await
+}
+#[tokio::test]
+async fn hevc_job_failure_falls_back_to_h264_without_software_x265() -> Result<()> {
+    discord_case(Backend::SimulatedHevcFailure).await
+}
+#[tokio::test]
+async fn successful_but_corrupt_hevc_job_and_cached_copy_are_repaired() -> Result<()> {
+    discord_case(Backend::SimulatedHevcCorruption).await
+}
+fn corrupt_mp4_payload(path: &Path) -> Result<()> {
+    let mut bytes = std::fs::read(path)?;
+    let marker = bytes
+        .windows(4)
+        .position(|part| part == b"mdat")
+        .context("MP4 mdat")?;
+    let length = u32::from_be_bytes(bytes[marker - 4..marker].try_into()?) as usize;
+    let end = (marker - 4 + length).min(bytes.len());
+    bytes[marker + 4..end].fill(0xff);
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
 async fn discord_case(backend: Backend) -> Result<()> {
     let Some(ffmpeg) = vice::runtime::which("ffmpeg") else {
         return Ok(());
@@ -112,6 +140,43 @@ async fn discord_case(backend: Backend) -> Result<()> {
             .open(&source)?
             .set_len(24 * 1024 * 1024)?;
     }
+    let broken = root.join("broken-hevc.mp4");
+    if backend == Backend::SimulatedHevcCorruption {
+        let encoded = Command::new(&ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30",
+                "-frames:v",
+                "12",
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "pools=none:frame-threads=1:log-level=error",
+                "-pix_fmt",
+                "yuv420p",
+                "-tag:v",
+                "hvc1",
+                "-y",
+            ])
+            .arg(&broken)
+            .output()?;
+        assert!(encoded.status.success());
+        corrupt_mp4_payload(&broken)?;
+        assert_eq!(
+            vice::media::probe_media(&broken).await?.vcodec,
+            "hevc",
+            "container metadata must remain plausible"
+        );
+        assert!(
+            vice::encoding::validate_video_stream(&broken, Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+    }
     let original_info = vice::media::probe_media(&source).await?;
     let original_size = std::fs::metadata(&source)?.len();
     let original_mtime = std::fs::metadata(&source)?.modified()?;
@@ -131,6 +196,7 @@ async fn discord_case(backend: Backend) -> Result<()> {
 for argument do
     if [ "$argument" = -encoders ]; then
         printf ' V..... h264_nvenc NVIDIA NVENC H.264 encoder\n'
+        [ "$VICE_TEST_HEVC" = 1 ] && printf ' V..... hevc_nvenc NVIDIA NVENC HEVC encoder\n'
         exit 0
     fi
 done
@@ -149,7 +215,7 @@ case "$input" in
         fi
         ;;
 esac
-if [ "$codec" = h264_nvenc ]; then
+if [ "$codec" = h264_nvenc ] || [ "$codec" = hevc_nvenc ]; then
     case "$input" in
         color=*)
             size=${input##*s=}
@@ -167,6 +233,16 @@ if [ "$codec" = h264_nvenc ]; then
         echo 'NVENC: 10-bit H.264 input is not supported on this GPU' >&2
         exit 1
     fi
+    if [ "$codec" = hevc_nvenc ] && [ "$VICE_TEST_HEVC_CORRUPT" = 1 ]; then
+        case "$input" in
+            testsrc2=*) ;;
+            *) cp "$VICE_TEST_BROKEN_HEVC" "$previous"; exit 0 ;;
+        esac
+    fi
+    if [ "$codec" = hevc_nvenc ] && [ "$VICE_TEST_HEVC_FAIL" = 1 ]; then
+        echo 'simulated HEVC hardware initialization failure' >&2
+        exit 44
+    fi
     if [ "$VICE_TEST_NVENC_FAIL" = 1 ]; then
         echo 'simulated NVIDIA encoder initialization failure' >&2
         exit 42
@@ -177,7 +253,14 @@ if [ "$codec" = h264_nvenc ]; then
         shift
         count=$((count-1))
         case "$argument" in
-            -c:v) shift; count=$((count-1)); set -- "$@" -c:v libx264 ;;
+            -c:v)
+                shift; count=$((count-1))
+                if [ "$codec" = hevc_nvenc ]; then
+                    set -- "$@" -c:v libx265 -x265-params 'pools=none:frame-threads=1:log-level=error'
+                else
+                    set -- "$@" -c:v libx264
+                fi
+                ;;
             -preset) shift; count=$((count-1)); set -- "$@" -preset fast ;;
             -rc) shift; count=$((count-1)) ;;
             *) set -- "$@" "$argument" ;;
@@ -212,6 +295,17 @@ exec "$VICE_REAL_FFMPEG" "$@"
     cfg.sharing.port = port;
     cfg.sharing.enabled = false;
     cfg.sharing.cloudflare_tunnel = false;
+    cfg.recording.video_codec = if matches!(
+        backend,
+        Backend::SimulatedHevcNvenc
+            | Backend::SimulatedHevcFailure
+            | Backend::SimulatedHevcCorruption
+    ) {
+        "hevc"
+    } else {
+        "h264"
+    }
+    .into();
     cfg.recording.backend = "gsr".into();
     cfg.recording.gsr_source = "native".into();
     cfg.output.directory = root.join("clips").to_string_lossy().into_owned();
@@ -230,6 +324,36 @@ exec "$VICE_REAL_FFMPEG" "$@"
         .env("XDG_RUNTIME_DIR", root.join("run"))
         .env("VICE_TEST_ENCODER_LOG", &invocation_log)
         .env("VICE_REAL_FFMPEG", &ffmpeg)
+        .env("VICE_TEST_BROKEN_HEVC", &broken)
+        .env(
+            "VICE_TEST_HEVC_CORRUPT",
+            if backend == Backend::SimulatedHevcCorruption {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            "VICE_TEST_HEVC",
+            if matches!(
+                backend,
+                Backend::SimulatedHevcNvenc
+                    | Backend::SimulatedHevcFailure
+                    | Backend::SimulatedHevcCorruption
+            ) {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            "VICE_TEST_HEVC_FAIL",
+            if backend == Backend::SimulatedHevcFailure {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env(
             "VICE_TEST_NVENC_FAIL",
             if backend == Backend::SimulatedNvencFailure {
@@ -296,7 +420,35 @@ exec "$VICE_REAL_FFMPEG" "$@"
     assert_ne!(path, source);
     assert!(path.starts_with(root.join("cache")));
     let info = vice::media::probe_media(&path).await?;
-    assert_eq!(info.vcodec, "h264");
+    assert_eq!(
+        info.vcodec,
+        if backend == Backend::SimulatedHevcNvenc {
+            "hevc"
+        } else {
+            "h264"
+        }
+    );
+    let tag = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_tag_string",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(&path)
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&tag.stdout).trim(),
+        if backend == Backend::SimulatedHevcNvenc {
+            "hvc1"
+        } else {
+            "avc1"
+        }
+    );
     assert_eq!(
         info.audio_streams, original_info.audio_streams,
         "Discord copies retain every audio track"
@@ -350,6 +502,7 @@ exec "$VICE_REAL_FFMPEG" "$@"
     assert!(!jobs.is_empty(), "Discord API must invoke the encoder");
     let completed = jobs
         .iter()
+        .rev()
         .find(|line| {
             line.split('\t').nth(1).is_some_and(|pid| {
                 log_before
@@ -396,6 +549,28 @@ exec "$VICE_REAL_FFMPEG" "$@"
             assert!(daemon_log.contains("simulated asynchronous file read unavailable"));
             assert!(!jobs.iter().any(|line| line.contains("-c:v libx264")));
         }
+        Backend::SimulatedHevcNvenc => {
+            assert_eq!(encoder, "hevc_nvenc");
+            assert!(
+                !jobs
+                    .iter()
+                    .any(|line| line.contains("-c:v libx265") || line.contains("-c:v libx264"))
+            );
+        }
+        Backend::SimulatedHevcFailure => {
+            assert!(
+                jobs[0].contains("-c:v h264_nvenc"),
+                "failed rate-control probes must skip the bad path before encoding the real clip"
+            );
+            assert_eq!(encoder, "h264_nvenc");
+            assert!(!jobs.iter().any(|line| line.contains("-c:v libx265")));
+            assert!(daemon_log.contains("Discord rate-control probe produced an unusable video"));
+        }
+        Backend::SimulatedHevcCorruption => {
+            assert_eq!(encoder, "h264_nvenc");
+            assert!(daemon_log.contains("Converted video is malformed"));
+            vice::encoding::validate_video_stream(&path, Duration::from_secs(20)).await?;
+        }
         Backend::Actual => {}
     }
     if daemon_log
@@ -403,7 +578,7 @@ exec "$VICE_REAL_FFMPEG" "$@"
         .any(|line| line.contains("GPU video encoding available") && line.contains("h264_"))
     {
         assert!(
-            jobs[0].contains("-c:v h264_"),
+            jobs[0].contains("-c:v h264_") || jobs[0].contains("-c:v hevc_"),
             "a confirmed GPU should be attempted before the CPU: {}",
             jobs[0]
         );
@@ -486,6 +661,107 @@ exec "$VICE_REAL_FFMPEG" "$@"
         log_before,
         "renaming an unchanged video must not launch another FFmpeg job"
     );
+    if matches!(
+        backend,
+        Backend::SimulatedHevcNvenc
+            | Backend::SimulatedHevcFailure
+            | Backend::SimulatedHevcCorruption
+    ) {
+        let before_switch = std::fs::read_to_string(&invocation_log)?;
+        client
+            .post(format!("{base}/api/config"))
+            .json(&serde_json::json!({"recording":{"video_codec":"h264"}}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let compatible: Value = client
+            .get(format!("{base}/api/clips/clip/discord"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let compatible_path = std::path::PathBuf::from(
+            compatible["path"]
+                .as_str()
+                .context("compatible copy path")?,
+        );
+        assert_eq!(
+            vice::media::probe_media(&compatible_path).await?.vcodec,
+            "h264"
+        );
+        if backend == Backend::SimulatedHevcNvenc {
+            assert_ne!(
+                compatible_path, renamed_copy,
+                "H.264 compatibility must not return the HEVC copy"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(&invocation_log)?,
+                before_switch,
+                "fallback H.264 bytes must also be reusable in compatibility mode"
+            );
+        }
+        let before_return = std::fs::read_to_string(&invocation_log)?;
+        client
+            .post(format!("{base}/api/config"))
+            .json(&serde_json::json!({"recording":{"video_codec":"hevc"}}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let preferred: Value = client
+            .get(format!("{base}/api/clips/clip/discord"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(preferred["path"], after_rename["path"]);
+        assert_eq!(
+            std::fs::read_to_string(&invocation_log)?,
+            before_return,
+            "changing preferences must retain existing compatible copies"
+        );
+    }
+    if backend == Backend::SimulatedHevcCorruption {
+        use sha2::{Digest, Sha256};
+        let original_hash = Sha256::digest(std::fs::read(&renamed_source)?);
+        corrupt_mp4_payload(&renamed_copy)?;
+        let before_repair = std::fs::read_to_string(&invocation_log)?;
+        let repaired: Value = client
+            .get(format!("{base}/api/clips/clip/discord"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let repaired_path =
+            std::path::PathBuf::from(repaired["path"].as_str().context("repaired path")?);
+        vice::encoding::validate_video_stream(&repaired_path, Duration::from_secs(20)).await?;
+        let after_repair = std::fs::read_to_string(&invocation_log)?;
+        assert!(
+            after_repair.len() > before_repair.len(),
+            "changed cached bytes must be checked and regenerated"
+        );
+        assert!(
+            !after_repair[before_repair.len()..].contains("-c:v hevc_nvenc"),
+            "a driver that emitted malformed frames must remain disabled for Discord copies"
+        );
+        client
+            .get(format!("{base}/api/clips/clip/discord"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(
+            std::fs::read_to_string(&invocation_log)?,
+            after_repair,
+            "valid repaired bytes must retain the instant cache path"
+        );
+        assert_eq!(
+            Sha256::digest(std::fs::read(&renamed_source)?),
+            original_hash
+        );
+    }
     client
         .post(format!("{base}/api/quit"))
         .send()

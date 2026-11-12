@@ -466,6 +466,18 @@ export function Settings() {
             />
           </Row>
 
+          <Row label={t('settings.videoCodec')} help={t('settings.videoCodecHelp')}>
+            <Select
+              label={t('settings.videoCodec')}
+              value={draft.videoCodec}
+              onChange={videoCodec => update({videoCodec, encoder: 'auto'})}
+              options={[
+                ['hevc', t('settings.videoCodecHevc')],
+                ['h264', t('settings.videoCodecH264')],
+              ]}
+            />
+          </Row>
+
           <Row label={t('settings.encoder')} help={t('settings.encoderHelp')}>
             <Select
               label={t('settings.encoder')}

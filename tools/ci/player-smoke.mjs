@@ -182,10 +182,17 @@ esac
   `});
   // Make the waiting state reproducible even on a fast CPU and local disk.
   let thumbnailFailures = 0;
+  let pausedDeletion = null;
   const fetchPatterns = [{urlPattern: `*proxy=${previewQuery}*`, requestStage: 'Request'}];
   if (process.env.VICE_SMOKE_THUMBNAILS === '1') fetchPatterns.push({urlPattern: `${base}/t/*`, requestStage: 'Request'});
+  if (process.env.VICE_SMOKE_DELETE === '1') fetchPatterns.push({urlPattern: `${base}/api/clips/*`, requestStage: 'Request'});
   await cdp.send('Fetch.enable', {patterns: fetchPatterns});
   cdp.on('Fetch.requestPaused', ({requestId, request}) => {
+    if (process.env.VICE_SMOKE_DELETE === '1' && request.url.startsWith(`${base}/api/clips/`)) {
+      if (request.method === 'DELETE') pausedDeletion = requestId;
+      else void cdp.send('Fetch.continueRequest', {requestId}).catch(()=>{});
+      return;
+    }
     if (process.env.VICE_SMOKE_THUMBNAILS === '1' && request.url.startsWith(`${base}/t/`)) {
       if (thumbnailFailures++ < 2) {
         void cdp.send('Fetch.fulfillRequest', {requestId, responseCode: 503, responseHeaders: [{name:'Cache-Control',value:'no-store'}], body:''}).catch(()=>{});
@@ -266,7 +273,7 @@ esac
     await cdp.evaluate(`
       window.__viceDiscordEncoder=null;
       new MutationObserver(()=>{
-        const label=document.querySelector('.share-sheet')?.innerText.match(/h264_(?:nvenc|vaapi|qsv|vulkan)|libx264/);
+        const label=document.querySelector('.share-sheet')?.innerText.match(/(?:h264|hevc)_(?:nvenc|vaapi|qsv|vulkan)|libx(?:264|265)/);
         if(label)window.__viceDiscordEncoder=label[0];
       }).observe(document.body,{childList:true,subtree:true,characterData:true});
       Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Share').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}));
@@ -464,7 +471,57 @@ esac
   }
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));
-  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, keyboardSeek, thumbnailRecovery, replayCache, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
+  let codecSettings = false;
+  if (process.env.VICE_SMOKE_CODEC === '1') {
+    await cdp.evaluate(`document.querySelector('.viewer-head .modal-close')?.click()`);
+    await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='Settings').click()`);
+    await until(() => cdp.evaluate(`Boolean(document.querySelector('select[aria-label="Recording and sharing codec"]'))`), 'codec setting was not rendered');
+    assert.equal(await cdp.evaluate(`document.querySelector('select[aria-label="Recording and sharing codec"]').value`), 'hevc', 'new codec preference must default to HEVC');
+    for (const codec of ['h264', 'hevc']) {
+      await cdp.evaluate(`{const select=document.querySelector('select[aria-label="Recording and sharing codec"]');select.value='${codec}';select.dispatchEvent(new Event('change',{bubbles:true}));}`);
+      await until(() => cdp.evaluate(`Boolean(document.querySelector('.save-bar[data-dirty] .btn:not(.btn-quiet):not(:disabled)'))`), 'codec change was not saveable');
+      await cdp.evaluate(`document.querySelector('.save-bar .btn:not(.btn-quiet)').click()`);
+      await until(async () => {
+        const config=await (await fetch(`${base}/api/config`)).json();
+        return config.recording.video_codec===codec&&config.recording.encoder==='auto';
+      }, 'codec setting did not persist');
+      await until(() => cdp.evaluate(`!document.querySelector('.save-bar[data-dirty]')`), 'saved codec remained dirty');
+      await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='All Clips').click()`);
+      await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='Settings').click()`);
+      await until(() => cdp.evaluate(`document.querySelector('select[aria-label="Recording and sharing codec"]')?.value==='${codec}'`), 'saved codec was lost after leaving settings');
+    }
+    codecSettings = true;
+  }
+  let deleteResponsiveness = false;
+  if (process.env.VICE_SMOKE_DELETE === '1') {
+    await cdp.evaluate(`document.querySelector('.viewer-head .modal-close')?.click()`);
+    await until(() => cdp.evaluate(`!document.querySelector('.viewer-video')`), 'viewer did not close before delete');
+    await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.querySelector('span')?.textContent==='All Clips').click()`);
+    for (const fail of [true, false]) {
+      await until(() => cdp.evaluate(`Boolean(document.querySelector('.clip-card button[aria-label="Delete"]'))`), 'clip did not appear for delete');
+      await cdp.evaluate(`document.querySelector('.clip-card button[aria-label="Delete"]').click()`);
+      await until(() => cdp.evaluate(`Boolean(document.querySelector('.btn-danger-solid'))`), 'delete confirmation missing');
+      await cdp.evaluate(`document.querySelector('.btn-danger-solid').click()`);
+      await until(() => pausedDeletion, 'delete request was not issued');
+      await until(() => cdp.evaluate(`!document.querySelector('.clip-card')`), 'clip waited for the network before disappearing', 500);
+      // A concurrent library reload still contains the file. It must not make
+      // a pending deletion reappear or reopen a hover download.
+      assert((await fetch(`${base}/api/library/rescan`, {method:'POST'})).ok);
+      await delay(250);
+      assert(await cdp.evaluate(`!document.querySelector('.clip-card')`), 'pending deletion reappeared after a stale library refresh');
+      const requestId = pausedDeletion; pausedDeletion = null;
+      if (fail) {
+        await cdp.send('Fetch.fulfillRequest', {requestId, responseCode:403, responseHeaders:[{name:'Content-Type',value:'application/json'}], body:Buffer.from(JSON.stringify({error:'simulated read-only share'})).toString('base64')});
+        await until(() => cdp.evaluate(`Boolean(document.querySelector('.clip-card'))`), 'failed deletion did not restore the clip');
+      } else {
+        await cdp.send('Fetch.continueRequest', {requestId});
+        await until(async () => (await fetch(`${base}/api/clips/smoke`)).status===404, 'confirmed deletion did not remove the file');
+        assert(await cdp.evaluate(`!document.querySelector('.clip-card')`));
+      }
+    }
+    deleteResponsiveness = true;
+  }
+  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, keyboardSeek, thumbnailRecovery, replayCache, codecSettings, deleteResponsiveness, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
   if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,visibility:document.visibilityState,thumbnail:document.querySelector('.clip-card')?.getBoundingClientRect().toJSON(),body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }

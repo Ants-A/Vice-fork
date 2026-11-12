@@ -19,6 +19,7 @@ export interface Draft {
   customResolution: string;
   container: string;
   encoder: string;
+  videoCodec: string;
   colorDepth: string;
   backend: string;
   gsrSource: string;
@@ -126,6 +127,7 @@ export function draftFromConfig(config: Config): Draft {
     customResolution: isPreset ? '' : resolution,
     container: str(r.container, 'mp4'),
     encoder: str(r.encoder, 'auto'),
+    videoCodec: str(r.video_codec, 'hevc'),
     colorDepth: String(r.color_depth ?? '8'),
     backend: str(r.backend, 'auto'),
     gsrSource: str(r.gsr_source, 'auto'),
@@ -234,6 +236,7 @@ export function patchFromDraft(draft: Draft): Record<string, Record<string, unkn
       resolution: resolution === false ? null : resolution,
       container: draft.container,
       encoder: draft.encoder,
+      video_codec: draft.videoCodec,
       color_depth: draft.colorDepth,
       backend: draft.backend,
       gsr_source: draft.gsrSource,

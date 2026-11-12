@@ -8,7 +8,8 @@ use std::{
 };
 
 pub const FPS: u32 = 60;
-pub const DISCORD_MAX_BYTES: u64 = 20 * 1024 * 1024;
+pub const DISCORD_MAX_BYTES: u64 = 20_000_000;
+pub const DISCORD_TARGET_BYTES: u64 = 19_600_000;
 pub const DISCORD_AUDIO_KBPS: i64 = 128;
 pub const DISCORD_MIN_VIDEO_KBPS: i64 = 150;
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -607,9 +608,16 @@ impl<'a, 'b> Chain<'a, 'b> {
         self.cur
     }
 }
+/// Keep the encoder's burst allowance within the file-size headroom. Larger
+/// VBV windows can overshoot an otherwise correct average bitrate on VAAPI.
+pub fn discord_buffer_kbps(video_kbps: i64) -> i64 {
+    (video_kbps / 4).clamp(1, 1600)
+}
+
 pub fn discord_bitrates(duration: f64, audio_streams: usize) -> Result<(i64, i64)> {
     let audio = DISCORD_AUDIO_KBPS * audio_streams.max(1) as i64;
-    let video = (20.0 * 8192.0 * 0.92 / duration.max(1.0) - audio as f64).round() as i64;
+    let video = (DISCORD_TARGET_BYTES as f64 * 8.0 / 1000.0 / duration.max(1.0) - audio as f64)
+        .floor() as i64;
     if video < DISCORD_MIN_VIDEO_KBPS {
         bail!(
             "{duration:.0}s with {} audio track(s) cannot fit 20 MB. Trim it shorter first.",
@@ -859,9 +867,9 @@ pub fn build_export_cmd_with_keys(
             "-b:v".into(),
             format!("{vb}k"),
             "-maxrate".into(),
-            format!("{}k", (vb as f64 * 1.45).round() as i64),
+            format!("{vb}k"),
             "-bufsize".into(),
-            format!("{}k", vb * 2),
+            format!("{}k", discord_buffer_kbps(vb)),
         ]);
     } else {
         ab = "192k".into();
@@ -1085,6 +1093,18 @@ mod tests {
         let (a, _) = discord_bitrates(10.0, 1).unwrap();
         let (b, _) = discord_bitrates(10.0, 2).unwrap();
         assert_eq!(a - b, 128);
+    }
+    #[test]
+    fn discord_budget_uses_nearly_twenty_decimal_megabytes_in_one_pass() {
+        for duration in [10.0, 60.0, 120.0] {
+            for tracks in [1, 2] {
+                let (video, audio) = discord_bitrates(duration, tracks).unwrap();
+                let estimated = (video + audio * tracks as i64) as f64 * 1000.0 / 8.0 * duration;
+                assert!(estimated <= DISCORD_TARGET_BYTES as f64);
+                assert!(estimated >= DISCORD_TARGET_BYTES as f64 - 15_000.0);
+                assert!(estimated < DISCORD_MAX_BYTES as f64);
+            }
+        }
     }
     #[test]
     fn names_and_progress() {

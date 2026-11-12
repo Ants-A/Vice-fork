@@ -36,7 +36,7 @@ const PlaybackContext = createContext<Playback | null>(null);
  * than inside a screen because the viewer has to survive a change of view.
  */
 export function PlaybackProvider({children}: {children: ReactNode}) {
-  const {state, dispatch, notify, refreshClips} = useStore();
+  const {state, dispatch, notify, refreshClips, deleteClip} = useStore();
   const {clips} = state;
 
   const [viewerSlug, setViewerSlug] = useState<string | null>(null);
@@ -232,8 +232,7 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
                 setConfirmDelete(null);
                 if (!clip) return;
                 setViewerSlug(null);
-                void api
-                  .deleteClip(clip.slug)
+                void deleteClip(clip.slug)
                   .then(() => say(t('viewer.clipDeleted')))
                   .catch(fail(t('viewer.errDelete')));
               }}>

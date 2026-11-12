@@ -1,5 +1,7 @@
 import {applyPlaylistGames} from '../lib/playlistGames';
 import {ListSnapshots} from '../lib/listSnapshots';
+import {PendingDeletes} from '../lib/pendingDeletes';
+import {stopHoverPreview} from '../lib/hoverPreview';
 import {
   createContext,
   useCallback,
@@ -7,6 +9,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useState,
   useRef,
   type ReactNode,
 } from 'react';
@@ -497,6 +500,8 @@ interface Store {
   visibleImages: Image[];
   hotkey: string;
   refreshClips: () => Promise<void>;
+  deleteClip: (slug: string) => Promise<void>;
+  deleteImage: (slug: string) => Promise<void>;
   refreshImages: () => Promise<void>;
   refreshPlaylists: () => Promise<void>;
   notify: (event: Omit<IslandEvent, 'id'>) => void;
@@ -509,6 +514,15 @@ const StoreContext = createContext<Store | null>(null);
 
 export function StoreProvider({children}: {children: ReactNode}) {
   const [state, dispatch] = useReducer(reduce, initialState);
+  const [pendingDeletes, setPendingDeletes] = useState<ReadonlySet<string>>(new Set());
+  const deletions = useRef<PendingDeletes | null>(null);
+  if (!deletions.current) deletions.current = new PendingDeletes(setPendingDeletes);
+  const visibleState = useMemo(() => pendingDeletes.size ? {
+    ...state,
+    clips: state.clips.filter(clip => !pendingDeletes.has(`clip:${clip.slug}`)),
+    images: state.images.filter(image => !pendingDeletes.has(`image:${image.slug}`)),
+  } : state, [state, pendingDeletes]);
+
 
   const clipSnapshots = useRef(new ListSnapshots<Clip>());
   const imageSnapshots = useRef(new ListSnapshots<Image>());
@@ -674,6 +688,20 @@ export function StoreProvider({children}: {children: ReactNode}) {
     if (playlists) dispatch({type: 'setPlaylists', playlists});
   }, [loadPlaylists]);
 
+  const deleteClip = useCallback((slug: string) => {
+    stopHoverPreview();
+    return deletions.current!.run(`clip:${slug}`, () => api.deleteClip(slug), () => {
+      clipSnapshots.current.observe(slug, null);
+      dispatch({type: 'ws', msg: {type: 'clip_deleted', slug}});
+    });
+  }, []);
+
+  const deleteImage = useCallback((slug: string) =>
+    deletions.current!.run(`image:${slug}`, () => api.deleteImage(slug), () => {
+      imageSnapshots.current.observe(slug, null);
+      dispatch({type: 'ws', msg: {type: 'image_deleted', slug}});
+    }), []);
+
   const notify = useCallback((event: Omit<IslandEvent, 'id'>) => {
     dispatch({type: 'event', event});
   }, []);
@@ -700,7 +728,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
     const playlist = state.currentPlaylistId
       ? state.playlists.find(p => p.id === state.currentPlaylistId)
       : null;
-    let list = state.clips;
+    let list = visibleState.clips;
     if (playlist) {
       const members = new Set(playlist.clip_slugs ?? []);
       list = list.filter(c => members.has(c.slug));
@@ -711,7 +739,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
       );
     }
     return list;
-  }, [state.clips, state.playlists, state.currentPlaylistId, state.searchQuery]);
+  }, [visibleState.clips, state.playlists, state.currentPlaylistId, state.searchQuery]);
 
   // Same rules as visibleClips, against the prefixed membership key. Kept
   // separate rather than folded into one list: the two grids are shown on
@@ -721,7 +749,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
     const playlist = state.currentPlaylistId
       ? state.playlists.find(p => p.id === state.currentPlaylistId)
       : null;
-    let list = state.images;
+    let list = visibleState.images;
     if (playlist) {
       const members = new Set(playlist.clip_slugs ?? []);
       list = list.filter(i => members.has(imageSlug(i.slug)));
@@ -732,7 +760,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
       );
     }
     return list;
-  }, [state.images, state.playlists, state.currentPlaylistId, state.searchQuery]);
+  }, [visibleState.images, state.playlists, state.currentPlaylistId, state.searchQuery]);
 
   const hotkey = useMemo(
     () => hotkeyLabel(state.config?.hotkeys?.clip as string | undefined),
@@ -741,23 +769,27 @@ export function StoreProvider({children}: {children: ReactNode}) {
 
   const value = useMemo<Store>(
     () => ({
-      state,
+      state: visibleState,
       dispatch,
       visibleClips,
       visibleImages,
       hotkey,
       refreshClips,
+      deleteClip,
+      deleteImage,
       refreshImages,
       refreshPlaylists,
       notify,
       saveConfig,
     }),
     [
-      state,
+      visibleState,
       visibleClips,
       visibleImages,
       hotkey,
       refreshClips,
+      deleteClip,
+      deleteImage,
       refreshImages,
       refreshPlaylists,
       notify,

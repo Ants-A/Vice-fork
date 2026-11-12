@@ -18,7 +18,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -73,6 +73,7 @@ pub struct AppState {
     managed_names: RwLock<crate::media_names::Names>,
     pub transcodes: Semaphore,
     pub preview_jobs: Mutex<HashMap<PathBuf, Arc<crate::stream_preview::PreviewJob>>>,
+    pub discord_validated: Mutex<HashSet<(u64, u128, u64)>>,
     pub playback_sessions: crate::playback_cache::Sessions,
 }
 
@@ -296,6 +297,7 @@ impl AppState {
             managed_names: RwLock::new(managed_names),
             transcodes: Semaphore::new(1),
             preview_jobs: Mutex::new(HashMap::new()),
+            discord_validated: Mutex::new(HashSet::new()),
             playback_sessions: crate::playback_cache::Sessions::new(cache_dir().join("playback")),
         })
     }
@@ -594,12 +596,17 @@ impl AppState {
     async fn invalidate_media(&self, path: &FsPath) {
         self.invalidate_media_caches(path, true).await;
     }
-    async fn invalidate_media_caches(&self, path: &FsPath, discard_discord: bool) {
+    async fn forget_media_metadata(&self, path: &FsPath) {
         self.metadata.lock().await.remove(path);
         self.tag_cache.lock().await.remove(path);
         self.metadata_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let prefix = cache_prefix(path);
+    }
+    async fn invalidate_media_caches(&self, path: &FsPath, discard_discord: bool) {
+        self.forget_media_metadata(path).await;
+        Self::remove_cached_media(&cache_prefix(path), false, discard_discord).await;
+    }
+    async fn remove_cached_media(prefix: &str, exact_revision: bool, discard_discord: bool) {
         for dir in ["thumbs", "proxies", "audio", "discord"] {
             if dir == "discord" && !discard_discord {
                 continue;
@@ -607,7 +614,10 @@ impl AppState {
             if let Ok(mut entries) = tokio::fs::read_dir(cache_dir().join(dir)).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with(&prefix) && !name.starts_with('.') {
+                    let matches = name
+                        .strip_prefix(prefix)
+                        .is_some_and(|tail| !exact_revision || tail.starts_with(['.', '-']));
+                    if matches && !name.starts_with('.') {
                         let _ = tokio::fs::remove_file(entry.path()).await;
                     }
                 }
@@ -1559,7 +1569,8 @@ async fn cached_media(
     let target = cache_dir().join(kind).join(format!("{key}{extra}.{ext}"));
     let lock = s.cache_lock(&target).await;
     let _guard = lock.lock().await;
-    if revision(&target).0 > 0 {
+    if revision(&target).0 > 0 && (kind != "discord" || validated_discord_cache(s, &target).await?)
+    {
         return Ok(target);
     }
     let _slot = if transcode {
@@ -1598,6 +1609,9 @@ async fn cached_media(
         bail!("the clip changed while its preview was being prepared; retry");
     }
     tokio::fs::rename(&tmp.0, &target).await?;
+    if kind == "discord" {
+        remember_validated_discord(s, &target).await?;
+    }
     Ok(target)
 }
 
@@ -1609,8 +1623,13 @@ async fn run_preview_process(
     event: &str,
 ) -> Result<()> {
     let mut failure = None;
+    let mut corrupt_encoders = HashSet::new();
     let candidates = if event == "discord_progress" {
-        crate::encoding::discord_command_candidates(&args).await
+        let prefer_gpu_decode = state
+            .cached_meta(source)
+            .await
+            .is_some_and(|meta| matches!(meta["vcodec"].as_str(), Some("hevc" | "h265")));
+        crate::encoding::discord_command_candidates_for(&args, prefer_gpu_decode).await
     } else {
         crate::encoding::command_candidates(&args).await
     };
@@ -1618,8 +1637,32 @@ async fn run_preview_process(
         let encoder = crate::encoding::video_encoder(&candidate)
             .unwrap_or("unknown")
             .to_owned();
+        if corrupt_encoders.contains(&encoder) {
+            continue;
+        }
+        let output = candidate.last().map(PathBuf::from);
         match run_media_attempt(state, source, candidate, seconds, event).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if event == "discord_progress" {
+                    let output = output.context("Discord conversion has no output")?;
+                    if let Err(error) = crate::encoding::validate_video_stream(
+                        &output,
+                        Duration::from_secs(seconds),
+                    )
+                    .await
+                    {
+                        // Retrying the same damaged rate-control path with a
+                        // different input reader cannot repair its bitstream.
+                        corrupt_encoders.insert(encoder.clone());
+                        crate::encoding::reject_discord_encoder(&encoder).await;
+                        let _ = tokio::fs::remove_file(&output).await;
+                        tracing::warn!(%encoder, %error, "Converted video is malformed; trying another GPU encoder");
+                        failure = Some(error);
+                        continue;
+                    }
+                }
+                return Ok(());
+            }
             Err(error) => {
                 if *state.shutdown.borrow() {
                     return Err(error);
@@ -2088,10 +2131,11 @@ async fn media_api(
             s.clip_json(slug, &path, true).await
         }),
         ("DELETE", []) => {
+            let identity = s.identities.read().await.get(&path).copied();
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(anyhow::Error::from)?;
-            s.invalidate_media(&path).await;
+            s.forget_media_metadata(&path).await;
             if image {
                 s.images.write().await.remove(slug);
             } else {
@@ -2126,8 +2170,17 @@ async fn media_api(
             }
             editor::EditorProjectStore::new(data_dir().join("editor_project.json"))
                 .on_clip_deleted(slug)?;
-            s.rescan().await;
             s.emit(json!({"type":if image{"image_deleted"}else{"clip_deleted"},"slug":slug}));
+            // Unlinking the recording is the only required share operation.
+            // Cached derivatives are local orphans now; do not keep the delete
+            // request and edit lock waiting for an entire cache-directory walk.
+            // Capture the old revision so a new file at this path is untouched.
+            if let Some(identity) = identity {
+                let prefix = identity_cache_key(&path, identity);
+                tokio::spawn(async move {
+                    AppState::remove_cached_media(&prefix, true, true).await;
+                });
+            }
             ok(json!({"ok":true}))
         }
         ("POST", ["rename"]) => {
@@ -2550,7 +2603,17 @@ async fn clipboard(path: &FsPath, image: bool) -> Result<()> {
 }
 async fn reuse_discord_after_rename(old_key: &str, new_key: &str) {
     let directory = cache_dir().join("discord");
-    for suffix in ["-budget2", "-budget1", ""] {
+    for suffix in [
+        "-budget2",
+        "-budget1",
+        "",
+        "-h264-budget2",
+        "-h264-budget1",
+        "-h264",
+        "-hevc-budget2",
+        "-hevc-budget1",
+        "-hevc",
+    ] {
         let old = directory.join(format!("{old_key}{suffix}.mp4"));
         let new = directory.join(format!("{new_key}{suffix}.mp4"));
         match tokio::fs::hard_link(&old, &new).await {
@@ -2564,17 +2627,69 @@ async fn reuse_discord_after_rename(old_key: &str, new_key: &str) {
         }
     }
 }
+async fn remember_validated_discord(s: &Shared, path: &FsPath) -> Result<()> {
+    let identity = media::FileIdentity::read(path)?;
+    let mut valid = s.discord_validated.lock().await;
+    if valid.len() >= 2048 {
+        valid.clear();
+    }
+    valid.insert((identity.size, identity.mtime_ns, identity.inode));
+    Ok(())
+}
+
+// Caller holds the cache file's job lock. Validity belongs to these exact
+// bytes, so a replaced/truncated cache file can never inherit an earlier pass.
+async fn validated_discord_cache(s: &Shared, path: &FsPath) -> Result<bool> {
+    let Ok(identity) = media::FileIdentity::read(path) else {
+        return Ok(false);
+    };
+    let key = (identity.size, identity.mtime_ns, identity.inode);
+    if s.discord_validated.lock().await.contains(&key) {
+        return Ok(true);
+    }
+    match crate::encoding::validate_video_stream(path, Duration::from_secs(120)).await {
+        Ok(()) => {
+            remember_validated_discord(s, path).await?;
+            Ok(true)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Removing an unusable Discord cache copy; original recording is unchanged");
+            tokio::fs::remove_file(path).await?;
+            s.discord_validated.lock().await.remove(&key);
+            Ok(false)
+        }
+    }
+}
+
 async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
-    // A lower-budget retry is just as reusable as the first output. Prefer
-    // it before launching another encode if this driver's VBR overshot once.
+    let codec = s.cfg.read().await.recording.video_codec.clone();
     let key = indexed_cache_key(s, path).await;
-    for suffix in ["-budget2", "-budget1", ""] {
-        let cached = cache_dir()
-            .join("discord")
-            .join(format!("{key}{suffix}.mp4"));
-        let bytes = revision(&cached).0;
-        if bytes > 0 && bytes <= editor::DISCORD_MAX_BYTES {
-            return Ok(cached);
+    // Reuse existing H.264 copies even after enabling HEVC. Compatibility mode
+    // deliberately skips HEVC copies; the original recording is never changed.
+    let families: &[&str] = if codec == "hevc" {
+        &["-hevc", "-h264", ""]
+    } else {
+        &["-h264", ""]
+    };
+    for family in families {
+        for budget in ["-budget2", "-budget1", ""] {
+            let cached = cache_dir()
+                .join("discord")
+                .join(format!("{key}{family}{budget}.mp4"));
+            let bytes = revision(&cached).0;
+            // Older ready copies used a 20 MiB cap; preserve those bytes.
+            let limit = if family.is_empty() {
+                20 * 1024 * 1024
+            } else {
+                editor::DISCORD_MAX_BYTES
+            };
+            if bytes > 0 && bytes <= limit {
+                let lock = s.cache_lock(&cached).await;
+                let _guard = lock.lock().await;
+                if validated_discord_cache(s, &cached).await? {
+                    return Ok(cached);
+                }
+            }
         }
     }
     let meta = s.meta(path).await;
@@ -2582,7 +2697,7 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
     if size > 0
         && size <= editor::DISCORD_MAX_BYTES
         && path.extension().is_some_and(|e| e == "mp4")
-        && meta["vcodec"] == "h264"
+        && (meta["vcodec"] == "h264" || (codec == "hevc" && meta["vcodec"] == "hevc"))
     {
         return Ok(path.into());
     }
@@ -2607,7 +2722,14 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         "-vf".into(),
         "scale='trunc(min(1280,iw)/2)*2':-2".into(),
         "-c:v".into(),
-        "libx264".into(),
+        if codec == "hevc" {
+            "libx265"
+        } else {
+            "libx264"
+        }
+        .into(),
+        "-tag:v".into(),
+        if codec == "hevc" { "hvc1" } else { "avc1" }.into(),
         // Discord-compatible 8-bit 4:2:0, including when the recording is
         // 10-bit. Older NVIDIA cards cannot accept 10-bit H.264 encode input.
         "-pix_fmt".into(),
@@ -2617,9 +2739,9 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         "-b:v".into(),
         format!("{bitrate}k"),
         "-maxrate".into(),
-        format!("{}k", (bitrate as f64 * 1.45).round() as i64),
+        format!("{bitrate}k"),
         "-bufsize".into(),
-        format!("{}k", bitrate * 2),
+        format!("{}k", editor::discord_buffer_kbps(bitrate)),
         "-c:a".into(),
         "aac".into(),
         "-b:a".into(),
@@ -2631,9 +2753,9 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
     let mut args = args;
     for attempt in 0..3 {
         let suffix = if attempt == 0 {
-            String::new()
+            format!("-{codec}")
         } else {
-            format!("-budget{attempt}")
+            format!("-{codec}-budget{attempt}")
         };
         let out = cached_media(
             s,
@@ -2648,13 +2770,25 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         .await?;
         let bytes = revision(&out).0;
         if bytes > 0 && bytes <= editor::DISCORD_MAX_BYTES {
+            if codec == "hevc"
+                && media::probe_media(&out)
+                    .await
+                    .is_ok_and(|meta| meta.vcodec == "h264")
+            {
+                // HEVC can fall back to H.264 on older/busy GPUs. Expose those
+                // same bytes to compatibility mode without another encode.
+                let fallback = cache_dir()
+                    .join("discord")
+                    .join(format!("{key}{}.mp4", suffix.replacen("-hevc", "-h264", 1)));
+                let _ = tokio::fs::hard_link(&out, fallback).await;
+            }
             tracing::info!(path=%out.display(), bytes, "Discord copy ready");
             return Ok(out);
         }
         let _ = tokio::fs::remove_file(&out).await;
         // Some hardware drivers overshoot their requested VBR. Retry using the
         // observed size rather than failing an otherwise valid conversion.
-        let ratio = (editor::DISCORD_MAX_BYTES as f64 / bytes.max(1) as f64 * 0.85).min(0.8);
+        let ratio = (editor::DISCORD_TARGET_BYTES as f64 / bytes.max(1) as f64 * 0.99).min(0.98);
         for flag in ["-b:v", "-maxrate", "-bufsize"] {
             if let Some(index) = args.iter().position(|arg| arg == flag) {
                 let rate = args[index + 1].trim_end_matches('k').parse::<f64>()?;
@@ -2871,15 +3005,47 @@ async fn run_export_process(
     args: &[String],
     duration: f64,
     job_id: &str,
+    discord: bool,
     cancelled: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut failure = None;
-    for candidate in crate::encoding::command_candidates(args).await {
+    let mut corrupt_encoders = HashSet::new();
+    let candidates = if discord {
+        crate::encoding::discord_command_candidates(args).await
+    } else {
+        crate::encoding::command_candidates(args).await
+    };
+    for candidate in candidates {
         if *cancelled.borrow() || *state.shutdown.borrow() {
             bail!("export canceled");
         }
+        let encoder = crate::encoding::video_encoder(&candidate)
+            .unwrap_or("unknown")
+            .to_owned();
+        if corrupt_encoders.contains(&encoder) {
+            continue;
+        }
         match run_export_attempt(state, &candidate, duration, job_id, cancelled).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if discord {
+                    let output = PathBuf::from(candidate.last().context("export output")?);
+                    let mut shutdown = state.shutdown.subscribe();
+                    let checked = tokio::select! {
+                        result = crate::encoding::validate_video_stream(&output, Duration::from_secs(120)) => result,
+                        _ = cancelled.changed() => bail!("export canceled"),
+                        _ = shutdown.changed() => bail!("export canceled"),
+                    };
+                    if let Err(error) = checked {
+                        corrupt_encoders.insert(encoder.clone());
+                        crate::encoding::reject_discord_encoder(&encoder).await;
+                        let _ = tokio::fs::remove_file(output).await;
+                        tracing::warn!(%encoder, %error, "Discord export contains damaged frames; trying another encoder");
+                        failure = Some(error);
+                        continue;
+                    }
+                }
+                return Ok(());
+            }
             Err(error) => {
                 if *cancelled.borrow() || *state.shutdown.borrow() {
                     return Err(error);
@@ -3071,6 +3237,11 @@ async fn start_export(s: Shared, body: Value) -> ApiResult {
         body["discord_optimized"].as_bool().unwrap_or(false),
         burn.as_ref(),
     )?;
+    let args = if body["discord_optimized"] == true {
+        crate::encoding::preferred_codec_args(&args, &s.cfg.read().await.recording.video_codec)
+    } else {
+        args
+    };
     let (cancel, mut cancelled) = watch::channel(false);
     s.export_committed
         .store(false, std::sync::atomic::Ordering::Release);
@@ -3083,7 +3254,15 @@ async fn start_export(s: Shared, body: Value) -> ApiResult {
         let _work_guard = work_guard;
         let _temp_guard = MediaTemp(temp.clone());
         let result: Result<()> = async {
-            run_export_process(&s, &args, duration, &job_id, &mut cancelled).await?;
+            run_export_process(
+                &s,
+                &args,
+                duration,
+                &job_id,
+                body["discord_optimized"] == true,
+                &mut cancelled,
+            )
+            .await?;
             media::probe_media(&temp).await?;
             if body["discord_optimized"] == true && revision(&temp).0 > editor::DISCORD_MAX_BYTES {
                 bail!("export exceeds Discord file limit");
@@ -3240,7 +3419,7 @@ mod tests {
         ];
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_export_process(&state, &args, 1.0, "test", &mut cancelled),
+            run_export_process(&state, &args, 1.0, "test", false, &mut cancelled),
         )
         .await
         .unwrap()
@@ -3257,7 +3436,7 @@ mod tests {
         let args = vec!["sh".into(), "-c".into(), "exec 1>&-; exec sleep 30".into()];
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            run_export_process(&state, &args, 1.0, "test", &mut cancelled),
+            run_export_process(&state, &args, 1.0, "test", false, &mut cancelled),
         )
         .await
         .unwrap();

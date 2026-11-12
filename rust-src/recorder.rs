@@ -426,7 +426,7 @@ pub fn sanitize_gsr_args(args: &[String], blocked: &[&str]) -> Vec<String> {
     output
 }
 pub fn codec_for_encoder(encoder: &str, depth: &str) -> Option<String> {
-    let base = if encoder.starts_with("h264") {
+    let base = if encoder.starts_with("h264") || encoder == "libx264" {
         "h264"
     } else if encoder.starts_with("hevc") || encoder == "libx265" {
         "hevc"
@@ -575,44 +575,70 @@ fn choose_codec(
     available: &HashSet<String>,
     avoid: Option<&str>,
 ) -> Option<String> {
-    let configured = codec_for_encoder(&rc.encoder, &rc.color_depth);
+    let configured = if rc.encoder == "auto" {
+        codec_for_encoder(&rc.video_codec, &rc.color_depth)
+    } else {
+        codec_for_encoder(&rc.encoder, &rc.color_depth)
+    };
     if let Some(codec) = &configured
         && Some(codec.as_str()) != avoid
         && (available.is_empty() || available.contains(codec))
     {
         return configured;
     }
-    if configured.is_none()
-        && avoid.is_none()
-        && (available.is_empty()
-            || ["h264", "hevc", "av1"]
-                .iter()
-                .any(|c| available.contains(*c)))
-    {
-        return None;
-    }
-    let preferred = if rc.color_depth == "10" {
+    // An explicit H.264 compatibility choice must never silently become HEVC.
+    // HEVC recording can use H.264 when the GPU does not support HEVC.
+    let h264 = configured
+        .as_deref()
+        .is_some_and(|codec| codec.starts_with("h264"));
+    let av1 = configured
+        .as_deref()
+        .is_some_and(|codec| codec.starts_with("av1"));
+    let preferred = if h264 {
+        &["h264", "h264_vulkan"][..]
+    } else if av1 && rc.color_depth == "10" {
         &[
-            "hevc_10bit",
             "av1_10bit",
-            "hevc_10bit_vulkan",
             "av1_10bit_vulkan",
-        ][..]
-    } else {
-        &[
-            "hevc",
-            "av1",
+            "hevc_10bit",
+            "hevc_10bit_vulkan",
             "h264",
             "h264_vulkan",
-            "hevc_vulkan",
-            "av1_vulkan",
         ][..]
+    } else if av1 {
+        &[
+            "av1",
+            "av1_vulkan",
+            "hevc",
+            "hevc_vulkan",
+            "h264",
+            "h264_vulkan",
+        ][..]
+    } else if rc.color_depth == "10" {
+        &[
+            "hevc_10bit",
+            "hevc_10bit_vulkan",
+            "hevc",
+            "hevc_vulkan",
+            "h264",
+            "h264_vulkan",
+        ][..]
+    } else {
+        &["hevc", "hevc_vulkan", "h264", "h264_vulkan"][..]
     };
     preferred
         .iter()
-        .find(|c| Some(**c) != avoid && available.contains(**c))
-        .map(|s| (*s).into())
+        .find(|codec| {
+            Some(**codec) != avoid
+                && (available.contains(**codec)
+                    || available.is_empty() && !codec.ends_with("_vulkan"))
+        })
+        .map(|codec| (*codec).into())
+        // If the capability list omits H.264 altogether, still request it
+        // explicitly; passing no codec lets GSR choose an incompatible family.
+        .or_else(|| (h264 && avoid.is_none()).then(|| "h264".into()))
 }
+
 fn encoder_failure(detail: &str) -> bool {
     let lower = detail.to_lowercase();
     [
@@ -729,6 +755,7 @@ pub struct Recorder {
     capture: Option<Capture>,
     segments: Option<SegmentEngine>,
     segment_template: Option<Vec<String>>,
+    gsr_codec: Option<String>,
     session: Option<Capture>,
     session_path: Option<PathBuf>,
     session_start: Option<Instant>,
@@ -749,6 +776,7 @@ impl Recorder {
             capture: None,
             segments: None,
             segment_template: None,
+            gsr_codec: None,
             session: None,
             session_path: None,
             session_start: None,
@@ -909,6 +937,7 @@ impl Recorder {
             self.backend = "gpu-screen-recorder".into();
             self.cpu_fallback = false;
             self.codec_fallback = false;
+            self.gsr_codec = None;
             let prefix = gsr_prefix(&self.cfg.recording.gsr_source).await?;
             let available = supported_codecs(&prefix).await;
             let mut codec = choose_codec(&self.cfg.recording, &available, None);
@@ -943,6 +972,7 @@ impl Recorder {
                 }
             }
             result?;
+            self.gsr_codec = if self.cpu_fallback { None } else { codec };
             self.capture = Some(capture);
             return Ok(());
         }
@@ -971,11 +1001,7 @@ impl Recorder {
             &path,
         )
         .await?;
-        let candidates = if self.backend == "ffmpeg" && self.cfg.recording.encoder == "auto" {
-            crate::encoding::command_candidates(&cmd).await
-        } else {
-            vec![cmd]
-        };
+        let candidates = capture_candidates(&self.cfg.recording, &self.backend, &cmd).await;
         let (mut capture, template) = start_capture_candidates(candidates).await?;
         self.segment_template = Some(template.clone());
         let (tx, mut rx) = mpsc::channel(8);
@@ -1253,8 +1279,11 @@ impl Recorder {
                 supported_codecs(&gsr_prefix(&self.cfg.recording.gsr_source).await?).await;
             self.build_gsr_cmd(
                 Some(&path),
-                false,
-                choose_codec(&self.cfg.recording, &available, None).as_deref(),
+                self.cpu_fallback,
+                self.gsr_codec
+                    .clone()
+                    .or_else(|| choose_codec(&self.cfg.recording, &available, None))
+                    .as_deref(),
             )
             .await?
         } else {
@@ -1266,20 +1295,15 @@ impl Recorder {
             )
             .await?
         };
-        let commands = if self.backend == "ffmpeg" && self.cfg.recording.encoder == "auto" {
-            if let Some(template) = &self.segment_template {
-                let selected = capture_output(template, &path);
-                if selected == cmd {
-                    vec![selected]
-                } else {
-                    vec![selected, cmd]
-                }
-            } else {
-                crate::encoding::command_candidates(&cmd).await
-            }
-        } else {
-            vec![cmd]
-        };
+        let mut commands = capture_candidates(&self.cfg.recording, &self.backend, &cmd).await;
+        if self.backend == "ffmpeg"
+            && self.cfg.recording.encoder == "auto"
+            && let Some(template) = &self.segment_template
+        {
+            let selected = capture_output(template, &path);
+            commands.retain(|command| command != &selected);
+            commands.insert(0, selected);
+        }
         let (capture, _) = start_capture_candidates(commands).await?;
         self.session = Some(capture);
         self.session_path = Some(path.clone());
@@ -1554,7 +1578,7 @@ pub async fn trim_to_last(path: &Path, seconds: u64) -> Result<()> {
         }
         cmd.extend(["-y".into(), temporary.to_string_lossy().into_owned()]);
         let result = if reencode {
-            crate::encoding::run_video_job(&cmd, Duration::from_secs(120)).await
+            run_new_clip_video_job(path, &cmd, 120).await
         } else {
             checked_command(&cmd, 120).await
         };
@@ -1636,6 +1660,45 @@ pub async fn choose_encoder(preferred: &str) -> String {
         .map(|candidate| candidate.name().to_owned())
         .unwrap_or_else(|| "libx264".into())
 }
+async fn capture_candidates(
+    rc: &RecordingConfig,
+    backend: &str,
+    command: &[String],
+) -> Vec<Vec<String>> {
+    if rc.encoder != "auto" {
+        return vec![command.to_vec()];
+    }
+    if backend == "ffmpeg" {
+        return crate::encoding::recording_command_candidates(command, &rc.video_codec).await;
+    }
+    if backend == "wf-recorder" {
+        let h264 = choose_encoder("auto").await;
+        return wf_command_candidates(command, &h264);
+    }
+    vec![command.to_vec()]
+}
+fn wf_command_candidates(command: &[String], h264: &str) -> Vec<Vec<String>> {
+    let mut commands = vec![command.to_vec()];
+    for encoder in [h264, "libx264"] {
+        if commands.iter().any(|candidate| {
+            candidate
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == encoder)
+        }) {
+            continue;
+        }
+        let mut fallback = sanitize_gsr_args(command, &["-c", "-d"]);
+        fallback.extend(["-c".into(), encoder.into()]);
+        if encoder.ends_with("_vaapi") {
+            fallback.extend(strings(&["-d", "/dev/dri/renderD128"]));
+        }
+        if !commands.contains(&fallback) {
+            commands.push(fallback);
+        }
+    }
+    commands
+}
+
 async fn pulse_source(microphone: bool, preferred: &str) -> String {
     let preferred = preferred.strip_prefix("device:").unwrap_or(preferred);
     if !preferred.is_empty()
@@ -1704,7 +1767,14 @@ async fn segment_command(
     // Build an ordinary CPU command for auto FFmpeg capture; the shared policy
     // rewrites the complete graph with the probed GPU's actual device path.
     let encoder = if backend == "ffmpeg" && rc.encoder == "auto" {
-        "libx264".into()
+        if rc.video_codec == "hevc" {
+            "libx265"
+        } else {
+            "libx264"
+        }
+        .into()
+    } else if rc.encoder == "auto" {
+        crate::encoding::preferred_recording_encoder(&rc.video_codec).await
     } else {
         choose_encoder(&rc.encoder).await
     };
@@ -1727,13 +1797,16 @@ async fn segment_command(
         }
         cmd.extend(strings(&[
             "-c",
-            if matches!(encoder.as_str(), "h264_nvenc" | "hevc_nvenc" | "h264_vaapi") {
+            if matches!(
+                encoder.as_str(),
+                "h264_nvenc" | "hevc_nvenc" | "h264_vaapi" | "hevc_vaapi" | "libx265"
+            ) {
                 &encoder
             } else {
                 "libx264"
             },
         ]));
-        if encoder == "h264_vaapi" {
+        if encoder.ends_with("_vaapi") {
             cmd.extend(strings(&["-d", "/dev/dri/renderD128"]));
         }
         return Ok(cmd);
@@ -1961,6 +2034,30 @@ async fn apply_audio(path: &Path, rc: &RecordingConfig) {
     }
     let _ = tokio::fs::remove_file(temporary).await;
 }
+/// Postprocessing runs only on a newly saved clip/session. Keep hardware HEVC
+/// from the recorder instead of silently replacing it with software H.264.
+async fn run_new_clip_video_job(source: &Path, args: &[String], seconds: u64) -> Result<()> {
+    let hevc = crate::media::probe_media(source)
+        .await
+        .is_ok_and(|media| matches!(media.vcodec.as_str(), "hevc" | "h265"));
+    if !hevc {
+        return crate::encoding::run_video_job(args, Duration::from_secs(seconds)).await;
+    }
+    let args = crate::encoding::preferred_codec_args(args, "hevc");
+    let mut failure = None;
+    for candidate in crate::encoding::recording_command_candidates(&args, "hevc").await {
+        match checked_command(&candidate, seconds).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(encoder=crate::encoding::video_encoder(&candidate), %error,
+                    "New clip postprocessing failed; trying the next encoder");
+                failure = Some(error);
+            }
+        }
+    }
+    Err(failure.unwrap_or_else(|| anyhow!("no new clip encoder available")))
+}
+
 async fn apply_watermark(path: &Path) {
     let temporary = temporary_media(path, "wm");
     let mut cmd = strings(&["ffmpeg", "-hide_banner", "-loglevel", "error", "-i"]);
@@ -1970,9 +2067,7 @@ async fn apply_watermark(path: &Path) {
         cmd.extend(strings(&["-movflags", "+faststart"]));
     }
     cmd.extend(["-y".into(), temporary.to_string_lossy().into_owned()]);
-    if crate::encoding::run_video_job(&cmd, Duration::from_secs(180))
-        .await
-        .is_ok()
+    if run_new_clip_video_job(path, &cmd, 180).await.is_ok()
         && verify_media(&temporary).await.is_ok()
     {
         let _ = tokio::fs::rename(&temporary, path).await;
@@ -2371,6 +2466,64 @@ mod tests {
         );
     }
     #[test]
+    fn automatic_recording_prefers_hevc_and_preserves_h264_compatibility() {
+        let mut rc = RecordingConfig::default();
+        let available = HashSet::from(["hevc".into(), "h264".into(), "av1".into()]);
+        assert_eq!(choose_codec(&rc, &available, None).as_deref(), Some("hevc"));
+        assert_eq!(
+            choose_codec(&rc, &available, Some("hevc")).as_deref(),
+            Some("h264")
+        );
+        assert_eq!(
+            choose_codec(&rc, &HashSet::new(), None).as_deref(),
+            Some("hevc")
+        );
+        assert_eq!(
+            choose_codec(&rc, &HashSet::new(), Some("hevc")).as_deref(),
+            Some("h264")
+        );
+        rc.video_codec = "h264".into();
+        rc.color_depth = "10".into();
+        assert_eq!(choose_codec(&rc, &available, None).as_deref(), Some("h264"));
+        assert_eq!(choose_codec(&rc, &available, Some("h264")), None);
+        assert_eq!(
+            choose_codec(&rc, &HashSet::from(["hevc".into()]), None).as_deref(),
+            Some("h264")
+        );
+        rc.encoder = "av1_nvenc".into();
+        rc.color_depth = "8".into();
+        assert_eq!(choose_codec(&rc, &available, None).as_deref(), Some("av1"));
+        rc.encoder = "libx264".into();
+        rc.color_depth = "10".into();
+        assert_eq!(choose_codec(&rc, &available, None).as_deref(), Some("h264"));
+    }
+    #[test]
+    fn wf_hevc_capture_can_fall_back_without_leaking_gpu_flags() {
+        let command = strings(&[
+            "wf-recorder",
+            "-f",
+            "/tmp/new.mp4",
+            "-c",
+            "hevc_vaapi",
+            "-d",
+            "/dev/dri/renderD128",
+            "-o",
+            "DP-1",
+        ]);
+        let candidates = wf_command_candidates(&command, "h264_vaapi");
+        assert_eq!(candidates[0], command);
+        assert!(
+            candidates[1]
+                .windows(2)
+                .any(|pair| pair == ["-c", "h264_vaapi"])
+        );
+        let cpu = candidates.last().unwrap();
+        assert!(cpu.windows(2).any(|pair| pair == ["-c", "libx264"]));
+        assert!(!cpu.iter().any(|arg| arg == "-d" || arg == "hevc_vaapi"));
+        assert!(cpu.windows(2).any(|pair| pair == ["-f", "/tmp/new.mp4"]));
+        assert!(cpu.windows(2).any(|pair| pair == ["-o", "DP-1"]));
+    }
+    #[test]
     fn monitor_parsing_filters_diagnostics() {
         let monitors = parse_gsr_displays(
             "screen\ngsr error: failed to open device\n\"DP-1\" 1920x1080\nHDMI-A-1|2560x1440\n",
@@ -2456,6 +2609,70 @@ mod tests {
         assert_eq!((leveled.width, leveled.height), (160, 90));
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[tokio::test]
+    async fn new_hevc_clip_postprocessing_preserves_codec_when_hardware_is_available() {
+        if !has_program("ffmpeg") || !has_program("ffprobe") {
+            return;
+        }
+        let encoders = output(&strings(&["ffmpeg", "-hide_banner", "-encoders"]), 10)
+            .await
+            .unwrap();
+        if !String::from_utf8_lossy(&encoders.stdout).contains("libx265") {
+            return;
+        }
+        let dir = temp_dir();
+        let source = dir.join("new-clip.mp4");
+        let destination = dir.join("processed.mp4");
+        let mut create = strings(&[
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440",
+            "-t",
+            "1",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "pools=none:frame-threads=1:log-level=error",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-y",
+        ]);
+        create.push(source.to_string_lossy().into_owned());
+        checked_command(&create, 30).await.unwrap();
+        let original = std::fs::read(&source).unwrap();
+        let mut command = strings(&["ffmpeg", "-v", "error", "-i"]);
+        command.push(source.to_string_lossy().into_owned());
+        command.extend(strings(&[
+            "-map", "0:v:0", "-map", "0:a?", "-vf", "hflip", "-c:v", "libx264", "-preset",
+            "veryfast", "-crf", "23", "-c:a", "copy", "-y",
+        ]));
+        command.push(destination.to_string_lossy().into_owned());
+        let hevc = crate::encoding::preferred_codec_args(&command, "hevc");
+        let candidates = crate::encoding::recording_command_candidates(&hevc, "hevc").await;
+        let has_hevc = crate::encoding::video_encoder(&candidates[0])
+            .is_some_and(|encoder| encoder.starts_with("hevc"));
+        run_new_clip_video_job(&source, &command, 30).await.unwrap();
+        let result = crate::media::probe_media(&destination).await.unwrap();
+        assert_eq!(result.vcodec, if has_hevc { "hevc" } else { "h264" });
+        assert_eq!((result.width, result.height), (320, 180));
+        assert_eq!(result.audio_streams, 1);
+        assert!((result.duration - 1.0).abs() < 0.2);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn real_segment_extraction_handles_multiple_audio_tracks() {
         if !has_program("ffmpeg") || !has_program("ffprobe") {

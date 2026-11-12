@@ -20,7 +20,7 @@ import {t} from '../lib/i18n';
  * thing that put the clip viewer up at the app root.
  */
 export function useImageActions(collection?: Image[]): {actions: ImageActionSet; overlays: ReactNode} {
-  const {state, visibleImages, notify, refreshImages, refreshPlaylists} = useStore();
+  const {state, visibleImages, notify, refreshImages, refreshPlaylists, deleteImage} = useStore();
   const {playlists} = state;
 
   const [viewing, setViewing] = useState<string | null>(null);
@@ -215,8 +215,7 @@ export function useImageActions(collection?: Image[]): {actions: ImageActionSet;
                 setConfirmDelete(null);
                 if (!image) return;
                 setViewing(current => (current === image.slug ? null : current));
-                void api
-                  .deleteImage(image.slug)
+                void deleteImage(image.slug)
                   .then(() => say(t('images.deleted')))
                   .catch(fail(t('images.errDelete')));
               }}>

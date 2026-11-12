@@ -21,7 +21,7 @@ section!(RecordingConfig {
     buffer_duration: i64 = 120, clip_duration: i64 = 20, fps: i64 = 60,
     display: Option<String> = None, follow_mouse_display: bool = false,
     window_capture: bool = false, resolution: Option<String> = None,
-    encoder: String = "auto".into(), crf: i64 = 23, color_depth: String = "8".into(),
+    encoder: String = "auto".into(), video_codec: String = "hevc".into(), crf: i64 = 23, color_depth: String = "8".into(),
     backend: String = "auto".into(), capture_audio: bool = true,
     desktop_volume: f64 = 1., microphone_volume: f64 = 1., capture_microphone: bool = false,
     microphone_source: String = "default_input".into(), microphone_mono: bool = false,
@@ -225,6 +225,11 @@ impl Config {
                 "auto",
             ),
             (&mut self.recording.color_depth, &["8", "10"][..], "8"),
+            (
+                &mut self.recording.video_codec,
+                &["hevc", "h264"][..],
+                "hevc",
+            ),
         ] {
             *value = value.trim().to_lowercase();
             if !choices.contains(&value.as_str()) {
@@ -276,6 +281,9 @@ impl Config {
         validate_hotkeys(&self.hotkeys)?;
         if !(1..=240).contains(&self.recording.fps) {
             bail!("recording.fps must be between 1 and 240");
+        }
+        if !["hevc", "h264"].contains(&self.recording.video_codec.as_str()) {
+            bail!("recording.video_codec must be hevc or h264");
         }
         if !(0..=51).contains(&self.recording.crf) {
             bail!("recording.crf must be between 0 and 51");
@@ -379,6 +387,21 @@ mod tests {
         assert_eq!(cfg.recording.color_depth, "8");
         assert_eq!(cfg.overlay.keys_scale, 3.);
         assert_eq!(cfg.hotkeys.clip, "KEY_F9");
+    }
+    #[test]
+    fn recording_codec_defaults_migrates_and_persists_compatibility() {
+        let mut cfg: Config = toml::from_str("[recording]\nencoder='auto'\n").unwrap();
+        assert_eq!(cfg.recording.video_codec, "hevc");
+        cfg.recording.video_codec = " H264 ".into();
+        cfg.normalize();
+        assert_eq!(cfg.recording.video_codec, "h264");
+        cfg.validate().unwrap();
+        let parsed: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(parsed.recording.video_codec, "h264");
+        cfg.recording.video_codec = "av1".into();
+        assert!(cfg.validate().is_err());
+        cfg.normalize();
+        assert_eq!(cfg.recording.video_codec, "hevc");
     }
     #[test]
     fn hotkey_collision_after_canonicalization() {

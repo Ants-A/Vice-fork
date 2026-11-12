@@ -37,6 +37,15 @@ fn executable(path: &Path, contents: &str) -> Result<()> {
 
 impl Library {
     async fn start(count: usize, legacy_cache: bool, probe_delay: &str) -> Result<Self> {
+        Self::start_with_preload(count, legacy_cache, probe_delay, None).await
+    }
+
+    async fn start_with_preload(
+        count: usize,
+        legacy_cache: bool,
+        probe_delay: &str,
+        preload: Option<&Path>,
+    ) -> Result<Self> {
         let root = tempfile::tempdir()?;
         for name in ["run", "clips", "images", "bin", "cache"] {
             std::fs::create_dir(root.path().join(name))?;
@@ -102,7 +111,8 @@ printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"h264","width":128
         cfg.output.auto_playlist_by_game = false;
         std::fs::write(root.path().join("config.toml"), toml::to_string(&cfg)?)?;
         let log = std::fs::File::create(root.path().join("daemon.log"))?;
-        let child = Command::new(env!("CARGO_BIN_EXE_vice"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vice"));
+        command
             .current_dir(root.path())
             .args(["start", "--no-open-ui"])
             .env("VICE_CONFIG", root.path().join("config.toml"))
@@ -118,8 +128,13 @@ printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"h264","width":128
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
-            .process_group(0)
-            .spawn()?;
+            .process_group(0);
+        if let Some(preload) = preload {
+            command
+                .env("LD_PRELOAD", preload)
+                .env("VICE_TEST_SLOW_CACHE", root.path().join("cache/thumbs"));
+        }
+        let child = command.spawn()?;
         let mut library = Self {
             root,
             child,
@@ -171,9 +186,126 @@ printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"h264","width":128
     }
 }
 
+#[cfg(target_env = "gnu")]
+#[tokio::test]
+async fn delete_finishes_before_slow_cache_cleanup_and_preserves_new_revisions() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let Some(cc) = vice::runtime::which("cc") else {
+        return Ok(());
+    };
+    let shim = tempfile::tempdir()?;
+    let c = shim.path().join("slow-cache.c");
+    let library_path = shim.path().join("slow-cache.so");
+    // Delay only cache enumeration in this isolated daemon. This represents a
+    // large/cold derivative cache without thousands of fixture files or sleeps
+    // in production code; source unlink and API bookkeeping stay fast.
+    std::fs::write(
+        &c,
+        r#"
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+struct dirent64 *readdir64(DIR *dir) {
+    struct dirent64 *(*real)(DIR *) = dlsym(RTLD_NEXT, "readdir64");
+    char fdpath[64], target[4096];
+    snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", dirfd(dir));
+    ssize_t size = readlink(fdpath, target, sizeof(target) - 1);
+    const char *slow = getenv("VICE_TEST_SLOW_CACHE");
+    if (size >= 0 && slow) {
+        target[size] = 0;
+        if (!strcmp(target, slow)) usleep(100000);
+    }
+    return real(dir);
+}
+"#,
+    )?;
+    let compiled = Command::new(cc)
+        .args(["-shared", "-fPIC", "-O2", "-o"])
+        .arg(&library_path)
+        .arg(&c)
+        .arg("-ldl")
+        .output()?;
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let library = Library::start_with_preload(2, true, "0", Some(&library_path)).await?;
+    let source = library.root.path().join("clips/clip-0.mp4");
+    let identity = vice::media::FileIdentity::read(&source)?;
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(source.as_os_str().as_encoded_bytes())
+    );
+    let key = format!(
+        "{}-{}-{}-{}",
+        &hash[..24],
+        identity.size,
+        identity.mtime_ns,
+        identity.inode
+    );
+    let cache = library.root.path().join("cache/thumbs");
+    std::fs::create_dir_all(&cache)?;
+    let old = cache.join(format!("{key}.jpg"));
+    let other_revision = cache.join(format!("{key}1.jpg"));
+    std::fs::write(&old, b"old thumbnail")?;
+    std::fs::write(
+        &other_revision,
+        b"a different inode whose number shares a prefix",
+    )?;
+
+    let started = Instant::now();
+    library
+        .client
+        .delete(format!("{}/api/clips/clip-0", library.base))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "deletion waited for cache cleanup: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !source.exists(),
+        "success must mean the original file was removed"
+    );
+    assert!(
+        old.exists(),
+        "the delayed derivative sweep should still be running"
+    );
+    let clips = library.get("/api/clips").await?;
+    assert_eq!(clips["clips"].as_array().unwrap().len(), 1);
+    assert_eq!(clips["clips"][0]["slug"], "clip-1");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while old.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !old.exists(),
+        "orphaned derivatives must eventually be removed"
+    );
+    assert!(
+        other_revision.exists(),
+        "cleanup must not remove a new revision at the same path"
+    );
+    assert!(
+        library.full_probes().is_empty(),
+        "deleting one known item must not probe or rescan its neighbors"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn cached_discord_copy_does_not_wait_for_cold_metadata_or_busy_probes() -> Result<()> {
     use sha2::{Digest, Sha256};
+    let Some(ffmpeg) = vice::runtime::which("ffmpeg") else {
+        return Ok(());
+    };
     let library = Library::start(2, false, "2").await?;
     let source = library.root.path().join("clips/clip-0.mp4");
     let identity = vice::media::FileIdentity::read(&source)?;
@@ -190,7 +322,45 @@ async fn cached_discord_copy_does_not_wait_for_cold_metadata_or_busy_probes() ->
         identity.mtime_ns,
         identity.inode
     ));
-    std::fs::write(&ready, b"completed-discord-copy")?;
+    let fixture = Command::new(&ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=96x64:r=5:d=0.4",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-threads",
+            "1",
+            "-movflags",
+            "+faststart",
+            "-y",
+        ])
+        .arg(&ready)
+        .output()?;
+    assert!(
+        fixture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fixture.stderr)
+    );
+    let ready_size = std::fs::metadata(&ready)?.len();
+    // A ready cache now receives real full-frame validation once. Keep normal
+    // probes/thumbnails fake, but forward validation through the actual decoder
+    // so this test cannot pass by treating arbitrary bytes as playable video.
+    let quoted_ffmpeg = ffmpeg.to_string_lossy().replace('\'', "'\\''");
+    let validations = library.root.path().join("validations.log");
+    let quoted_log = validations.to_string_lossy().replace('\'', "'\\''");
+    executable(
+        &library.root.path().join("bin/ffmpeg"),
+        &format!(
+            "#!/bin/sh\nfor last do :; done\nif [ \"$last\" = - ]; then\n printf 'validation\\n' >> '{quoted_log}'\n exec '{quoted_ffmpeg}' \"$@\"\nfi\nprintf 'fixture-thumbnail' > \"$last\"\n"
+        ),
+    )?;
 
     // Hydration owns one probe. A detail request fills the other slot. The
     // ready copy must bypass both the source's metadata lock and probe queue.
@@ -221,7 +391,21 @@ async fn cached_discord_copy_does_not_wait_for_cold_metadata_or_busy_probes() ->
         "an existing local copy waited {elapsed:?} for unrelated probing"
     );
     assert_eq!(result["path"], ready.to_string_lossy().as_ref());
-    assert_eq!(result["size"], b"completed-discord-copy".len());
+    assert_eq!(result["size"], ready_size);
+    assert_eq!(std::fs::read_to_string(&validations)?.lines().count(), 1);
+    let started = Instant::now();
+    let warm = library.get("/api/clips/clip-0/discord").await?;
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "warm cache reuse waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(warm["path"], result["path"]);
+    assert_eq!(
+        std::fs::read_to_string(&validations)?.lines().count(),
+        1,
+        "unchanged validated bytes must not launch a second decoder"
+    );
     assert_eq!(
         library.full_probes().len(),
         2,

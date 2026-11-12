@@ -12,7 +12,10 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-use tokio::{process::Command, sync::OnceCell};
+use tokio::{
+    process::Command,
+    sync::{Mutex, OnceCell},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
@@ -73,6 +76,8 @@ impl VideoEncoder {
 }
 static H264: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
 static HEVC: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
+static DISCORD_HEVC: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
+static DISCORD_INVALID: OnceCell<Mutex<HashSet<String>>> = OnceCell::const_new();
 static AV1: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
 static VP8: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
 static VP9: OnceCell<Vec<VideoEncoder>> = OnceCell::const_new();
@@ -273,37 +278,243 @@ pub async fn command_candidates(args: &[String]) -> Vec<Vec<String>> {
     commands
 }
 
-/// CUDA copies resize and convert to 8-bit on the decoder's GPU. VAAPI uses
-/// the faster measured CPU decode/scale path first. Keep both pipelines so
-/// narrower hardware decode support can still use a working GPU encoder.
-pub async fn discord_command_candidates(args: &[String]) -> Vec<Vec<String>> {
-    if job_family(args) != Some(Family::H264) {
-        return command_candidates(args).await;
+/// Change only the requested codec and its MP4 sample entry. Existing bitrate,
+/// stream selection and filters remain unchanged across compatibility fallbacks.
+pub fn preferred_codec_args(args: &[String], codec: &str) -> Vec<String> {
+    let family = if codec == "hevc" {
+        Family::Hevc
+    } else {
+        Family::H264
+    };
+    codec_args(args, family)
+}
+fn codec_args(args: &[String], family: Family) -> Vec<String> {
+    let mut command = args.to_vec();
+    if let Some(index) = encoder_position(&command) {
+        command[index + 1] = family.software().into();
     }
-    let mut commands = Vec::new();
-    for encoder in probed(Family::H264)
-        .await
-        .into_iter()
-        .filter(VideoEncoder::is_hardware)
+    if let Some(index) = command
+        .iter()
+        .position(|a| matches!(a.as_str(), "-tag:v" | "-tag:v:0"))
     {
-        if encoder.hardware == Hardware::Nvenc
-            && let Ok(command) = rewrite_discord_args(args, &encoder)
-        {
-            commands.push(command);
+        command[index + 1] = if family == Family::Hevc {
+            "hvc1"
+        } else {
+            "avc1"
         }
-        // Radeon 680M benchmarks with ongoing replay recording are faster
-        // using CPU decode/scale + VAAPI encode than sharing VCN for both
-        // decode and encode. Keep that path first on VAAPI devices.
-        if let Ok(command) = rewrite_video_args(args, &encoder) {
-            commands.push(command);
+        .into();
+    } else if family == Family::Hevc
+        && command
+            .last()
+            .and_then(|arg| Path::new(arg).extension())
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "mp4" | "mov" | "m4v"))
+    {
+        let output = command.len().saturating_sub(1);
+        command.splice(output..output, strings(&["-tag:v", "hvc1"]));
+    }
+    if family == Family::H264 {
+        for option in ["-pix_fmt", "-pix_fmt:v"] {
+            if let Some(index) = command.iter().position(|a| a == option)
+                && matches!(
+                    command[index + 1].as_str(),
+                    "p010le" | "yuv420p10le" | "yuv420p12le"
+                )
+            {
+                command[index + 1] = "yuv420p".into();
+            }
         }
-        if matches!(encoder.hardware, Hardware::Vaapi(_))
-            && let Ok(command) = rewrite_discord_args(args, &encoder)
-        {
-            commands.push(command);
+        while let Some(index) = command.iter().position(|a| a == "-x265-params") {
+            command.drain(index..(index + 2).min(command.len()));
         }
     }
-    commands.push(args.to_vec());
+    command
+}
+/// Real-time recording must not fall back to slow software HEVC. A machine
+/// without a working HEVC GPU still records with hardware/CPU H.264.
+pub async fn recording_command_candidates(args: &[String], codec: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    if codec == "hevc" {
+        let hevc = codec_args(args, Family::Hevc);
+        for encoder in probed(Family::Hevc)
+            .await
+            .into_iter()
+            .filter(VideoEncoder::is_hardware)
+        {
+            if let Ok(command) = rewrite_video_args(&hevc, &encoder) {
+                commands.push(command);
+            }
+        }
+    }
+    commands.extend(command_candidates(&codec_args(args, Family::H264)).await);
+    commands
+}
+pub async fn preferred_recording_encoder(codec: &str) -> String {
+    if codec == "hevc" {
+        for encoder in probed(Family::Hevc).await {
+            if matches!(encoder.hardware, Hardware::Nvenc | Hardware::Vaapi(_)) {
+                return encoder.name;
+            }
+        }
+    }
+    for encoder in probed(Family::H264).await {
+        if matches!(encoder.hardware, Hardware::Nvenc | Hardware::Vaapi(_)) {
+            return encoder.name;
+        }
+    }
+    "libx264".into()
+}
+/// A successful encoder process is insufficient: some drivers produce malformed
+/// budgeted HEVC while their constant-quality recording path remains healthy.
+/// Check moving frames and a software decode once, only for Discord's rate mode.
+async fn discord_encoders(family: Family) -> Vec<VideoEncoder> {
+    if family != Family::Hevc {
+        return probed(family).await;
+    }
+    DISCORD_HEVC.get_or_init(|| async {
+        let mut usable = Vec::new();
+        for encoder in probed(Family::Hevc).await.into_iter().filter(VideoEncoder::is_hardware) {
+            if probe_discord_encoder(&encoder).await {
+                usable.push(encoder);
+            } else {
+                tracing::warn!(encoder=encoder.name(), "Discord rate-control probe produced an unusable video; keeping other recording modes available");
+            }
+        }
+        usable
+    }).await.clone()
+}
+
+async fn probe_discord_encoder(encoder: &VideoEncoder) -> bool {
+    let directory = ProbeDirectory(
+        std::env::temp_dir().join(format!("vice-discord-probe-{}", uuid::Uuid::new_v4())),
+    );
+    if tokio::fs::create_dir_all(&directory.0).await.is_err() {
+        return false;
+    }
+    let output = directory.0.join("moving.mp4");
+    let mut args = strings(&[
+        "ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=256x256:r=30",
+        "-frames:v",
+        "12",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx265",
+        "-b:v",
+        "1000k",
+        "-maxrate",
+        "1000k",
+        "-bufsize",
+        "250k",
+        "-tag:v",
+        "hvc1",
+        "-y",
+    ]);
+    args.push(output.to_string_lossy().into_owned());
+    let Ok(command) = rewrite_video_args(&args, encoder) else {
+        return false;
+    };
+    run_command(&command, Duration::from_secs(10)).await.is_ok()
+        && validate_video_stream(&output, Duration::from_secs(10))
+            .await
+            .is_ok()
+}
+
+/// A driver that reports success but emits damaged frames must not be selected
+/// again for later copies. This does not blacklist recording's other modes.
+pub async fn reject_discord_encoder(name: &str) {
+    DISCORD_INVALID
+        .get_or_init(|| async { Mutex::new(HashSet::new()) })
+        .await
+        .lock()
+        .await
+        .insert(name.to_owned());
+}
+
+/// Decode every video frame before making a converted file available. Metadata
+/// probes alone cannot detect invalid CABAC data or damaged inter frames.
+pub async fn validate_video_stream(path: &Path, timeout: Duration) -> Result<()> {
+    let mut args = strings(&[
+        "ffmpeg",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-xerror",
+        "-err_detect",
+        "explode",
+        "-i",
+    ]);
+    args.push(path.to_string_lossy().into_owned());
+    args.extend(strings(&["-map", "0:v:0", "-an", "-f", "null", "-"]));
+    let result = tokio::time::timeout(
+        timeout,
+        Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("converted video validation timed out")??;
+    // Some decoders conceal damaged blocks and still return process status 0.
+    // At error log level any diagnostic is a failed validation, not a warning.
+    if !result.status.success() || !result.stderr.is_empty() {
+        bail!(
+            "converted video failed full-frame decoding: {}",
+            String::from_utf8_lossy(&result.stderr[..result.stderr.len().min(2048)])
+        );
+    }
+    Ok(())
+}
+
+/// CUDA copies resize on the decoder's GPU. Integrated-GPU copies retain the
+/// faster CPU decode/scale path first. Unsupported HEVC hardware falls back to
+/// H.264 hardware, then fast H.264 software instead of a slow x265 encode.
+pub async fn discord_command_candidates(args: &[String]) -> Vec<Vec<String>> {
+    discord_command_candidates_for(args, false).await
+}
+
+/// HEVC input benefits from resident GPU decode/scale surfaces, while older
+/// H.264 clips keep the measured faster CPU decode/scale path on integrated GPUs.
+pub async fn discord_command_candidates_for(
+    args: &[String],
+    prefer_gpu_decode: bool,
+) -> Vec<Vec<String>> {
+    let Some(family @ (Family::H264 | Family::Hevc)) = job_family(args) else {
+        return command_candidates(args).await;
+    };
+    let families = if family == Family::Hevc {
+        vec![Family::Hevc, Family::H264]
+    } else {
+        vec![Family::H264]
+    };
+    let mut commands = Vec::new();
+    for family in families {
+        let args = codec_args(args, family);
+        for encoder in discord_encoders(family)
+            .await
+            .into_iter()
+            .filter(VideoEncoder::is_hardware)
+        {
+            commands.extend(discord_encoder_commands(&args, &encoder, prefer_gpu_decode));
+        }
+        if family == Family::H264 {
+            commands.push(args);
+        }
+    }
+    if let Some(invalid) = DISCORD_INVALID.get() {
+        let invalid = invalid.lock().await;
+        commands
+            .retain(|command| video_encoder(command).is_none_or(|name| !invalid.contains(name)));
+    }
     if !async_input_available().await {
         return commands;
     }
@@ -312,12 +523,31 @@ pub async fn discord_command_candidates(args: &[String]) -> Vec<Vec<String>> {
         if let Some(wrapped) = async_file_input(&command) {
             overlapped.push(wrapped);
         }
-        // A protocol/read failure can retry this same encoder with its raw
-        // file input before falling back to a slower encoder.
         overlapped.push(command);
     }
     overlapped
 }
+fn discord_encoder_commands(
+    args: &[String],
+    encoder: &VideoEncoder,
+    prefer_gpu_decode: bool,
+) -> Vec<Vec<String>> {
+    let direct = rewrite_discord_args(args, encoder).ok();
+    let normal = rewrite_video_args(args, encoder).ok().map(|mut command| {
+        if encoder.hardware == Hardware::Nvenc
+            && let Some(index) = command.iter().position(|arg| arg == "-preset")
+        {
+            command[index + 1] = "p4".into();
+        }
+        command
+    });
+    if encoder.hardware == Hardware::Nvenc || prefer_gpu_decode {
+        direct.into_iter().chain(normal).collect()
+    } else {
+        normal.into_iter().chain(direct).collect()
+    }
+}
+
 async fn async_input_available() -> bool {
     *ASYNC_INPUT
         .get_or_init(|| async {
@@ -353,11 +583,11 @@ fn async_file_input(args: &[String]) -> Option<Vec<String>> {
 }
 
 fn rewrite_discord_args(args: &[String], encoder: &VideoEncoder) -> Result<Vec<String>> {
-    if job_family(args) != Some(Family::H264)
+    if !matches!(job_family(args), Some(Family::H264 | Family::Hevc))
         || !budgeted(args)
         || args.iter().filter(|a| *a == "-i").count() != 1
     {
-        bail!("direct Discord resizing requires one budgeted H.264 output");
+        bail!("direct Discord resizing requires one budgeted H.264 or HEVC output");
     }
     let filter =
         value(args, &["-vf", "-filter:v", "-filter:v:0"]).context("Discord resize filter")?;
@@ -375,8 +605,9 @@ fn rewrite_discord_args(args: &[String], encoder: &VideoEncoder) -> Result<Vec<S
             "scale_cuda=w='trunc(min(1280,iw)/2)*2':h=-2:format=nv12:interp_algo=bicubic"
         }
         Hardware::Vaapi(_) => "scale_vaapi=w='trunc(min(1280,iw)/2)*2':h=-2:format=nv12",
-        // QSV/Vulkan retain the existing tested CPU-decode/upload path until
-        // their resize/format-conversion capabilities can be checked together.
+        Hardware::Vulkan(_) => "scale_vulkan=w='trunc(min(1280,iw)/2)*2':h=-2:format=nv12",
+        // QSV retains the CPU-decode/upload fallback until its shared decoder
+        // and scaler surfaces can be checked together.
         _ => bail!("direct Discord resize is unavailable on this backend"),
     };
     let mut unfiltered = Vec::new();
@@ -1123,6 +1354,60 @@ mod tests {
         );
     }
     #[test]
+    fn hevc_input_can_prefer_resident_gpu_frames_without_changing_h264_defaults() {
+        let mut args = discord_args();
+        let filter = args.iter().position(|arg| arg == "-vf").unwrap();
+        args[filter + 1] = "scale='trunc(min(1280,iw)/2)*2':-2".into();
+        let args = preferred_codec_args(&args, "hevc");
+        for (name, hardware) in [
+            ("hevc_vaapi", Hardware::Vaapi("/dev/dri/renderD128".into())),
+            ("hevc_vulkan", Hardware::Vulkan(0)),
+        ] {
+            let encoder = encoder(name, hardware, Family::Hevc);
+            let original_order = discord_encoder_commands(&args, &encoder, false);
+            let hevc_order = discord_encoder_commands(&args, &encoder, true);
+            assert_eq!(original_order.len(), 2);
+            assert_eq!(hevc_order.len(), 2);
+            assert_eq!(hevc_order[0], original_order[1]);
+            assert_eq!(hevc_order[1], original_order[0]);
+            assert!(value(&hevc_order[0], &["-hwaccel_output_format"]).is_some());
+            assert!(value(&original_order[0], &["-hwaccel"]).is_none());
+            assert_eq!(value(&hevc_order[0], &["-b:v"]), value(&args, &["-b:v"]));
+        }
+    }
+    #[test]
+    fn hevc_discord_gpu_path_keeps_budget_and_hvc1_while_h264_fallback_is_8_bit() {
+        let mut original = discord_args();
+        let filter = original.iter().position(|arg| arg == "-vf").unwrap();
+        original[filter + 1] = "scale='trunc(min(1280,iw)/2)*2':-2".into();
+        let hevc = preferred_codec_args(&original, "hevc");
+        assert_eq!(value(&hevc, &["-tag:v"]), Some("hvc1"));
+        for hardware in [
+            Hardware::Nvenc,
+            Hardware::Vaapi("/dev/dri/renderD128".into()),
+        ] {
+            let name = if hardware == Hardware::Nvenc {
+                "hevc_nvenc"
+            } else {
+                "hevc_vaapi"
+            };
+            let command =
+                rewrite_discord_args(&hevc, &encoder(name, hardware, Family::Hevc)).unwrap();
+            assert_eq!(value(&command, &["-tag:v"]), Some("hvc1"));
+            for option in ["-b:v", "-maxrate", "-bufsize", "-b:a", "-c:a"] {
+                assert_eq!(value(&command, &[option]), value(&hevc, &[option]));
+            }
+        }
+        let mut ten_bit = hevc;
+        let index = ten_bit.iter().position(|arg| arg == "-pix_fmt").unwrap();
+        ten_bit[index + 1] = "yuv420p10le".into();
+        let compatible = preferred_codec_args(&ten_bit, "h264");
+        assert_eq!(video_encoder(&compatible), Some("libx264"));
+        assert_eq!(value(&compatible, &["-tag:v"]), Some("avc1"));
+        assert_eq!(value(&compatible, &["-pix_fmt"]), Some("yuv420p"));
+        assert_eq!(compatible.last(), discord_args().last());
+    }
+    #[test]
     fn discord_nvenc_preserves_exact_bitrate_budget() {
         let original = discord_args();
         let command = rewrite_video_args(
@@ -1299,6 +1584,72 @@ mod tests {
         assert_eq!(info.vcodec, "h264");
         assert!(info.duration > 0.);
     }
+    #[tokio::test]
+    async fn simple_discord_video_does_not_pad_to_its_bitrate_budget() {
+        if crate::runtime::which("ffmpeg").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("black.mp4");
+        let mut fixture = strings(&[
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1280x720:r=30:d=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-threads",
+            "1",
+            "-y",
+        ]);
+        fixture.push(source.to_string_lossy().into_owned());
+        run_command(&fixture, Duration::from_secs(20))
+            .await
+            .unwrap();
+        for codec in ["hevc", "h264"] {
+            let output = dir.path().join(format!("{codec}.mp4"));
+            let mut args = strings(&["ffmpeg", "-v", "error", "-i"]);
+            args.push(source.to_string_lossy().into_owned());
+            args.extend(strings(&[
+                "-vf",
+                "scale='trunc(min(1280,iw)/2)*2':-2",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-pix_fmt",
+                "yuv420p",
+                "-b:v",
+                "3000k",
+                "-maxrate",
+                "3000k",
+                "-bufsize",
+                "750k",
+                "-y",
+            ]));
+            args.push(output.to_string_lossy().into_owned());
+            let args = preferred_codec_args(&args, codec);
+            let candidates = discord_command_candidates(&args).await;
+            run_candidates(&args, candidates, Duration::from_secs(20))
+                .await
+                .unwrap();
+            let info = crate::media::probe_media(&output).await.unwrap();
+            assert!(info.duration > 1.9);
+            // The budget allows 750 KB, but black frames need only a few KB.
+            // Some VAAPI drivers insert filler NAL units in CBR mode.
+            assert!(
+                output.metadata().unwrap().len() < 200_000,
+                "{codec} padded simple content"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn failed_gpu_job_retries_cpu_without_publishing_partial_output() {
         use std::os::unix::fs::PermissionsExt;

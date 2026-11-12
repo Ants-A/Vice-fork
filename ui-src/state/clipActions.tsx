@@ -49,7 +49,7 @@ export function useRenameClip(): (clip: Clip, name: string) => Promise<Clip | nu
 }
 
 export function useClipActions(): {actions: ClipActions; overlays: ReactNode} {
-  const {state, notify} = useStore();
+  const {state, notify, deleteClip} = useStore();
   const {openViewer, openTrim, openShare} = usePlayback();
   const {playlists} = state;
   const playlistItems = usePlaylistToggleItems();
@@ -188,8 +188,7 @@ export function useClipActions(): {actions: ClipActions; overlays: ReactNode} {
                 const clip = confirmDelete;
                 setConfirmDelete(null);
                 if (!clip) return;
-                void api
-                  .deleteClip(clip.slug)
+                void deleteClip(clip.slug)
                   .then(() => say(t('viewer.clipDeleted')))
                   .catch(fail(t('viewer.errDelete')));
               }}>
