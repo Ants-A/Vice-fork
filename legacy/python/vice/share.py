@@ -1200,7 +1200,7 @@ def _stop_thumb_processes() -> None:
 
 
 async def _make_thumb(path: Path, duration: float = 0.0,
-                      thumb: Path | None = None) -> Path:
+                      thumb: Path | None = None, width: int = 640) -> Path:
     """Lazily generate a 640px-wide JPEG thumbnail stored in THUMB_DIR.
 
     Short clips (< 1 s) used to come back blank because `-ss 0.75` seeks
@@ -1232,7 +1232,7 @@ async def _make_thumb(path: Path, duration: float = 0.0,
             "-ss", f"{seek_ts:.3f}",
             "-i", str(path),
             "-frames:v", "1",
-            "-vf", "scale=640:-2",
+            "-vf", f"scale={width}:-2",
             "-q:v", "4",
             "-y", str(tmp),
             stdout=asyncio.subprocess.DEVNULL,
@@ -2794,7 +2794,10 @@ class ShareServer:
         # scan already recorded. The clip folder is not touched here: stats on
         # a busy network mount block the event loop, which is what used to
         # delay a player behind a grid of thumbnails.
+        width = 240 if req.query.get("w") == "240" else 640
         thumb = self._known_thumb_path(slug, path)
+        if thumb is not None and width != 640:
+            thumb = thumb.with_name(f"{thumb.stem}_{width}.jpg")
         if thumb is not None and thumb.exists() and thumb.stat().st_size > 0:
             return web.FileResponse(thumb, headers={"Content-Type": "image/jpeg"})
         # The grid asks for a dozen of these at once, but a video opening at
@@ -2807,9 +2810,11 @@ class ShareServer:
                 raise web.HTTPNotFound()
             if thumb is None:
                 thumb = _thumb_path(path)
+                if width != 640:
+                    thumb = thumb.with_name(f"{thumb.stem}_{width}.jpg")
             meta = await self._get_meta(slug, path)
             t = await _make_thumb(path, duration=meta.get("duration", 0),
-                                  thumb=thumb)
+                                  thumb=thumb, width=width)
         finally:
             self._thumb_sem.release()
         if not t.exists() or t.stat().st_size == 0:
@@ -3272,8 +3277,12 @@ class ShareServer:
 
     async def _image_thumb(self, req: web.Request) -> web.Response:
         _, path = self._image_or_404(req)
+        width = 240 if req.query.get("w") == "240" else 640
+        thumb = _thumb_path(path)
+        if width != 640:
+            thumb = thumb.with_name(f"{thumb.stem}_{width}.jpg")
         async with self._thumb_sem:
-            t = await _make_thumb(path)
+            t = await _make_thumb(path, thumb=thumb, width=width)
         if not t.exists():
             raise web.HTTPNotFound()
         return web.FileResponse(t, headers={"Content-Type": "image/jpeg"})
