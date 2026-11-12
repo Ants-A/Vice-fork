@@ -89,8 +89,9 @@ function withWidth(url: string | undefined, width: number): string | undefined {
   if (!url) return undefined;
   try {
     const parsed = new URL(url, window.location.href);
-    if (width === 160) parsed.searchParams.set('w', '160');
-    else parsed.searchParams.delete('w');
+    // Include the selected width in the URL so browser caches cannot keep
+    // serving an older 320px thumbnail after switching to high quality.
+    parsed.searchParams.set('w', String(width));
     return parsed.origin === window.location.origin ? `${parsed.pathname}${parsed.search}${parsed.hash}` : parsed.toString();
   } catch {
     return url;

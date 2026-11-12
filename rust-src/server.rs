@@ -1289,25 +1289,17 @@ async fn serve_media(
         return Ok(Html(format!("<!doctype html><html><head><meta charset=\"utf-8\"><title>{0} · Vice</title><meta property=\"og:title\" content=\"{0}\"><meta property=\"og:type\" content=\"video.other\"><meta property=\"og:video\" content=\"{1}/v/{2}\"><meta property=\"og:video:type\" content=\"video/mp4\"><meta property=\"og:video:width\" content=\"{3}\"><meta property=\"og:video:height\" content=\"{4}\"><meta property=\"og:image\" content=\"{1}/t/{2}\"><meta name=\"theme-color\" content=\"{5}\"><meta name=\"twitter:card\" content=\"player\"></head><body style=\"background:#111;color:#eee;margin:0\"><video controls autoplay playsinline style=\"width:100%;height:100vh\" src=\"/v/{2}\" poster=\"/t/{2}\"></video></body></html>",html(&slug),html(&base),enc(reference),meta["width"],meta["height"],html(&color))).into_response());
     }
     if kind == "t" || kind == "it" {
-        let low_resolution = req.uri().query().is_some_and(|query| {
-            query.split('&').any(|part| part == "w=160")
-        });
-        // Reuse thumbnails from the previous implementation before touching
-        // the recording. These cache identities use size and nanosecond mtime.
+        let width = req.uri().query()
+            .and_then(|query| query.split('&').find_map(|part| part.strip_prefix("w=")))
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|width| matches!(width, 160 | 320 | 1280))
+            .unwrap_or(1280);
+        let suffix = format!("_{width}");
         let identity = s.identity(&path).await;
-        if let Some(identity) = identity.filter(|_| !low_resolution) {
-            let legacy = cache_dir().join("thumbs").join(format!(
-                "{}_{}_{}.jpg",
-                path.file_stem().unwrap_or_default().to_string_lossy(),
-                identity.size,
-                identity.mtime_ns
-            ));
-            if revision(&legacy).0 > 0 {
-                return thumbnail_file(legacy, identity, req).await;
-            }
+        if let Some(identity) = identity {
             let cache_key = indexed_cache_key(&s, &path).await;
             let current = cache_dir().join("thumbs").join(format!(
-                "{}{}.jpg", cache_key, if low_resolution { "_160" } else { "" }
+                "{}{}.jpg", cache_key, suffix
             ));
             if revision(&current).0 > 0 {
                 return thumbnail_file(current, identity, req).await;
@@ -1342,7 +1334,7 @@ async fn serve_media(
             "-frames:v".into(),
             "1".into(),
             "-vf".into(),
-            format!("scale=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", if low_resolution { 160 } else { 320 }, if low_resolution { 90 } else { 180 }),
+            format!("scale=w='min({},iw)':h='min({},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", width, width * 9 / 16),
             "-q:v".into(),
             "6".into(),
             "-threads:v".into(),
@@ -1350,7 +1342,7 @@ async fn serve_media(
             "-f".into(),
             "image2".into(),
         ];
-        let thumb = cached_media(&s, &path, "thumbs", "jpg", if low_resolution { "_160" } else { "" }, args, 60, false).await?;
+        let thumb = cached_media(&s, &path, "thumbs", "jpg", &suffix, args, 60, false).await?;
         return match identity {
             Some(identity) => thumbnail_file(thumb, identity, req).await,
             None => file(thumb, req).await,

@@ -1154,8 +1154,8 @@ export function Settings() {
           <Row label={t('settings.thumbnailQuality')} help={t('settings.thumbnailQualityHelp')}>
             <Select
               label={t('settings.thumbnailQuality')}
-              value={config?.ui?.thumbnail_quality === 'low' ? 'low' : 'high'}
-              options={[["low", t('settings.thumbnailLow')], ["high", t('settings.thumbnailHigh')]]}
+              value={config?.ui?.thumbnail_quality === 'low' ? 'low' : config?.ui?.thumbnail_quality === 'medium' ? 'medium' : 'high'}
+              options={[["low", t('settings.thumbnailLow')], ["medium", t('settings.thumbnailMedium')], ["high", t('settings.thumbnailHigh')]]}
               onChange={thumbnail_quality => {
                 void saveConfig({ui: {thumbnail_quality}}).catch(err =>
                   notify({kind: 'error', title: t('events.notSaved'), detail: err.message, tone: 'error', holdMs: 6000}),

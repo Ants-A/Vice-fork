@@ -2795,7 +2795,7 @@ class ShareServer:
         # scan already recorded. The clip folder is not touched here: stats on
         # a busy network mount block the event loop, which is what used to
         # delay a player behind a grid of thumbnails.
-        width = 160 if req.query.get("w") == "160" else 640
+        width = int(req.query["w"]) if req.query.get("w") in {"160", "320"} else 640
         thumb = self._known_thumb_path(slug, path)
         if thumb is not None and width != 640:
             thumb = thumb.with_name(f"{thumb.stem}_{width}.jpg")
@@ -3278,7 +3278,7 @@ class ShareServer:
 
     async def _image_thumb(self, req: web.Request) -> web.Response:
         _, path = self._image_or_404(req)
-        width = 160 if req.query.get("w") == "160" else 640
+        width = int(req.query["w"]) if req.query.get("w") in {"160", "320"} else 640
         thumb = _thumb_path(path)
         if width != 640:
             thumb = thumb.with_name(f"{thumb.stem}_{width}.jpg")

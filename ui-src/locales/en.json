@@ -922,6 +922,7 @@
     "thumbnailQuality": "Thumbnail quality",
     "thumbnailQualityHelp": "Choose smaller thumbnails to use less data, or higher resolution for sharper previews.",
     "thumbnailLow": "Low resolution",
+    "thumbnailMedium": "Medium resolution",
     "thumbnailHigh": "High resolution",
     "matugen": "Matugen wallpaper colours",
     "accentAria": "{name} accent",
