@@ -16,6 +16,6 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-export function useThumbnailQuality(): 240 | 640 {
-  return useSyncExternalStore(subscribe, () => quality === 'low' ? 240 : 640, () => 640);
+export function useThumbnailQuality(): 160 | 320 {
+  return useSyncExternalStore(subscribe, () => quality === 'low' ? 160 : 320, () => 320);
 }

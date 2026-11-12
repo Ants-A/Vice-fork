@@ -89,7 +89,7 @@ function withWidth(url: string | undefined, width: number): string | undefined {
   if (!url) return undefined;
   try {
     const parsed = new URL(url, window.location.href);
-    if (width === 240) parsed.searchParams.set('w', '240');
+    if (width === 160) parsed.searchParams.set('w', '160');
     else parsed.searchParams.delete('w');
     return parsed.origin === window.location.origin ? `${parsed.pathname}${parsed.search}${parsed.hash}` : parsed.toString();
   } catch {

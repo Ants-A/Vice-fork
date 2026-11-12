@@ -38,6 +38,8 @@ enum Command {
         filter: String,
     },
     Clips,
+    /// Print the setup for live Matugen wallpaper colours.
+    Matugen,
     /// Toggle full-session recording.
     Session,
     /// Remove a local user installation, preserving recordings and settings.
@@ -129,6 +131,17 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
+        }
+        Command::Matugen => {
+            let dir = config::config_dir();
+            std::fs::create_dir_all(&dir)?;
+            let template = dir.join("matugen-color-template");
+            std::fs::write(&template, "{{colors.primary.default.hex}}\n")?;
+            println!("Add this to ~/.config/matugen/config.toml:\n");
+            println!("[templates.vice]");
+            println!("input_path = \"{}\"", template.display());
+            println!("output_path = \"{}\"", dir.join("matugen-color").display());
+            println!("\nThen run matugen as usual and choose Matugen under Vice Settings → Appearance.");
         }
         Command::Uninstall { yes } => uninstall(yes).await?,
         Command::Doctor => {

@@ -78,7 +78,8 @@ section!(NotificationsConfig {
 section!(UIConfig {
     hardware_video_decode: bool = true,
     scale: f64 = 1.0,
-    theme: String = "light".into()
+    theme: String = "light".into(),
+    thumbnail_quality: String = "high".into()
 });
 section!(OverlayConfig {
     keys: bool = false,
