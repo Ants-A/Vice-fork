@@ -3,6 +3,7 @@ import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
 import {api} from '../lib/api';
 import {H264_SUPPORTED, WEBM_SUPPORTED} from '../lib/env';
 import {useVideoBuffer} from '../lib/useVideoBuffer';
+import {usePlaybackSession} from '../lib/usePlaybackSession';
 import {onWsMessage} from '../lib/ws';
 import type {BufferedRange} from '../lib/mediaBuffer';
 import {useEscape} from '../lib/escape';
@@ -129,7 +130,7 @@ export function Viewer(props: ViewerProps) {
   const [paused, setPaused] = useState(true);
   const [quality, setQuality] = useState<{slug: string; smaller: boolean} | null>(null);
   const smaller = Boolean(clip && quality?.slug === clip.slug && quality.smaller);
-  const source = playbackUrl(clip, smaller);
+  const source = usePlaybackSession(clip?.slug, playbackUrl(clip, smaller), props.clip !== null);
   const buffer = useVideoBuffer(videoRef, props.clip !== null, source, clip?.duration ?? 0);
   useEffect(() => onWsMessage(msg => {
     const video = videoRef.current;
@@ -186,6 +187,14 @@ export function Viewer(props: ViewerProps) {
     const resumeAfterTrim = wasTrimming.current && !trimOpen;
     wasTrimming.current = trimOpen;
     if (!open || !video || !clip) return;
+    if (!source) {
+      if (video.getAttribute('src')) {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+      }
+      return;
+    }
     const src = source;
     if (video.getAttribute('src') === src) {
       if (resumeAfterTrim) playQuietly(video);

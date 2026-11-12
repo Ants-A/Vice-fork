@@ -248,9 +248,12 @@ esac
     await until(async () => (await fs.readdir(path.join(root, 'cache/proxies'))).some(name => !name.startsWith('.')), 'preview cache never completed');
     await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return v && Number.isFinite(v.duration) && v.duration > 7;})()`), 'completed preview did not expose its full seekable duration');
   }
-  const range = await fetch(`${base}/v/smoke${original ? '' : '?proxy=' + previewQuery}`, {headers: {Range: 'bytes=0-1023'}});
+  const playbackSource = await cdp.evaluate(`document.querySelector('.viewer-video').currentSrc`);
+  const range = await fetch(playbackSource, {headers: {Range: 'bytes=0-1023'}});
   assert.equal(range.status, 206, 'completed previews must support range requests');
-  assert.equal((await range.arrayBuffer()).byteLength, 1024);
+  const prefix = Buffer.from(await range.arrayBuffer());
+  assert.equal(prefix.byteLength, 1024);
+  if (forceWebm) assert.equal(prefix.subarray(0,4).toString('hex'), '1a45dfa3', 'a viewer session must not substitute original MP4 bytes for a completed WebM preview');
   await until(() => cdp.evaluate(`Boolean(document.querySelector('.viewer-buffered')?.getBoundingClientRect().width > 0)`), 'buffered timeline never rendered');
   const result = await cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return {source:v.currentSrc,width:v.videoWidth,height:v.videoHeight,duration:v.duration,currentTime:v.currentTime,error:v.error,bufferObserved:window.__viceSmoke.bufferObserved,bufferedColor:getComputedStyle(document.querySelector('.viewer-buffered')).backgroundColor,cardDuration:document.querySelector('.clip-card .clip-duration').textContent,banners:document.querySelector('.banners')?.innerText||''};})()`);
   assert(original ? !result.source.includes('proxy=') : result.source.includes(`proxy=${previewQuery}`));
@@ -434,9 +437,34 @@ esac
     await press('Escape');
     keyboardSeek = true;
   }
+  let replayCache = false;
+  if (process.env.VICE_SMOKE_REPLAY_CACHE === '1') {
+    assert(original, 'replay cache regression uses original media');
+    const source = await cdp.evaluate(`document.querySelector('.viewer-video').currentSrc`);
+    const session = new URL(source).searchParams.get('playback_session');
+    assert(session, 'viewer did not acquire a playback session');
+    const cacheRoot = path.join(root, 'cache/playback');
+    const entry = (await fs.readdir(cacheRoot, {recursive:true})).find(name => path.basename(name) === session + '.cache');
+    assert(entry, 'playback cache file is missing');
+    const spool = path.join(cacheRoot, entry);
+    assert((await fs.stat(spool)).size > 0, 'downloaded video has no session spool');
+    await cdp.evaluate(`{const v=document.querySelector('.viewer-video');v.currentTime=v.duration-0.25;v.play();}`);
+    await until(() => cdp.evaluate(`document.querySelector('.viewer-video').ended`), 'clip never reached EOS');
+    assert((await fs.stat(spool)).size > 0, 'EOS released the cached recording');
+    assert((await fetch(`${base}/api/playback/${session}/touch`, {method:'POST'})).ok, 'EOS released the playback session');
+    await cdp.evaluate(`{const v=document.querySelector('.viewer-video');v.currentTime=0;v.play();}`);
+    await until(() => cdp.evaluate(`{const v=document.querySelector('.viewer-video');v.currentTime>0.1&&!v.paused&&!v.error}`), 'cached clip did not replay', 3000);
+    assert.equal(await cdp.evaluate(`document.querySelector('.viewer-video').currentSrc`), source, 'replay changed the video source');
+    await cdp.evaluate(`document.querySelector('.viewer-head .modal-close').click()`);
+    await until(async () => {
+      try {await fs.stat(spool);return false;} catch(error) {if(error.code==='ENOENT')return true;throw error;}
+    }, 'closing the player did not release its spool');
+    assert.equal((await fetch(`${base}/api/playback/${session}/touch`, {method:'POST'})).status, 404, 'closed session is still live');
+    replayCache = true;
+  }
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));
-  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, keyboardSeek, thumbnailRecovery, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
+  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, keyboardSeek, thumbnailRecovery, replayCache, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
   if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,visibility:document.visibilityState,thumbnail:document.querySelector('.clip-card')?.getBoundingClientRect().toJSON(),body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }

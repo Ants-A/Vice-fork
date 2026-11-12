@@ -73,6 +73,7 @@ pub struct AppState {
     managed_names: RwLock<crate::media_names::Names>,
     pub transcodes: Semaphore,
     pub preview_jobs: Mutex<HashMap<PathBuf, Arc<crate::stream_preview::PreviewJob>>>,
+    pub playback_sessions: crate::playback_cache::Sessions,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -295,6 +296,7 @@ impl AppState {
             managed_names: RwLock::new(managed_names),
             transcodes: Semaphore::new(1),
             preview_jobs: Mutex::new(HashMap::new()),
+            playback_sessions: crate::playback_cache::Sessions::new(cache_dir().join("playback")),
         })
     }
     pub fn emit(&self, value: Value) {
@@ -1447,7 +1449,7 @@ async fn serve_media(
                     .map_err(ApiError::from);
             }
         }
-        return video_file(s, path, req).await;
+        return serve_video_file(s, path, req, !public).await;
     }
     let mime = crate::media_names::mime(&s.media_format(&path).await);
     let mut response = file(path, req).await?;
@@ -1503,8 +1505,32 @@ impl Drop for VideoActivity {
     }
 }
 pub(crate) async fn video_file(state: Shared, path: PathBuf, req: Request<Body>) -> ApiResult {
+    // Completed previews have their own persistent cache and different bytes.
+    // An original's viewer session must never replace a converted response.
+    serve_video_file(state, path, req, false).await
+}
+async fn serve_video_file(
+    state: Shared,
+    path: PathBuf,
+    req: Request<Body>,
+    private: bool,
+) -> ApiResult {
     let mime = crate::media_names::mime(&state.media_format(&path).await);
-    let response = crate::media_stream::serve_as(path, req, mime).await?;
+    let session = req
+        .uri()
+        .query()
+        .filter(|_| private)
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|part| part.strip_prefix("playback_session="))
+        })
+        .map(str::to_owned);
+    let response = if let Some(id) = session {
+        state.playback_sessions.serve(&id, req, mime).await?
+    } else {
+        crate::media_stream::serve_as(path, req, mime).await?
+    };
     state
         .active_video_streams
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1788,6 +1814,16 @@ async fn api(State(s): State<Shared>, Path(path): Path<String>, req: Request<Bod
         serde_json::from_slice::<Value>(&raw).map_err(|_| bad("invalid JSON"))?
     };
     match (method.as_str(), parts.as_slice()) {
+        ("DELETE", ["playback", id]) => {
+            s.playback_sessions.close(id);
+            ok(json!({"ok":true}))
+        }
+        ("POST", ["playback", id, "touch"]) => {
+            if !s.playback_sessions.touch(id) {
+                return Err(missing());
+            }
+            ok(json!({"ok":true}))
+        }
         ("GET", ["status"]) => ok(s.status().await),
         ("GET", ["config"]) => {
             ok(serde_json::to_value(s.cfg.read().await.clone()).map_err(anyhow::Error::from)?)
@@ -2042,6 +2078,10 @@ async fn media_api(
     };
     let highlights = data_dir().join("highlights").join(format!("{slug}.json"));
     match (method.as_str(), rest) {
+        ("POST", ["playback-session"]) if !image => {
+            let id = s.playback_sessions.create(path).await?;
+            ok(json!({"id":id}))
+        }
         ("GET", []) => ok(if image {
             s.image_json(slug, &path).await
         } else {

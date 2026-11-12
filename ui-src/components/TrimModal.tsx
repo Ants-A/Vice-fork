@@ -2,6 +2,7 @@ import {useEffect, useRef, useState} from 'react';
 
 import {api} from '../lib/api';
 import {useVideoBuffer} from '../lib/useVideoBuffer';
+import {usePlaybackSession} from '../lib/usePlaybackSession';
 import {onWsMessage} from '../lib/ws';
 import {useEscape} from '../lib/escape';
 import {formatDuration} from '../lib/format';
@@ -54,7 +55,7 @@ export function TrimModal({
   const [selection, setSelection] = useState({start: 0, end: 0});
   const [playhead, setPlayhead] = useState(0);
   const [previewing, setPreviewing] = useState(false);
-  const source = playbackUrl(clip);
+  const source = usePlaybackSession(clip?.slug, playbackUrl(clip), clip !== null);
   const buffer = useVideoBuffer(videoRef, clip !== null, source, clip?.duration ?? 0);
   const [dragging, setDragging] = useState<'start' | 'end' | null>(null);
   const [saving, setSaving] = useState(false);
@@ -92,7 +93,7 @@ export function TrimModal({
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !clip) return;
+    if (!video || !clip || !source) return;
     setTotal(clip.duration ?? 0);
     setSelection({start: 0, end: clip.duration ?? 0});
     setPlayhead(0);
@@ -102,7 +103,7 @@ export function TrimModal({
     setError(null);
     setPendingName(null);
     setConfirmReplace(false);
-    video.src = playbackUrl(clip);
+    video.src = source;
     video.load();
     return () => {
       video.pause();

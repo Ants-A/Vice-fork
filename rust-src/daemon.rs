@@ -190,6 +190,7 @@ pub async fn run(open_ui: bool) -> Result<()> {
                 HotkeyEvent::OverlayToggle=>{if hotkeys_suppressed(&state).await{continue;}let mut cfg=state.cfg.write().await;cfg.overlay.keys = !cfg.overlay.keys;let _=config::save(&cfg);let result=state.overlay.lock().await.configure(&cfg).await;state.emit(json!({"type":"key_overlay","running":cfg.overlay.keys&&result.is_ok(),"error":result.err().map(|e|e.to_string()),"moving":false}));}
             }},
             _=interval.tick()=>{
+                state.playback_sessions.reap_expired();
                 let cfg=state.cfg.read().await.clone();
                 let win=crate::active_window::get_active_window().await;
                 let game=win.as_ref().and_then(|win|crate::active_window::match_game(win,&cfg.discord.custom_games));

@@ -1,14 +1,16 @@
 //! Native video presentation policy. This never changes FFmpeg/NVENC encoding.
 use std::path::Path;
 
-/// WebKit defaults its download-buffer byte watermark to only 100 KiB. Since
-/// GStreamer takes the maximum of byte/time percentages, a time-only setting
-/// cannot build a useful cushion for high-bitrate Wi-Fi recordings.
-/// https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+/// WebKit pauses the whole pipeline when its download buffer crosses the low
+/// watermark, then waits for the high watermark before consuming queued frames.
+/// Keep that refill window short: decoded frames can continue through network
+/// jitter, while the server retains its independent 16 MiB read-ahead and cache.
+/// These thresholds do not limit how much of the recording stays cached.
+/// https://github.com/WebKit/WebKit/blob/webkitgtk-2.54.2/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
 pub fn download_environment() -> [(&'static str, &'static str); 2] {
     [
-        ("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_BYTES", "8388608"),
-        ("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC", "2000000000"),
+        ("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_BYTES", "1048576"),
+        ("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC", "250000000"),
     ]
 }
 

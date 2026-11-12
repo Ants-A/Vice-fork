@@ -61,6 +61,9 @@ export const api = {
   // The list endpoints wrap their payload in an envelope. Unwrapped here so
   // callers only ever see the list.
   clipInfo: (slug: string) => request<Clip>(`/api/clips/${enc(slug)}`),
+  createPlaybackSession: (slug: string) => post<{id: string}>(`/api/clips/${enc(slug)}/playback-session`),
+  touchPlaybackSession: (id: string) => post<void>(`/api/playback/${enc(id)}/touch`),
+  closePlaybackSession: (id: string) => request<void>(`/api/playback/${enc(id)}`, {method: 'DELETE', keepalive: true}),
   clips: async () => (await request<{clips: Clip[]}>('/api/clips')).clips,
   /** Re-scan the output directory and repair playlist tags where needed. */
   rescanLibrary: () =>
