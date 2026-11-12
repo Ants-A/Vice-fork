@@ -2136,6 +2136,19 @@ def cli(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
 
+@cli.command()
+def matugen() -> None:
+    """Print Matugen setup that keeps Vice matched to its wallpaper palette."""
+    template = CONFIG_DIR / "matugen-color-template"
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text("{{colors.primary.default.hex}}\n", encoding="utf-8")
+    click.echo("Add this to ~/.config/matugen/config.toml:\n")
+    click.echo("[templates.vice]")
+    click.echo(f'input_path = "{template}"')
+    click.echo(f'output_path = "{CONFIG_DIR / "matugen-color"}"')
+    click.echo('\nThen run matugen as usual and choose “Matugen” under Vice Settings → Appearance.')
+
+
 def _running_daemon_version(status_line: Optional[str]) -> Optional[str]:
     """Version reported by the daemon already holding the socket."""
     try:

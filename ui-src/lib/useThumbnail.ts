@@ -1,18 +1,19 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {usePlayback} from '../state/playback';
+import {useThumbnailQuality} from './thumbnailQuality';
 import {ThumbnailRetry} from './thumbnailRetry';
 
 /** Cached images may still load behind a player, but cold/failed thumbnails
  * retry only near the visible gallery and resume promptly after playback. */
 export function useThumbnail(url: string | undefined, enabled = true) {
   const {thumbnailsPaused} = usePlayback();
+  const width = useThumbnailQuality();
   const containerRef = useRef<HTMLElement>(null);
   const controller = useRef<ThumbnailRetry | null>(null);
   const [visible, setVisible] = useState(false);
   const [suspended, setSuspended] = useState(thumbnailsPaused);
   const [available, setAvailable] = useState(() => document.visibilityState === 'visible' && navigator.onLine);
   const [image, setImage] = useState({source: url, src: url, failed: false, loaded: false});
-  const [quality, setQuality] = useState<'low' | 'high'>('low');
   const blocked = thumbnailsPaused || suspended;
 
   useEffect(() => {
@@ -50,13 +51,12 @@ export function useThumbnail(url: string | undefined, enabled = true) {
   }, []);
 
   useEffect(() => {
-    setQuality('low');
-    setImage({source: url, src: url ? withWidth(url, 240) : url, failed: false, loaded: false});
-  }, [url]);
+    setImage({source: url, src: withWidth(url, width), failed: false, loaded: false});
+  }, [url, width]);
 
   useEffect(() => {
     const retry = new ThumbnailRetry(request => {
-      const base = withWidth(url, quality === 'low' ? 240 : 640);
+      const base = withWidth(url, width);
       const separator = base?.includes('?') ? '&' : '?';
       setImage({source: url, src: `${base}${separator}retry=${request}`, failed: false, loaded: false});
     });
@@ -65,43 +65,32 @@ export function useThumbnail(url: string | undefined, enabled = true) {
       retry.dispose();
       if (controller.current === retry) controller.current = null;
     };
-  }, [url, quality]);
+  }, [url, width]);
 
   useEffect(() => {
     controller.current?.setReady(Boolean(url) && enabled && visible && available && !blocked);
-  }, [url, enabled, visible, available, blocked]);
+  }, [url, width, enabled, visible, available, blocked]);
 
   const onError = useCallback(() => {
-    if (quality === 'high') {
-      setQuality('low');
-      setImage({source: url, src: withWidth(url, 240), failed: false, loaded: true});
-      controller.current?.loaded();
-      return;
-    }
-    setImage(previous => ({source: url, src: previous.source === url ? previous.src : url, failed: true, loaded: false}));
+    setImage(previous => ({source: url, src: previous.source === url ? previous.src : withWidth(url, width), failed: true, loaded: false}));
     controller.current?.error();
-  }, [url, quality]);
+  }, [url, width]);
   const onLoad = useCallback(() => {
     controller.current?.loaded();
-    const connection = (navigator as Navigator & {connection?: {saveData?: boolean; effectiveType?: string}}).connection;
-    if (quality === 'low' && !connection?.saveData && connection?.effectiveType !== '2g' && connection?.effectiveType !== 'slow-2g') {
-      setQuality('high');
-      setImage({source: url, src: withWidth(url, 640), failed: false, loaded: true});
-    } else {
-      setImage(previous => ({source: url, src: previous.source === url ? previous.src : withWidth(url, 240), failed: false, loaded: true}));
-    }
-  }, [url, quality]);
-  const current = image.source === url ? image : {src: withWidth(url, 240), failed: false, loaded: false};
+    setImage(previous => ({source: url, src: previous.source === url ? previous.src : withWidth(url, width), failed: false, loaded: true}));
+  }, [url, width]);
+  const current = image.source === url ? image : {src: withWidth(url, width), failed: false, loaded: false};
   // Removing an unfinished <img> cancels its HTTP request, freeing per-host
   // browser connections for the video. Finished images stay visible/cached.
   return {containerRef, src: current.loaded || !blocked ? current.src : undefined, loaded: current.loaded, failed: current.failed, onError, onLoad};
 }
 
-function withWidth(url: string | undefined, width: 240 | 640): string | undefined {
+function withWidth(url: string | undefined, width: number): string | undefined {
   if (!url) return undefined;
   try {
     const parsed = new URL(url, window.location.href);
-    parsed.searchParams.set('w', String(width));
+    if (width === 240) parsed.searchParams.set('w', '240');
+    else parsed.searchParams.delete('w');
     return parsed.origin === window.location.origin ? `${parsed.pathname}${parsed.search}${parsed.hash}` : parsed.toString();
   } catch {
     return url;

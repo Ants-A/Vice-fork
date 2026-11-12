@@ -578,8 +578,8 @@ export function StoreProvider({children}: {children: ReactNode}) {
     const named = saved && (ACCENT_NAMES as string[]).includes(saved);
     // A saved 'custom' with no seed behind it is not a usable accent, so it
     // falls back rather than opening the window in a half-applied theme.
-    if (named || (saved === 'custom' && custom)) {
-      dispatch({type: 'setAccent', accent: saved as AccentChoice, custom});
+    if (named || (saved === 'custom' && custom) || (saved === 'matugen' && custom)) {
+      dispatch({type: 'setAccent', accent: saved === 'matugen' ? 'custom' : saved as AccentChoice, custom});
     } else if (custom) {
       dispatch({type: 'setAccent', accent: DEFAULT_ACCENT, custom});
     }

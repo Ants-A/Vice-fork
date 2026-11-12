@@ -284,6 +284,8 @@ class NotificationsConfig:
 
 @dataclass
 class UIConfig:
+    # Thumbnail width requested by the gallery: low saves bandwidth on slow links.
+    thumbnail_quality: str = "high"
     # Let Chromium decode clip previews on the GPU. Off by default: hardware
     # decode draws a black rectangle on a lot of Linux GPU and driver
     # combinations, and a laggy preview beats no picture (#140). Worth turning

@@ -86,6 +86,8 @@ Completed recordings are published after finalization, and live gallery updates 
 
 Settings → Appearance offers Light (the original palette) and a substantially darker Dark theme. Buffering remains visible in the bottom timeline without covering the video. Playlist artwork can use an uploaded image; game playlists automatically try locally cached Steam icons (including cached artwork for uninstalled games), then Discord artwork, with an emoji/glyph fallback. Artwork changes do not remux recordings. Gallery cards retain larger previews in narrow windows, and half-screen desktop windows use at most two columns.
 
+Thumbnail quality can be set to Low or High in Settings → Appearance. To follow wallpaper colours with Matugen, run `vice matugen`, add the printed template to Matugen's config, then select Matugen in Settings → Appearance. The UI checks the generated colour regularly and updates the app theme as Matugen changes it.
+
 The interface retains the clip and image libraries, playlists, highlights, trim and rename controls, screenshots and frame capture, sharing, and the multi-track timeline editor. Exports use FFmpeg for video, text, transitions, detached audio, and optional recorded keys.
 
 Closing the window leaves the daemon recording. The native tray is available when the desktop provides a StatusNotifier watcher and an AppIndicator library. Public share links require either `cloudflared`, a configured public base URL, or access to the machine's public share port. Without a tunnel or reverse proxy, links are limited to your network.

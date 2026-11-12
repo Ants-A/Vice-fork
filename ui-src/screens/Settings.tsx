@@ -66,9 +66,14 @@ interface DisplayInfo {
   follow_mouse_supported?: boolean;
 }
 
+function matugenIsSelected(): boolean {
+  try { return localStorage.getItem('vice-theme') === 'matugen'; }
+  catch { return false; }
+}
+
 export function Settings() {
   const {state, saveConfig, notify} = useStore();
-  const {choose, chooseCustom, seed} = useAccentChoice();
+  const {choose, chooseCustom, chooseMatugen, seed} = useAccentChoice();
   const [picking, setPicking] = useState(false);
   const customBase = seed ? deriveCustom(seed).ramp.base : null;
   const {config, accent, status} = state;
@@ -1146,6 +1151,18 @@ export function Settings() {
 
         {/* ── Appearance ────────────────────────────────────────── */}
         <Card id="appearance" title={t('settings.secAppearance')} register={register('appearance')}>
+          <Row label={t('settings.thumbnailQuality')} help={t('settings.thumbnailQualityHelp')}>
+            <Select
+              label={t('settings.thumbnailQuality')}
+              value={config?.ui?.thumbnail_quality === 'low' ? 'low' : 'high'}
+              options={[["low", t('settings.thumbnailLow')], ["high", t('settings.thumbnailHigh')]]}
+              onChange={thumbnail_quality => {
+                void saveConfig({ui: {thumbnail_quality}}).catch(err =>
+                  notify({kind: 'error', title: t('events.notSaved'), detail: err.message, tone: 'error', holdMs: 6000}),
+                );
+              }}
+            />
+          </Row>
           <Row label={t('settings.theme')} help={t('settings.themeHelp')}>
             <Select
               label={t('settings.theme')}
@@ -1212,6 +1229,17 @@ export function Settings() {
                 aria-pressed={accent === 'custom'}
                 onClick={() => setPicking(true)}>
                 {accent === 'custom' ? <IconCheck size={13} /> : <IconPlus size={13} />}
+              </button>
+              <button
+                type="button"
+                className="swatch"
+                data-active={matugenIsSelected() || undefined}
+                style={{background: customBase ?? ACCENTS.blue.base}}
+                title={t('settings.matugen')}
+                aria-label={t('settings.matugen')}
+                aria-pressed={matugenIsSelected()}
+                onClick={() => void chooseMatugen()}>
+                {matugenIsSelected() ? <IconCheck size={13} /> : null}
               </button>
             </div>
           </Row>

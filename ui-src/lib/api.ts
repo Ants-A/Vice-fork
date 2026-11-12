@@ -36,6 +36,7 @@ const post = <T>(path: string, body?: unknown) =>
 const enc = (segment: string) => encodeURIComponent(segment);
 
 export const api = {
+  matugenColor: () => request<{color: string}>('/api/matugen-color'),
   status: () => request<Status>('/api/status'),
 
   getConfig: () => request<Config>('/api/config'),

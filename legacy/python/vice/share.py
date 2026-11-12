@@ -1577,6 +1577,7 @@ class ShareServer:
         r.add_post("/api/playlists/{pid}/clips",           self._api_playlist_add_clip)
         r.add_delete("/api/playlists/{pid}/clips/{slug}",  self._api_playlist_remove_clip)
         r.add_get("/api/config",               self._api_get_config)
+        r.add_get("/api/matugen-color",         self._api_matugen_color)
         r.add_get("/api/displays",             self._api_get_displays)
         r.add_get("/api/audio-sources",        self._api_get_audio_sources)
         r.add_post("/api/config",              self._api_set_config)
@@ -3817,6 +3818,16 @@ class ShareServer:
     async def _api_get_config(self, _: web.Request) -> web.Response:
         from .config import load as load_cfg
         return web.json_response(asdict(load_cfg()))
+
+    async def _api_matugen_color(self, _: web.Request) -> web.Response:
+        color_file = actual_home_dir() / ".config" / "vice" / "matugen-color"
+        try:
+            color = color_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            color = ""
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            color = ""
+        return web.json_response({"color": color.lower()})
 
     async def _api_get_displays(self, req: web.Request) -> web.Response:
         backend = (req.query.get("backend") or self.cfg.recording.backend or "auto").strip() or "auto"

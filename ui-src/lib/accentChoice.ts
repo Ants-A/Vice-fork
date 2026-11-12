@@ -18,6 +18,8 @@ export function useAccentChoice(): {
   seed: string | null;
   choose: (name: AccentName) => void;
   chooseCustom: (seed: string) => void;
+  chooseMatugen: () => Promise<void>;
+  updateMatugenColor: (seed: string) => void;
 } {
   const {state, dispatch} = useStore();
 
@@ -67,5 +69,26 @@ export function useAccentChoice(): {
     [dispatch, remember, pushEmbedColour],
   );
 
-  return {accent: state.accent, seed: state.customAccent, choose, chooseCustom};
+  const updateMatugenColor = useCallback((seed: string) => {
+    if (!/^#[0-9a-f]{6}$/i.test(seed)) return;
+    const {ramp} = deriveCustomTheme(seed);
+    dispatch({type: 'setAccent', accent: 'custom', custom: seed});
+    remember(CUSTOM_ACCENT_KEY, seed.toLowerCase());
+    remember('vice-custom-bg', ramp.bg);
+    remember('vice-custom-base', ramp.base);
+    remember('vice-theme', 'matugen');
+    pushEmbedColour(ramp.base);
+  }, [dispatch, remember, pushEmbedColour]);
+
+  const chooseMatugen = useCallback(async () => {
+    remember('vice-theme', 'matugen');
+    try {
+      const {color} = await api.matugenColor();
+      if (color) updateMatugenColor(color);
+    } catch (err) {
+      console.debug('Reading the Matugen colour failed', err);
+    }
+  }, [remember, updateMatugenColor]);
+
+  return {accent: state.accent, seed: state.customAccent, choose, chooseCustom, chooseMatugen, updateMatugenColor};
 }

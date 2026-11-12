@@ -27,6 +27,9 @@ import {Images} from './screens/Images';
 import {Settings} from './screens/Settings';
 import {Editor} from './screens/Editor';
 import {About} from './screens/About';
+import {api} from './lib/api';
+import {useAccentChoice} from './lib/accentChoice';
+import {setThumbnailQuality} from './lib/thumbnailQuality';
 
 function syncNativeTrayLabels(): void {
   setNativeTrayLabels(t('tray.openVice'), t('tray.quitVice'));
@@ -39,6 +42,7 @@ function cachedAppearance() {
 
 function App() {
   const {state} = useStore();
+  const {updateMatugenColor} = useAccentChoice();
   const {accent, customAccent, ready, view} = state;
   // One resolve per render, shared by the theme, the ambient wash and the
   // custom properties, so a custom accent cannot be derived three times.
@@ -57,6 +61,28 @@ function App() {
   useEffect(() => {
     setNativeScale(Number(state.config?.ui?.scale ?? 1));
   }, [state.config?.ui?.scale]);
+
+  useEffect(() => {
+    setThumbnailQuality(state.config?.ui?.thumbnail_quality);
+  }, [state.config?.ui?.thumbnail_quality]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let last = '';
+    const sync = async () => {
+      try {
+        if (localStorage.getItem('vice-theme') !== 'matugen') return;
+        const {color} = await api.matugenColor();
+        if (!cancelled && color && color !== last) {
+          last = color;
+          updateMatugenColor(color);
+        }
+      } catch { /* Matugen has not written a palette yet, or the daemon is restarting. */ }
+    };
+    void sync();
+    const timer = window.setInterval(() => void sync(), 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [updateMatugenColor]);
 
   // The boot cover is in index.html so it paints before this bundle parses.
   // It goes once there is real data behind it, not merely once React mounted.
