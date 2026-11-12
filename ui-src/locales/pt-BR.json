@@ -294,7 +294,7 @@
     "share": "Compartilhar",
     "reveal": "Mostrar na pasta",
     "delete": "Apagar",
-    "shortcuts": "Esquerda e direita para trocar de clipe · H para marcar um destaque · Esc para fechar",
+    "shortcuts": "Esquerda/direita para retroceder/avançar 5 segundos · H para marcar um destaque · Esc para fechar",
     "playbackFailed": "O Vice não conseguiu reproduzir este clipe na janela do app. Mas o arquivo em si muito provavelmente funcionará.",
     "noH264Decoder": "Esta build do WebKit não possui um decodificador H.264, então clipes não poderão ser reproduzidos dentro do Vice. Mas o arquivo em si muito provavelmente funcionará.",
     "saveFrame": "Salvar este quadro",

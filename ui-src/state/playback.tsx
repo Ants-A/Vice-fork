@@ -22,6 +22,7 @@ import {useStore} from './store';
 import {t} from '../lib/i18n';
 
 interface Playback {
+  thumbnailsPaused: boolean;
   openViewer: (slug: string) => void;
   openTrim: (slug: string) => void;
   openShare: (slug: string) => void;
@@ -169,8 +170,8 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
   );
 
   const value = useMemo<Playback>(
-    () => ({openViewer, openTrim, openShare: setShareSlug}),
-    [openViewer, openTrim],
+    () => ({openViewer, openTrim, openShare: setShareSlug, thumbnailsPaused: viewerClip !== null || trimClip !== null}),
+    [openViewer, openTrim, viewerClip !== null, trimClip !== null],
   );
 
   return (

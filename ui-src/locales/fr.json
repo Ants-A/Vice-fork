@@ -310,7 +310,7 @@
     "share": "Partager",
     "reveal": "Afficher",
     "delete": "Supprimer",
-    "shortcuts": "Gauche et droite : clip précédent ou suivant · H marque un moment fort · Échap ferme",
+    "shortcuts": "Gauche/droite : reculer/avancer de 5 secondes · H marque un moment fort · Échap ferme",
     "playbackFailed": "Vice n'a pas pu lire ce clip dans la fenêtre de l'application. Le fichier lui-même est très probablement intact.",
     "noH264Decoder": "Cette version de WebKit n'a pas de décodeur H.264, donc les clips ne peuvent pas être lus dans Vice. Le fichier lui-même est intact.",
     "saveFrame": "Enregistrer cette image",

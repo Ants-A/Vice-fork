@@ -416,6 +416,14 @@ export function Viewer(props: ViewerProps) {
     else video.pause();
   }, []);
 
+  const seekBy = useCallback((seconds: number) => {
+    const video = videoRef.current;
+    if (!video?.getAttribute('src')) return;
+    const duration = Number.isFinite(video.duration) ? video.duration : clip?.duration ?? 0;
+    const target = Math.max(0, video.currentTime + seconds);
+    seekTo(video, duration > 0 ? Math.min(duration, target) : target, true);
+  }, [clip?.duration]);
+
   useEffect(() => {
     if (!open || closing || trimOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -431,10 +439,10 @@ export function Viewer(props: ViewerProps) {
       }
       if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        step(-1);
+        seekBy(-5);
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        step(1);
+        seekBy(5);
       } else if (e.key === 'h' || e.key === 'H') {
         e.preventDefault();
         void addHighlight();
@@ -451,7 +459,7 @@ export function Viewer(props: ViewerProps) {
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [open, closing, trimOpen, step, addHighlight, toggleExpanded, saveFrame, toggleMuted, toggle]);
+  }, [open, closing, trimOpen, seekBy, addHighlight, toggleExpanded, saveFrame, toggleMuted, toggle]);
 
   if (!mounted || !clip) return null;
 

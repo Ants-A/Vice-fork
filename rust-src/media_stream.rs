@@ -18,8 +18,10 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 const FIRST_READ: usize = 128 * 1024;
-const READ_SIZE: usize = 4 * 1024 * 1024;
-const QUEUED_READS: usize = 4;
+// A multi-megabyte SMB read can take nearly a second on Wi-Fi. Keep delivery
+// frequent while retaining the same bounded 16 MiB of independent read-ahead.
+const READ_SIZE: usize = 1024 * 1024;
+const QUEUED_READS: usize = 16;
 
 pub async fn serve(path: PathBuf, req: Request<Body>) -> Result<Response> {
     serve_as(path, req, None).await
@@ -174,9 +176,22 @@ fn read_ahead(
     let mut read_size = FIRST_READ;
     while remaining > 0 && !send.is_closed() {
         let count = remaining.min(read_size as u64) as usize;
-        read_size = (read_size * 2).min(READ_SIZE);
         let mut buffer = vec![0; count];
-        reader.read_exact(&mut buffer)?;
+        // Forward a short successful read immediately; read_exact would hold
+        // available video bytes until the entire next window had arrived.
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "video ended before its advertised length",
+                ));
+            }
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        buffer.truncate(count);
+        read_size = (count * 2).clamp(FIRST_READ, READ_SIZE);
         remaining -= count as u64;
         if send.blocking_send(Ok(Bytes::from(buffer))).is_err() {
             break;
@@ -205,7 +220,9 @@ mod tests {
     async fn original_bytes_ranges_and_conditions_survive_read_ahead() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("original.mp4");
-        let data: Vec<u8> = (0..READ_SIZE * 2 + 113).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..8 * 1024 * 1024 + 113)
+            .map(|i| (i % 251) as u8)
+            .collect();
         std::fs::write(&path, &data).unwrap();
         for (range, start, end) in [
             (None, 0, data.len()),
@@ -271,6 +288,14 @@ mod tests {
             to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
             b"shorter new clip"
         );
+    }
+    #[test]
+    fn short_network_reads_are_delivered_before_the_window_fills() {
+        let (send, mut receive) = mpsc::channel(4);
+        let data = vec![7; 4096];
+        let result = read_ahead(&mut io::Cursor::new(data.clone()), 8192, &send);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(receive.try_recv().unwrap().unwrap().as_ref(), data);
     }
     #[tokio::test]
     async fn startup_does_not_wait_for_the_read_ahead_window_and_close_stops_reads() {

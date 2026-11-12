@@ -345,7 +345,7 @@
     "shareDiscordSize": "Discord ready · {size}",
     "reveal": "Reveal",
     "delete": "Delete",
-    "shortcuts": "Left and right step clips · H marks a highlight · Esc closes",
+    "shortcuts": "Left/right seek 5 seconds · H marks a highlight · Esc closes",
     "playbackFailed": "Vice could not play this clip in the app window. The file itself is most likely fine.",
     "noH264Decoder": "This media engine has no H.264 decoder, so clips cannot play inside Vice. The file itself is fine.",
     "saveFrame": "Save this frame",

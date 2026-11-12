@@ -26,7 +26,7 @@ export function playbackUrl(clip: Clip | null | undefined, smaller = false): str
 }
 
 /** Frame-accurate enough for a scrub, and cheap on engines that offer it. */
-export function seekTo(video: HTMLVideoElement | null, seconds: number): void {
+export function seekTo(video: HTMLVideoElement | null, seconds: number, precise = false): void {
   if (!video) return;
   let target = Math.max(0, Number(seconds) || 0);
   // An unfinished preview has no final seek index. Stay within its available
@@ -37,7 +37,7 @@ export function seekTo(video: HTMLVideoElement | null, seconds: number): void {
     else target = 0;
   }
   try {
-    if (typeof video.fastSeek === 'function') video.fastSeek(target);
+    if (!precise && typeof video.fastSeek === 'function') video.fastSeek(target);
     else video.currentTime = target;
   } catch {
     video.currentTime = target;

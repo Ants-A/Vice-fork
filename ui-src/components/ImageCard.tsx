@@ -1,3 +1,4 @@
+import {useThumbnail} from '../lib/useThumbnail';
 import {useState} from 'react';
 
 import {endClipDrag, startImageDrag} from '../lib/clipDrag';
@@ -35,7 +36,7 @@ export function ImageCard({
   draggable?: boolean;
 }) {
   const [renamingHere, setRenamingHere] = useState(false);
-  const [failedThumb, setFailedThumb] = useState<string | null>(null);
+  const thumbnail = useThumbnail(image.thumb_url ?? undefined);
   const renaming = renamingHere || actions.renamingSlug === image.slug;
 
   const stopRenaming = () => {
@@ -54,6 +55,7 @@ export function ImageCard({
   return (
     <article
       className="clip-card image-card"
+      ref={thumbnail.containerRef}
       data-renaming={renaming || undefined}
       draggable={draggable && !renaming}
       onDragStart={e => startImageDrag(e, image)}
@@ -74,9 +76,9 @@ export function ImageCard({
         className="clip-thumb"
         onClick={() => actions.onOpen?.(image)}
         aria-label={t('images.openTitle', {name: imageTitle(image)})}>
-        {image.thumb_url && failedThumb !== image.thumb_url ? (
-          <img src={image.thumb_url} loading="lazy" decoding="async" alt="" draggable={false}
-            onError={() => setFailedThumb(image.thumb_url ?? null)} />
+        {thumbnail.src && !thumbnail.failed ? (
+          <img src={thumbnail.src} loading="lazy" decoding="async" alt="" draggable={false}
+            onError={thumbnail.onError} onLoad={thumbnail.onLoad} />
         ) : (
           <span className="clip-thumb-empty" aria-hidden="true"><IconImages size={32} /></span>
         )}

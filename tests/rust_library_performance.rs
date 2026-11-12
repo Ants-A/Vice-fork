@@ -387,3 +387,116 @@ async fn playlist_artwork_does_not_probe_or_remux_the_video_library() -> Result<
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn cold_thumbnails_queue_and_cache_instead_of_timing_out() -> Result<()> {
+    let library = Library::start(8, true, "0").await?;
+    executable(
+        &library.root.path().join("bin/ffmpeg"),
+        r#"#!/bin/sh
+for last do :; done
+[ "$last" = - ] && exit 1
+sleep 0.15
+printf 'fixture-thumbnail' > "$last"
+"#,
+    )?;
+    let clips = library.get("/api/clips").await?;
+    let urls: Vec<_> = clips["clips"]
+        .as_array()
+        .context("clips")?
+        .iter()
+        .map(|clip| clip["thumb_url"].as_str().unwrap().to_owned())
+        .collect();
+    let requests = urls
+        .iter()
+        .map(|url| library.client.get(format!("{}{url}", library.base)).send());
+    for response in join_all(requests).await {
+        let response = response?;
+        assert!(
+            response.status().is_success(),
+            "cold thumbnail was rejected: {}",
+            response.status()
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, max-age=31536000, immutable"
+        );
+        assert_eq!(response.bytes().await?.as_ref(), b"fixture-thumbnail");
+    }
+    let stale = library
+        .client
+        .get(format!("{}/t/clip-0?v=stale", library.base))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(stale.headers()["cache-control"], "no-store");
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_thumbnails_resume_soon_after_playback_finishes() -> Result<()> {
+    let library = Library::start(1, true, "0").await?;
+    let video = library
+        .client
+        .get(format!("{}/v/clip-0", library.base))
+        .send()
+        .await?
+        .error_for_status()?;
+    let _ = video.bytes().await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let response = library
+        .client
+        .get(format!("{}/t/clip-0", library.base))
+        .send()
+        .await?;
+    assert!(
+        response.status().is_success(),
+        "completed playback must not block new thumbnails for four seconds: {}",
+        response.status()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn portable_tag_writes_wait_for_playback_network_reads() -> Result<()> {
+    let library = Library::start(1, true, "0").await?;
+    let source = library.root.path().join("clips/clip-0.mp4");
+    std::fs::File::options()
+        .write(true)
+        .open(source)?
+        .set_len(64 * 1024 * 1024)?;
+    let video = library
+        .client
+        .get(format!("{}/v/clip-0", library.base))
+        .send()
+        .await?
+        .error_for_status()?;
+    // Keep the body unread so HTTP backpressure leaves this video stream
+    // active while the playlist change is applied to the client immediately.
+    let playlist: Value = library
+        .client
+        .post(format!("{}/api/playlists", library.base))
+        .json(&json!({"name":"While watching"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let pid = playlist["playlist"]["id"].as_str().context("playlist id")?;
+    library
+        .client
+        .post(format!("{}/api/playlists/{pid}/clips", library.base))
+        .json(&json!({"slug":"clip-0"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        std::fs::read_to_string(library.root.path().join("probes.log"))
+            .unwrap_or_default()
+            .is_empty(),
+        "background tag work must not start source probes/remuxes while playback is downloading"
+    );
+    drop(video);
+    Ok(())
+}

@@ -8,6 +8,7 @@ import {formatDuration} from '../lib/format';
 import {
   playQuietly,
   playbackUrl,
+  seekTo,
   timecode,
   useVideoFailure,
   videoFailureMessage,
@@ -109,6 +110,31 @@ export function TrimModal({
       video.load();
     };
   }, [clip?.slug, source]);
+
+  useEffect(() => {
+    if (!clip || saving) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest('input, textarea, select') || target?.isContentEditable) return;
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      const video = videoRef.current;
+      if (!video?.getAttribute('src')) return;
+      // Like pointer scrubbing, seeking can leave the selected interval.
+      // Stop its preview loop so it cannot immediately snap the seek back.
+      if (previewingRef.current) {
+        previewingRef.current = false;
+        setPreviewing(false);
+        video.pause();
+      }
+      const duration = Number.isFinite(video.duration) ? video.duration : clip.duration ?? 0;
+      const seconds = Math.max(0, video.currentTime + (event.key === 'ArrowLeft' ? -5 : 5));
+      seekTo(video, duration > 0 ? Math.min(duration, seconds) : seconds, true);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [clip?.slug, clip?.duration, saving]);
 
   if (!clip) return null;
 

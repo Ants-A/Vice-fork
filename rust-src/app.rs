@@ -60,16 +60,14 @@ fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--key-overlay") {
         return vice::key_overlay::run();
     }
-    // WebKitGTK's download buffer otherwise waits for up to five seconds of
-    // media after an underflow. Keep native startup/rebuffering responsive,
-    // independently of the server's larger read-ahead window. This shared
-    // WebKit GStreamer setting applies to GTK as well as WPE:
-    // Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
-    // (configureDownloadBuffer). Preserve an explicit environment override.
-    if std::env::var_os("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC").is_none() {
-        // The application is still single-threaded, before GTK/WebKit starts.
-        unsafe {
-            std::env::set_var("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC", "1000000000");
+    // Keep a useful high-bitrate download cushion: WebKit's 100 KiB byte
+    // watermark otherwise overrides the time threshold after only a few ms.
+    // Honor explicit deployment/user overrides and apply before GTK starts.
+    for (key, value) in vice::native_video::download_environment() {
+        if std::env::var_os(key).is_none() {
+            unsafe {
+                std::env::set_var(key, value);
+            }
         }
     }
     let nvidia = vice::native_video::nvidia_gpu();

@@ -1,6 +1,17 @@
 //! Native video presentation policy. This never changes FFmpeg/NVENC encoding.
 use std::path::Path;
 
+/// WebKit defaults its download-buffer byte watermark to only 100 KiB. Since
+/// GStreamer takes the maximum of byte/time percentages, a time-only setting
+/// cannot build a useful cushion for high-bitrate Wi-Fi recordings.
+/// https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+pub fn download_environment() -> [(&'static str, &'static str); 2] {
+    [
+        ("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_BYTES", "8388608"),
+        ("WPE_SHELL_MEDIA_DISK_CACHE_SIZE_NSEC", "2000000000"),
+    ]
+}
+
 pub fn nvidia_gpu_at(root: &Path) -> bool {
     // The proc entry also covers machines where the NVIDIA render node is not
     // visible in the app's device namespace (including hybrid configurations).

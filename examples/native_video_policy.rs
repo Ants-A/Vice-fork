@@ -8,6 +8,11 @@ fn main() -> anyhow::Result<()> {
     let policy: std::collections::BTreeMap<_, _> =
         vice::native_video::environment(hardware, nvidia, &ranks)
             .into_iter()
+            .chain(
+                vice::native_video::download_environment()
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_owned())),
+            )
             .collect();
     println!("{}", serde_json::to_string(&policy)?);
     Ok(())

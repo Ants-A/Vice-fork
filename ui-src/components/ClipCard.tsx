@@ -1,3 +1,4 @@
+import {useThumbnail} from '../lib/useThumbnail';
 import {startHoverPreview, stopHoverPreview} from '../lib/hoverPreview';
 import {memo, useEffect, useRef, useState} from 'react';
 
@@ -8,13 +9,6 @@ import {H264_SUPPORTED} from '../lib/env';
 import {playbackUrl, clipNeedsProxy} from '../lib/playback';
 import {t} from '../lib/i18n';
 import {InlineRename} from './InlineRename';
-
-/**
- * Missing thumbnails are generated lazily, but the server deliberately drops
- * those requests while a clip is playing so playback gets the network share
- * to itself. The card then asks again, backing off, until the frame is ready.
- */
-const THUMB_RETRY_MS = [1000, 2000, 4000, 8000, 15000];
 
 export interface ClipActions {
   onOpen?: (clip: Clip) => void;
@@ -52,14 +46,11 @@ export const ClipCard = memo(function ClipCard({
   draggable?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const thumbTimer = useRef<number | undefined>(undefined);
-  const thumbAttempts = useRef(0);
   const [previewFailed, setPreviewFailed] = useState(false);
   const [hovered, setHovered] = useState(false);
   const [previewReady, setPreviewReady] = useState(false);
   const [renamingHere, setRenamingHere] = useState(false);
-  const [thumbUrl, setThumbUrl] = useState(clip.thumb_url);
-  const [thumbFailed, setThumbFailed] = useState(false);
+  const thumbnail = useThumbnail(clip.thumb_url, !clip.unreadable);
   const renaming = renamingHere || actions.renamingSlug === clip.slug;
 
   const stopRenaming = () => {
@@ -68,7 +59,7 @@ export const ClipCard = memo(function ClipCard({
   };
 
   const broken = clip.unreadable;
-  const canPreview = H264_SUPPORTED && !clipNeedsProxy(clip) && !broken && !previewFailed && Boolean(clip.thumb_url);
+  const canPreview = thumbnail.loaded && H264_SUPPORTED && !clipNeedsProxy(clip) && !broken && !previewFailed && Boolean(clip.thumb_url);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -77,34 +68,9 @@ export const ClipCard = memo(function ClipCard({
     return () => stopHoverPreview(video);
   }, [hovered, canPreview, clip.video_url]);
 
-  useEffect(() => {
-    // A rename or a trim gives the clip a new thumbnail revision. Start over,
-    // but leave the existing image in place until React swaps it.
-    window.clearTimeout(thumbTimer.current);
-    thumbTimer.current = undefined;
-    thumbAttempts.current = 0;
-    setThumbUrl(clip.thumb_url);
-    setThumbFailed(false);
-  }, [clip.thumb_url]);
-
-  useEffect(() => () => window.clearTimeout(thumbTimer.current), []);
-
-  const retryThumb = () => {
-    setThumbFailed(true);
-    if (broken || !clip.thumb_url || thumbTimer.current !== undefined) return;
-    const attempt = thumbAttempts.current;
-    const delay = THUMB_RETRY_MS[Math.min(attempt, THUMB_RETRY_MS.length - 1)];
-    thumbAttempts.current = attempt + 1;
-    thumbTimer.current = window.setTimeout(() => {
-      thumbTimer.current = undefined;
-      const separator = clip.thumb_url.includes('?') ? '&' : '?';
-      setThumbFailed(false);
-      setThumbUrl(`${clip.thumb_url}${separator}retry=${thumbAttempts.current}`);
-    }, delay);
-  };
-
   const attachPreview = () => {
-    if (canPreview) setHovered(true);
+    // Let the small still image finish before starting a full video download.
+    setHovered(true);
   };
 
   const releasePreview = () => {
@@ -126,6 +92,7 @@ export const ClipCard = memo(function ClipCard({
   return (
     <article
       className="clip-card"
+      ref={thumbnail.containerRef}
       data-broken={broken || undefined}
       draggable={draggable && !renaming}
       onDragStart={e => startClipDrag(e, clip)}
@@ -152,14 +119,15 @@ export const ClipCard = memo(function ClipCard({
         onPointerEnter={attachPreview}
         onPointerLeave={releasePreview}
         aria-label={t('card.openTitle', {name: clipTitle(clip)})}>
-        {thumbUrl && !thumbFailed ? (
+        {thumbnail.src && !thumbnail.failed ? (
           <img
-            src={thumbUrl}
+            src={thumbnail.src}
             loading="lazy"
             decoding="async"
             alt=""
             draggable={false}
-            onError={retryThumb}
+            onError={thumbnail.onError}
+            onLoad={thumbnail.onLoad}
           />
         ) : (
           <span className="clip-thumb-empty" aria-hidden="true" />

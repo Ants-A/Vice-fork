@@ -325,7 +325,7 @@
     "shareDiscordSize": "Siap untuk Discord · {size}",
     "reveal": "Tampilkan",
     "delete": "Hapus",
-    "shortcuts": "Kiri dan kanan berpindah klip · H menandai sorotan · Esc menutup",
+    "shortcuts": "Kiri/kanan mundur/maju 5 detik · H menandai sorotan · Esc menutup",
     "playbackFailed": "Vice tidak dapat memutar klip ini di jendela aplikasi. File kemungkinan besar tidak bermasalah.",
     "noH264Decoder": "Build WebKit ini tidak memiliki decoder H.264, jadi klip tidak dapat diputar di Vice. File tidak bermasalah.",
     "saveFrame": "Simpan bingkai ini",

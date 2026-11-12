@@ -181,8 +181,18 @@ esac
     new MutationObserver(()=>{const bar=document.querySelector('.viewer-buffered');if(bar&&bar.getBoundingClientRect().width>0)window.__viceSmoke.bufferObserved=true;}).observe(document,{childList:true,subtree:true,attributes:true});
   `});
   // Make the waiting state reproducible even on a fast CPU and local disk.
-  await cdp.send('Fetch.enable', {patterns: [{urlPattern: `*proxy=${previewQuery}*`, requestStage: 'Request'}]});
-  cdp.on('Fetch.requestPaused', ({requestId}) => { void delay(800).then(() => cdp.send('Fetch.continueRequest', {requestId})).catch(() => {}); });
+  let thumbnailFailures = 0;
+  const fetchPatterns = [{urlPattern: `*proxy=${previewQuery}*`, requestStage: 'Request'}];
+  if (process.env.VICE_SMOKE_THUMBNAILS === '1') fetchPatterns.push({urlPattern: `${base}/t/*`, requestStage: 'Request'});
+  await cdp.send('Fetch.enable', {patterns: fetchPatterns});
+  cdp.on('Fetch.requestPaused', ({requestId, request}) => {
+    if (process.env.VICE_SMOKE_THUMBNAILS === '1' && request.url.startsWith(`${base}/t/`)) {
+      if (thumbnailFailures++ < 2) {
+        void cdp.send('Fetch.fulfillRequest', {requestId, responseCode: 503, responseHeaders: [{name:'Cache-Control',value:'no-store'}], body:''}).catch(()=>{});
+      } else void cdp.send('Fetch.continueRequest', {requestId}).catch(()=>{});
+    } else void delay(800).then(() => cdp.send('Fetch.continueRequest', {requestId})).catch(() => {});
+  });
+  await cdp.send('Page.bringToFront');
   await cdp.send('Page.navigate', {url: base});
   await until(() => cdp.evaluate(`Boolean(document.querySelector('.clip-card .clip-duration')?.textContent && !document.querySelector('.tutorial'))`), 'clip card and duration did not render');
   if (forceWebm) assert.equal(await cdp.evaluate(`document.createElement('video').canPlayType('video/mp4; codecs="avc1.640028"')`), '');
@@ -191,6 +201,16 @@ esac
     // A large file over a link with latency must stay original and avoid any
     // conversion work. This catches the previous automatic 720p regression.
     await cdp.send('Network.emulateNetworkConditions', {offline: false, latency: 60, downloadThroughput: 12_500_000, uploadThroughput: 12_500_000});
+  }
+  let thumbnailRecovery = null;
+  if (process.env.VICE_SMOKE_THUMBNAILS === '1') {
+    await cdp.evaluate(`document.querySelector('.clip-card').scrollIntoView({block:'center'})`);
+    const began = Date.now();
+    await until(() => cdp.evaluate(`(()=>{const image=document.querySelector('.clip-thumb img');return image?.complete&&image.naturalWidth>0;})()`), 'thumbnail did not recover from transient busy responses', 5000);
+    const dimensions = await cdp.evaluate(`(()=>{const image=document.querySelector('.clip-thumb img');return {width:image.naturalWidth,height:image.naturalHeight};})()`);
+    assert(dimensions.width <= 320 && dimensions.height <= 180, `thumbnail remains oversized: ${JSON.stringify(dimensions)}`);
+    assert(thumbnailFailures >= 3, 'two busy thumbnail responses should have been retried');
+    thumbnailRecovery = {ms:Date.now()-began,...dimensions};
   }
   viewerOpened=true;
   const openedAt = Date.now();
@@ -387,12 +407,39 @@ esac
     assert.equal(await cdp.evaluate(`document.querySelector('.viewer-video').getAttribute('src')`), sourceBeforeTags, 'removing a tag must not reload the video');
     liveTags = true;
   }
+  let keyboardSeek = false;
+  if (process.env.VICE_SMOKE_KEYS === '1') {
+    assert(original, 'precise arrow-key assertions use an original complete recording');
+    const initial = await cdp.evaluate(`document.querySelector('.viewer-video').getAttribute('src')`);
+    await cdp.evaluate(`{const video=document.querySelector('.viewer-video');video.pause();video.currentTime=1;}`);
+    await until(() => cdp.evaluate(`!document.querySelector('.viewer-video').seeking`), 'setup seek did not complete');
+    const press = async key => {await cdp.send('Input.dispatchKeyEvent',{type:'keyDown',key,code:key});await cdp.send('Input.dispatchKeyEvent',{type:'keyUp',key,code:key});};
+    await press('ArrowRight');
+    await until(() => cdp.evaluate(`Math.abs(document.querySelector('.viewer-video').currentTime-6)<0.15`), 'Right arrow did not seek five seconds');
+    assert.equal(await cdp.evaluate(`document.querySelector('.viewer-video').getAttribute('src')`), initial, 'arrow key switched clips');
+    assert(await cdp.evaluate(`document.querySelector('.viewer-video').paused`), 'seeking should preserve pause');
+    await press('ArrowLeft');
+    await until(() => cdp.evaluate(`Math.abs(document.querySelector('.viewer-video').currentTime-1)<0.15`), 'Left arrow did not seek back five seconds');
+    await press('ArrowLeft');
+    await until(() => cdp.evaluate(`document.querySelector('.viewer-video').currentTime<0.05`), 'Left arrow did not clamp to zero');
+    await cdp.evaluate(`document.querySelector('.viewer-video').currentTime=7`);
+    await until(() => cdp.evaluate(`!document.querySelector('.viewer-video').seeking`), 'end setup seek did not complete');
+    await press('ArrowRight');
+    await until(() => cdp.evaluate(`{const v=document.querySelector('.viewer-video');v.currentTime<=v.duration&&v.currentTime>v.duration-0.15}`), 'Right arrow did not clamp to end');
+    await cdp.evaluate(`document.querySelector('.viewer-heading h2').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}))`);
+    await until(() => cdp.evaluate(`Boolean(document.querySelector('.viewer-rename'))`), 'rename input did not open');
+    const before = await cdp.evaluate(`document.querySelector('.viewer-video').currentTime`);
+    await press('ArrowLeft');
+    assert.equal(await cdp.evaluate(`document.querySelector('.viewer-video').currentTime`), before, 'editing a name must not seek the video');
+    await press('Escape');
+    keyboardSeek = true;
+  }
   const png = await cdp.send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
   await fs.writeFile(screenshot, Buffer.from(png.data, 'base64'));
-  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
+  console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, keyboardSeek, thumbnailRecovery, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
-  if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }
+  if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,visibility:document.visibilityState,thumbnail:document.querySelector('.clip-card')?.getBoundingClientRect().toJSON(),body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }
   console.error('Daemon log:', daemonLog.slice(-5000));
   console.error('Browser log:', browserLog.slice(-3000));
   console.error('Browser activity:', JSON.stringify(activity));

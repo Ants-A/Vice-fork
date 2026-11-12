@@ -319,7 +319,7 @@
     "shareDiscordSize": "Bereit für Discord · {size}",
     "reveal": "Anzeigen",
     "delete": "Löschen",
-    "shortcuts": "Links und Rechts wechseln den Clip · H setzt ein Highlight · Esc schließt",
+    "shortcuts": "Links/Rechts spulen 5 Sekunden · H setzt ein Highlight · Esc schließt",
     "playbackFailed": "Vice konnte diesen Clip im App-Fenster nicht abspielen. An der Datei selbst liegt es höchstwahrscheinlich nicht.",
     "noH264Decoder": "In diesem WebKit-Build fehlt ein H.264-Decoder, deshalb lassen sich Clips in Vice nicht abspielen. Die Datei selbst ist in Ordnung.",
     "saveFrame": "Standbild speichern",

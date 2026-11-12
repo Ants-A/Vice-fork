@@ -284,7 +284,7 @@ impl AppState {
                 cfg.sharing.public_port.unwrap_or(port.saturating_add(1))
             ),
             probes: Semaphore::new(2),
-            thumbnail_slots: Semaphore::new(2),
+            thumbnail_slots: Semaphore::new(4),
             metadata: Mutex::new(metadata),
             media_jobs: Mutex::new(HashMap::new()),
             edits: Mutex::new(()),
@@ -569,6 +569,17 @@ impl AppState {
                 .ok()
                 .and_then(|t| *t)
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(4))
+    }
+    fn thumbnails_paused(&self) -> bool {
+        self.active_video_streams
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+            || self
+                .last_video_request
+                .lock()
+                .ok()
+                .and_then(|time| *time)
+                .is_some_and(|time| time.elapsed() < Duration::from_millis(200))
     }
     async fn cache_lock(&self, path: &FsPath) -> Arc<Mutex<()>> {
         self.media_jobs
@@ -1268,7 +1279,8 @@ async fn serve_media(
     if kind == "t" || kind == "it" {
         // Reuse thumbnails from the previous implementation before touching
         // the recording. These cache identities use size and nanosecond mtime.
-        if let Some(identity) = s.identity(&path).await {
+        let identity = s.identity(&path).await;
+        if let Some(identity) = identity {
             let legacy = cache_dir().join("thumbs").join(format!(
                 "{}_{}_{}.jpg",
                 path.file_stem().unwrap_or_default().to_string_lossy(),
@@ -1276,16 +1288,16 @@ async fn serve_media(
                 identity.mtime_ns
             ));
             if revision(&legacy).0 > 0 {
-                return file(legacy, req).await;
+                return thumbnail_file(legacy, identity, req).await;
             }
             let current = cache_dir()
                 .join("thumbs")
                 .join(format!("{}.jpg", indexed_cache_key(&s, &path).await));
             if revision(&current).0 > 0 {
-                return file(current, req).await;
+                return thumbnail_file(current, identity, req).await;
             }
         }
-        if s.video_busy() {
+        if s.thumbnails_paused() {
             return Err(ApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "thumbnail preparation paused during playback; retry".into(),
@@ -1300,19 +1312,33 @@ async fn serve_media(
             "1".into(),
             "-filter_threads".into(),
             "1".into(),
+            "-probesize".into(),
+            "524288".into(),
+            "-analyzeduration".into(),
+            "200000".into(),
             "-i".into(),
             path.to_string_lossy().into(),
+            "-map".into(),
+            "0:v:0".into(),
+            "-an".into(),
+            "-sn".into(),
+            "-dn".into(),
             "-frames:v".into(),
             "1".into(),
             "-vf".into(),
-            "scale=480:-2".into(),
+            "scale=w='min(320,iw)':h='min(180,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2".into(),
+            "-q:v".into(),
+            "6".into(),
             "-threads:v".into(),
             "1".into(),
             "-f".into(),
             "image2".into(),
         ];
         let thumb = cached_media(&s, &path, "thumbs", "jpg", "", args, 60, false).await?;
-        return file(thumb, req).await;
+        return match identity {
+            Some(identity) => thumbnail_file(thumb, identity, req).await,
+            None => file(thumb, req).await,
+        };
     }
     if kind == "v" {
         if let Ok(mut at) = s.last_video_request.lock() {
@@ -1433,6 +1459,31 @@ async fn serve_media(
     }
     Ok(response)
 }
+/// A thumbnail URL contains the source revision. Cache its small response in
+/// the browser instead of making the Wi-Fi client refetch on every visit.
+async fn thumbnail_file(
+    path: PathBuf,
+    identity: media::FileIdentity,
+    req: Request<Body>,
+) -> ApiResult {
+    let revision = format!("{}-{}", identity.size, identity.mtime_ns);
+    let version = req
+        .uri()
+        .query()
+        .and_then(|query| query.split('&').find_map(|part| part.strip_prefix("v=")));
+    let cache = match version {
+        Some(version) if version == revision => "private, max-age=31536000, immutable",
+        Some(_) => "no-store",
+        None => "no-cache",
+    };
+    let mut response = file(path, req).await?;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(cache),
+    );
+    Ok(response)
+}
+
 pub(crate) async fn indexed_cache_key(s: &Shared, path: &FsPath) -> String {
     if let Some(identity) = s.identity(path).await {
         identity_cache_key(path, identity)
@@ -1488,9 +1539,13 @@ async fn cached_media(
     let _slot = if transcode {
         s.transcodes.acquire().await?
     } else {
-        tokio::time::timeout(Duration::from_millis(50), s.thumbnail_slots.acquire())
-            .await
-            .context("thumbnail worker busy; retry")??
+        // Queue cold visible thumbnails instead of rejecting every request
+        // that cannot start within 50ms and forcing exponential client retries.
+        let slot = s.thumbnail_slots.acquire().await?;
+        if s.thumbnails_paused() {
+            bail!("thumbnail preparation paused during playback; retry");
+        }
+        slot
     };
     tokio::fs::create_dir_all(target.parent().context("cache parent")?).await?;
     let tmp = MediaTemp(target.with_file_name(format!(".{}.{ext}", uuid::Uuid::new_v4().simple())));
@@ -2732,6 +2787,12 @@ async fn playlist_api(s: Shared, parts: &[&str], method: &Method, body: &Value) 
             .map(|(slug, path)| (slug.clone(), path.clone()))
             .collect();
         for (slug, path) in files {
+            // Portable tag remuxes read and write the full recording. Wait
+            // for playback's share reads to finish instead of competing for
+            // the same Wi-Fi link after a user edits a tag in the player.
+            while s.video_busy() && !*s.shutdown.borrow() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
             if *s.shutdown.borrow() {
                 break;
             }
