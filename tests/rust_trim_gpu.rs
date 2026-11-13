@@ -339,3 +339,69 @@ async fn trim_child() -> Result<()> {
     )?;
     Ok(())
 }
+
+#[tokio::test]
+async fn hevc_trim_keeps_codec_and_limits_reencode_bitrate() -> Result<()> {
+    let Some(ffmpeg) = vice::runtime::which("ffmpeg") else {
+        return Ok(());
+    };
+    let encoders = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-encoders"])
+        .output()?;
+    if !String::from_utf8_lossy(&encoders.stdout).contains("libx265") {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("source.mp4");
+    let target = dir.path().join("trim.mp4");
+    let result = Command::new(&ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=20:duration=3",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "pools=none:frame-threads=1:log-level=error:keyint=120",
+            "-y",
+        ])
+        .arg(&source)
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let before = media::probe_media(&source).await?;
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let log = attempts.clone();
+    let info = media::trim_range_with_runner(
+        &source,
+        &target,
+        0.55,
+        2.05,
+        &before,
+        &HashMap::new(),
+        move |args| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(args.clone());
+                let output = media::run_command(&args, 60.0).await?;
+                if !output.status.success() {
+                    bail!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+                Ok(())
+            }
+        },
+    )
+    .await?;
+    assert_eq!(info.vcodec, "hevc");
+    let attempts = attempts.lock().unwrap();
+    assert!(attempts.iter().any(
+        |args| args.iter().any(|arg| arg == "-b:v") && args.iter().any(|arg| arg == "-maxrate")
+    ));
+    Ok(())
+}

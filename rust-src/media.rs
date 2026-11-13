@@ -483,6 +483,12 @@ where
         bail!("trim extends beyond the clip");
     }
     let duration = end - start;
+    // Keep a re-encoded trim near the source's average data rate. Constant
+    // quality settings alone can make a short hardware encode much larger.
+    let source_kbps = std::fs::metadata(source)
+        .ok()
+        .map(|meta| (meta.len() as f64 * 8.0 / before.duration / 1000.0).ceil() as u64)
+        .filter(|rate| *rate > 0);
     let make = |encoder: Option<&str>| {
         let mut args: Vec<String> = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss"]
             .map(str::to_owned)
@@ -522,6 +528,14 @@ where
                 "-c:a".into(),
                 "copy".into(),
             ]);
+            if let Some(rate) = source_kbps {
+                let rate = rate.max(500);
+                args.extend([
+                    "-b:v".into(), format!("{rate}k"),
+                    "-maxrate".into(), format!("{}k", rate * 3 / 2),
+                    "-bufsize".into(), format!("{}k", rate * 2),
+                ]);
+            }
         } else {
             args.extend(["-c".into(), "copy".into()]);
         }

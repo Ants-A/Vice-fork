@@ -971,6 +971,8 @@
     "imageDirectory": "Image folder",
     "imageDirectoryHelp": "Where screenshots are written. Kept apart from clips so an image viewer is not indexing a folder of video files.",
     "soundScreenshot": "Screenshot",
+    "discordFps": "Discord clip frame rate",
+    "discordFpsHelp": "Frame rate for Discord-sized copies. Lower frame rates can speed up compression.",
     "shareDiscordFile": "Share copies a Discord file",
     "shareDiscordFileHelp": "On: the Share button copies the clip itself, shrunk to fit Discord's free upload limit, ready to paste into a message. Off: it copies the share link. Right-click Share for the other one either way.",
     "theme": "Theme",

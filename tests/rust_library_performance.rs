@@ -37,7 +37,7 @@ fn executable(path: &Path, contents: &str) -> Result<()> {
 
 impl Library {
     async fn start(count: usize, legacy_cache: bool, probe_delay: &str) -> Result<Self> {
-        Self::start_with_preload(count, legacy_cache, probe_delay, None).await
+        Self::start_with_preload(count, legacy_cache, probe_delay, None, false).await
     }
 
     async fn start_with_preload(
@@ -45,6 +45,7 @@ impl Library {
         legacy_cache: bool,
         probe_delay: &str,
         preload: Option<&Path>,
+        large_first_clip: bool,
     ) -> Result<Self> {
         let root = tempfile::tempdir()?;
         for name in ["run", "clips", "images", "bin", "cache"] {
@@ -71,6 +72,12 @@ printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"h264","width":128
         for n in 0..count {
             let path = root.path().join(format!("clips/clip-{n}.mp4"));
             std::fs::write(&path, b"video-fixture")?;
+            if large_first_clip && n == 0 {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)?
+                    .set_len(21_000_000)?;
+            }
             if legacy_cache {
                 let stat = std::fs::metadata(&path)?;
                 let mtime = stat.mtime() as i128 * 1_000_000_000 + stat.mtime_nsec() as i128;
@@ -234,7 +241,7 @@ struct dirent64 *readdir64(DIR *dir) {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let library = Library::start_with_preload(2, true, "0", Some(&library_path)).await?;
+    let library = Library::start_with_preload(2, true, "0", Some(&library_path), false).await?;
     let source = library.root.path().join("clips/clip-0.mp4");
     let identity = vice::media::FileIdentity::read(&source)?;
     let hash = format!(
@@ -306,7 +313,7 @@ async fn cached_discord_copy_does_not_wait_for_cold_metadata_or_busy_probes() ->
     let Some(ffmpeg) = vice::runtime::which("ffmpeg") else {
         return Ok(());
     };
-    let library = Library::start(2, false, "2").await?;
+    let library = Library::start_with_preload(2, false, "2", None, true).await?;
     let source = library.root.path().join("clips/clip-0.mp4");
     let identity = vice::media::FileIdentity::read(&source)?;
     let prefix = format!(
@@ -316,7 +323,7 @@ async fn cached_discord_copy_does_not_wait_for_cold_metadata_or_busy_probes() ->
     let cache = library.root.path().join("cache/discord");
     std::fs::create_dir_all(&cache)?;
     let ready = cache.join(format!(
-        "{}-{}-{}-{}.mp4",
+        "{}-{}-{}-{}-h264-fps30.mp4",
         &prefix[..24],
         identity.size,
         identity.mtime_ns,
@@ -682,5 +689,15 @@ async fn portable_tag_writes_wait_for_playback_network_reads() -> Result<()> {
         "background tag work must not start source probes/remuxes while playback is downloading"
     );
     drop(video);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discord_returns_small_original_without_encoding() -> Result<()> {
+    let library = Library::start(1, false, "0").await?;
+    let source = library.root.path().join("clips/clip-0.mp4");
+    let result = library.get("/api/clips/clip-0/discord").await?;
+    assert_eq!(result["path"], source.to_string_lossy().as_ref());
+    assert!(!library.root.path().join("cache/discord").exists());
     Ok(())
 }

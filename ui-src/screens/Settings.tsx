@@ -975,6 +975,14 @@ export function Settings() {
               onChange={shareDiscordFile => update({shareDiscordFile})}
             />
           </Row>
+          <Row label={t('settings.discordFps')} help={t('settings.discordFpsHelp')}>
+            <Select
+              label={t('settings.discordFps')}
+              value={draft.discordFps}
+              onChange={discordFps => update({discordFps})}
+              options={['24', '30', '50', '60'].map(v => [v, t('settings.fpsOption', {fps: v})] as [string, string])}
+            />
+          </Row>
         </Card>
 
         {/* ── Discord ───────────────────────────────────────────── */}

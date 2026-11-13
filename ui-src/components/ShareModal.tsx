@@ -43,7 +43,7 @@ export function ShareModal({
   const [encoder, setEncoder] = useState('');
   useEffect(() => onWsMessage(msg => {
     if (msg.type === 'discord_progress' && msg.slug === clip?.slug) {
-      setProgress(msg.progress);
+      setProgress(previous => Math.max(previous ?? 0, Math.min(msg.progress, 0.99)));
       setEncoder(msg.encoder ?? '');
     }
   }), [clip?.slug]);

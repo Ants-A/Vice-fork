@@ -2608,7 +2608,7 @@ async fn clipboard(path: &FsPath, image: bool) -> Result<()> {
 }
 async fn reuse_discord_after_rename(old_key: &str, new_key: &str) {
     let directory = cache_dir().join("discord");
-    for suffix in [
+    let mut suffixes: Vec<String> = [
         "-budget2",
         "-budget1",
         "",
@@ -2618,7 +2618,15 @@ async fn reuse_discord_after_rename(old_key: &str, new_key: &str) {
         "-hevc-budget2",
         "-hevc-budget1",
         "-hevc",
-    ] {
+    ].into_iter().map(str::to_owned).collect();
+    for codec in ["h264", "hevc"] {
+        for fps in [24, 30, 50, 60] {
+            for budget in ["", "-budget1", "-budget2"] {
+                suffixes.push(format!("-{codec}-fps{fps}{budget}"));
+            }
+        }
+    }
+    for suffix in suffixes {
         let old = directory.join(format!("{old_key}{suffix}.mp4"));
         let new = directory.join(format!("{new_key}{suffix}.mp4"));
         match tokio::fs::hard_link(&old, &new).await {
@@ -2667,7 +2675,14 @@ async fn validated_discord_cache(s: &Shared, path: &FsPath) -> Result<bool> {
 }
 
 async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
-    let codec = s.cfg.read().await.recording.video_codec.clone();
+    let size = revision(path).0;
+    if size > 0 && size <= editor::DISCORD_MAX_BYTES {
+        return Ok(path.to_path_buf());
+    }
+    let cfg = s.cfg.read().await;
+    let codec = cfg.recording.video_codec.clone();
+    let fps = cfg.sharing.discord_fps;
+    drop(cfg);
     let key = indexed_cache_key(s, path).await;
     // Reuse existing H.264 copies even after enabling HEVC. Compatibility mode
     // deliberately skips HEVC copies; the original recording is never changed.
@@ -2680,7 +2695,7 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         for budget in ["-budget2", "-budget1", ""] {
             let cached = cache_dir()
                 .join("discord")
-                .join(format!("{key}{family}{budget}.mp4"));
+                .join(format!("{key}{family}-fps{fps}{budget}.mp4"));
             let bytes = revision(&cached).0;
             // Older ready copies used a 20 MiB cap; preserve those bytes.
             let limit = if family.is_empty() {
@@ -2698,14 +2713,6 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         }
     }
     let meta = s.meta(path).await;
-    let size = revision(path).0;
-    if size > 0
-        && size <= editor::DISCORD_MAX_BYTES
-        && path.extension().is_some_and(|e| e == "mp4")
-        && (meta["vcodec"] == "h264" || (codec == "hevc" && meta["vcodec"] == "hevc"))
-    {
-        return Ok(path.into());
-    }
     let duration = meta["duration"]
         .as_f64()
         .filter(|d| *d > 0.0)
@@ -2714,6 +2721,8 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         duration,
         meta["audio_streams"].as_u64().unwrap_or(1) as usize,
     )?;
+    // Leave room for hardware rate-control overshoot and MP4 overhead.
+    let bitrate = (bitrate * 9 / 10).max(1);
     let args = vec![
         "ffmpeg".into(),
         "-loglevel".into(),
@@ -2726,6 +2735,8 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
         "0:a?".into(),
         "-vf".into(),
         "scale='trunc(min(1280,iw)/2)*2':-2".into(),
+        "-r".into(),
+        fps.to_string(),
         "-c:v".into(),
         if codec == "hevc" {
             "libx265"
@@ -2758,9 +2769,9 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
     let mut args = args;
     for attempt in 0..3 {
         let suffix = if attempt == 0 {
-            format!("-{codec}")
+            format!("-{codec}-fps{fps}")
         } else {
-            format!("-{codec}-budget{attempt}")
+            format!("-{codec}-fps{fps}-budget{attempt}")
         };
         let out = cached_media(
             s,
@@ -3177,6 +3188,15 @@ async fn start_export(s: Shared, body: Value) -> ApiResult {
         )
             .into_response());
     }
+    // Preserve the game only when every source belongs to the same game.
+    let source_game = {
+        let playlists = s.playlists.lock().await;
+        let mut games = sources.keys().map(|id| playlists.game_for(id));
+        match games.next().flatten() {
+            Some(game) if games.all(|other| other.as_deref() == Some(game.as_str())) => Some(game),
+            _ => None,
+        }
+    };
     let cfg = s.cfg.read().await.clone();
     let library = runtime::resolve_path(&cfg.output.directory);
     let dir = match body["location"].as_str().unwrap_or("library") {
@@ -3308,7 +3328,12 @@ async fn start_export(s: Shared, body: Value) -> ApiResult {
                 let _edit = s.edits.lock().await;
                 let id = uuid::Uuid::new_v4().simple().to_string();
                 s.remember_name(&path, &path, &id, false, "mp4").await?;
-                s.saved_locked(&path, false).await?;
+                if let Some(game) = source_game {
+                    let mut playlists = s.playlists.lock().await;
+                    playlists.record_auto(&game, &id, None, false)?;
+                    s.emit(json!({"type":"playlists_changed","playlists":playlists.list_playlists()}));
+                }
+                s.saved_locked_with_game(&path, false, None).await?;
                 clip = s.clip_json(&id, &path, true).await;
             }
             s.emit(json!({"type":"export_done","job_id":job_id,"path":final_path,"clip":clip}));

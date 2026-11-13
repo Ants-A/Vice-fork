@@ -60,9 +60,11 @@ export async function shareClip(
     return;
   }
   notify({kind: 'info', title: t('card.discordPreparing'), tone: 'neutral', holdMs: 600_000});
+  let progress = 0;
   const unsubscribe = onWsMessage(msg => {
     if (msg.type === 'discord_progress' && msg.slug === clip.slug) {
-      notify({kind: 'info', title: t('card.discordPreparing'), detail: `${Math.round(msg.progress * 100)}%${msg.encoder ? ` · ${msg.encoder}` : ''}`, tone: 'neutral', holdMs: 600_000});
+      progress = Math.max(progress, Math.min(msg.progress, 0.99));
+      notify({kind: 'info', title: t('card.discordPreparing'), detail: `${Math.round(progress * 100)}%${msg.encoder ? ` · ${msg.encoder}` : ''}`, tone: 'neutral', holdMs: 600_000});
     }
   });
   try {

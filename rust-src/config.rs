@@ -58,7 +58,7 @@ section!(OutputConfig {
 section!(SharingConfig {
     enabled: bool = true, port: u16 = 8765, public_port: Option<u16> = None,
     cloudflare_tunnel: bool = true, base_url: Option<String> = None,
-    embed_color: String = "#0099ff".into(), share_discord_file: bool = false
+    embed_color: String = "#0099ff".into(), share_discord_file: bool = false, discord_fps: u32 = 30
 });
 section!(DiscordCustomGame { name: String = String::new(), matches: Vec<String> = vec![] });
 section!(DiscordConfig {
@@ -288,6 +288,9 @@ impl Config {
         }
         if !(0..=51).contains(&self.recording.crf) {
             bail!("recording.crf must be between 0 and 51");
+        }
+        if ![24, 30, 50, 60].contains(&self.sharing.discord_fps) {
+            bail!("sharing.discord_fps must be 24, 30, 50 or 60");
         }
         if self.sharing.port == 0 || self.sharing.public_port == Some(0) {
             bail!("server ports must be positive");

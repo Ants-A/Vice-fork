@@ -64,6 +64,7 @@ export interface Draft {
   port: number;
   cloudflareTunnel: boolean;
   shareDiscordFile: boolean;
+  discordFps: string;
 
   discordEnabled: boolean;
   discordGameIcons: boolean;
@@ -183,6 +184,7 @@ export function draftFromConfig(config: Config): Draft {
     port: num(s.port, 8765),
     cloudflareTunnel: s.cloudflare_tunnel !== false,
     shareDiscordFile: Boolean(s.share_discord_file),
+    discordFps: String(s.discord_fps ?? 30),
 
     discordEnabled: Boolean(d.enabled),
     discordGameIcons: d.game_icons !== false,
@@ -276,6 +278,7 @@ export function patchFromDraft(draft: Draft): Record<string, Record<string, unkn
       port: Number(draft.port),
       cloudflare_tunnel: draft.cloudflareTunnel,
       share_discord_file: draft.shareDiscordFile,
+      discord_fps: Number(draft.discordFps),
     },
     // keys_x and keys_y are left out: they belong to the drag, and the
     // daemon writes them itself.
