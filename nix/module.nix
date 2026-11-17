@@ -52,7 +52,7 @@ in
         # Everything the recorder needs to find the session is set by the
         # compositor, not by us, so import it rather than hardcoding a guess.
         # XAUTHORITY is the X cookie; without it X refuses the recorder (#231).
-        PassEnvironment = "WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP KDE_SESSION_VERSION";
+        PassEnvironment = "WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP KDE_SESSION_VERSION HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK NIRI_SOCKET";
       };
     };
   };

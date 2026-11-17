@@ -220,6 +220,9 @@ pub const RUNTIME_ENV_KEYS: &[&str] = &[
     "XDG_CURRENT_DESKTOP",
     "XAUTHORITY",
     "KDE_SESSION_VERSION",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "SWAYSOCK",
+    "NIRI_SOCKET",
 ];
 pub fn runtime_env_snapshot() -> BTreeMap<String, String> {
     RUNTIME_ENV_KEYS
@@ -307,11 +310,9 @@ pub fn normalize_runtime_environment() {
             std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", libc::getuid()));
         }
     }
+    load_user_systemd_env();
     if !has_display() {
-        load_user_systemd_env();
-        if !has_display() {
-            recover_wayland_display();
-        }
+        recover_wayland_display();
     }
 }
 pub async fn wait_for_display(timeout: Duration) -> bool {

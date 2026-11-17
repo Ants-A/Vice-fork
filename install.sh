@@ -127,7 +127,7 @@ if command -v systemctl >/dev/null && systemctl --user show-environment &>/dev/n
             mkdir -p "$service_dir"
             sed "s|^ExecStart=.*|ExecStart=\"$bin_dir/vice\" start --no-open-ui|" packaging/vice.service > "$service_file"
             systemctl --user daemon-reload
-            systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP || true
+            systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK NIRI_SOCKET || true
             systemctl --user reenable vice.service
             systemctl --user restart vice.service
         fi

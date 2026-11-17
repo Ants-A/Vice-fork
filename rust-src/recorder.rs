@@ -122,9 +122,20 @@ struct Capture {
 }
 impl Capture {
     async fn spawn(args: Vec<String>) -> Result<Self> {
+        // A user service can start before the desktop exports its display and
+        // X authority. Refresh the child environment on every retry without
+        // changing the environment of the multithreaded daemon.
+        let session = if crate::runtime::running_under_systemd() && !in_flatpak() {
+            tokio::task::spawn_blocking(crate::runtime::user_systemd_env_snapshot)
+                .await
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let mut command = Command::new(&args[0]);
         command
             .args(&args[1..])
+            .envs(session)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
