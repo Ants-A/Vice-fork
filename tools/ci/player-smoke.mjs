@@ -183,11 +183,21 @@ esac
   // Make the waiting state reproducible even on a fast CPU and local disk.
   let thumbnailFailures = 0;
   let pausedDeletion = null;
+  let failMedia = process.env.VICE_SMOKE_MEDIA_FAILURE === '1';
   const fetchPatterns = [{urlPattern: `*proxy=${previewQuery}*`, requestStage: 'Request'}];
   if (process.env.VICE_SMOKE_THUMBNAILS === '1') fetchPatterns.push({urlPattern: `${base}/t/*`, requestStage: 'Request'});
   if (process.env.VICE_SMOKE_DELETE === '1') fetchPatterns.push({urlPattern: `${base}/api/clips/*`, requestStage: 'Request'});
+  if (process.env.VICE_SMOKE_SESSION_DELAY === '1') fetchPatterns.push({urlPattern: `${base}/api/clips/*/playback-session`, requestStage: 'Request'});
   await cdp.send('Fetch.enable', {patterns: fetchPatterns});
   cdp.on('Fetch.requestPaused', ({requestId, request}) => {
+    if (failMedia && request.url.includes('/v/')) {
+      void cdp.send('Fetch.failRequest', {requestId, errorReason: 'Failed'}).catch(() => {});
+      return;
+    }
+    if (process.env.VICE_SMOKE_SESSION_DELAY === '1' && request.url.endsWith('/playback-session')) {
+      void delay(8000).then(() => cdp.send('Fetch.continueRequest', {requestId})).catch(() => {});
+      return;
+    }
     if (process.env.VICE_SMOKE_DELETE === '1' && request.url.startsWith(`${base}/api/clips/`)) {
       if (request.method === 'DELETE') pausedDeletion = requestId;
       else void cdp.send('Fetch.continueRequest', {requestId}).catch(()=>{});
@@ -222,6 +232,13 @@ esac
   viewerOpened=true;
   const openedAt = Date.now();
   await cdp.evaluate(`document.querySelector('.clip-card .clip-thumb').click()`);
+  if (failMedia) {
+    await until(() => cdp.evaluate(`Boolean(document.querySelector('.viewer-stage .video-overlay'))`), 'failed video did not show an error', 15000);
+    await cdp.evaluate(`document.querySelector('.viewer-head .modal-close').click()`);
+    await until(() => cdp.evaluate(`!document.querySelector('.viewer-video')`), 'viewer did not close after video failure');
+    failMedia = false;
+    await cdp.evaluate(`document.querySelector('.clip-card .clip-thumb').click()`);
+  }
   if (!forceWebm && !autoPreview) {
     await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Smaller preview'))`), 'smaller preview control did not render');
     await cdp.evaluate(`window.__viceSmoke.bufferObserved=false;Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Smaller preview').click()`);
@@ -256,6 +273,11 @@ esac
     await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.viewer-video');return v && Number.isFinite(v.duration) && v.duration > 7;})()`), 'completed preview did not expose its full seekable duration');
   }
   const playbackSource = await cdp.evaluate(`document.querySelector('.viewer-video').currentSrc`);
+  if (process.env.VICE_SMOKE_SESSION_DELAY === '1') {
+    assert(!playbackSource.includes('playback_session='), 'a stalled session must fall back to the direct video URL');
+    await delay(4000);
+    assert.equal(await cdp.evaluate(`document.querySelector('.viewer-video').currentSrc`), playbackSource, 'a late session must not reload the video');
+  }
   const range = await fetch(playbackSource, {headers: {Range: 'bytes=0-1023'}});
   assert.equal(range.status, 206, 'completed previews must support range requests');
   const prefix = Buffer.from(await range.arrayBuffer());
@@ -268,6 +290,55 @@ esac
   if (!original) assert(requests.some(url => url.includes(`proxy=${previewQuery}`)), 'browser never requested the selected preview');
   assert.equal(result.banners.trim(), '', `unexpected hard warning: ${result.banners}`);
   assert.equal(diagnostics.length, 0, JSON.stringify(diagnostics));
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Trim').click()`);
+  await until(() => cdp.evaluate(`document.querySelector('.trim-video')?.readyState >= 2`), 'trim video did not load');
+  const dragTrim = async (index, fraction) => {
+    const points = await cdp.evaluate(`(()=>{const track=document.querySelector('.trim-timeline').getBoundingClientRect();const handle=document.querySelectorAll('.trim-handle')[${index}].getBoundingClientRect();return {from:{x:handle.x+handle.width/2,y:handle.y+handle.height/2},to:{x:track.x+track.width*${fraction},y:handle.y+handle.height/2}}})()`);
+    await cdp.send('Input.dispatchMouseEvent', {type:'mouseMoved', ...points.from});
+    await cdp.send('Input.dispatchMouseEvent', {type:'mousePressed', button:'left', clickCount:1, ...points.from});
+    await cdp.send('Input.dispatchMouseEvent', {type:'mouseMoved', button:'left', buttons:1, ...points.to});
+    await cdp.send('Input.dispatchMouseEvent', {type:'mouseReleased', button:'left', clickCount:1, ...points.to});
+  };
+  await dragTrim(0, 0.25);
+  await until(() => cdp.evaluate(`Math.abs(document.querySelector('.trim-video').currentTime-2)<0.3`), 'start handle did not seek');
+  await dragTrim(1, 0.75);
+  await until(() => cdp.evaluate(`Math.abs(document.querySelector('.trim-video').currentTime-6)<0.3`), 'end handle did not seek');
+  await cdp.evaluate(`(()=>{const h=document.querySelectorAll('.trim-handle')[0];const r=h.getBoundingClientRect();h.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,clientX:r.x+r.width/2,clientY:r.y+r.height/2}));window.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,button:0}));})()`);
+  await until(() => cdp.evaluate(`Math.abs(document.querySelector('.trim-video').currentTime-2)<0.3`), 'clicking the start handle did not seek');
+  const clickTimeline = async fraction => {
+    const point = await cdp.evaluate(`(()=>{const r=document.querySelector('.trim-timeline').getBoundingClientRect();return {x:r.x+r.width*${fraction},y:r.y+r.height/2}})()`);
+    await cdp.send('Input.dispatchMouseEvent', {type:'mousePressed', button:'left', clickCount:1, ...point});
+    await cdp.send('Input.dispatchMouseEvent', {type:'mouseReleased', button:'left', clickCount:1, ...point});
+  };
+  // Hold the media seek back to verify the playhead responds to the click
+  // without waiting for the browser to decode the requested frame.
+  await until(() => cdp.evaluate(`!document.querySelector('.trim-video').seeking`), 'previous trim seek did not settle');
+  const immediatePlayhead = await cdp.evaluate(`new Promise(resolve=>{
+    const video=document.querySelector('.trim-video');
+    Object.defineProperty(video,'currentTime',{configurable:true,get:()=>2,set:()=>{}});
+    const track=document.querySelector('.trim-timeline'), r=track.getBoundingClientRect();
+    track.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,clientX:r.x+r.width*0.5}));
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      const position=parseFloat(document.querySelector('.trim-playhead').style.left);
+      delete video.currentTime;
+      resolve(position);
+    }));
+  })`);
+  assert(Math.abs(immediatePlayhead-50)<1, `playhead waited for the media seek: ${immediatePlayhead}`);
+  await clickTimeline(0.5);
+  await until(() => cdp.evaluate(`Math.abs(document.querySelector('.trim-video').currentTime-4)<0.3`), 'clicking the timeline did not seek');
+  await clickTimeline(0.1);
+  await until(() => cdp.evaluate(`Math.abs(document.querySelector('.trim-video').currentTime-2)<0.3`), 'timeline click escaped the start boundary');
+  await clickTimeline(0.9);
+  await until(() => cdp.evaluate(`Math.abs(document.querySelector('.trim-video').currentTime-6)<0.3`), 'timeline click escaped the end boundary');
+  await cdp.evaluate(`document.querySelector('.trim-video').currentTime=0`);
+  await until(() => cdp.evaluate(`document.querySelector('.trim-video').currentTime>=1.9`), 'seek escaped the start boundary');
+  await cdp.evaluate(`document.querySelector('.trim-video').currentTime=7`);
+  await until(() => cdp.evaluate(`document.querySelector('.trim-video').currentTime<=6.1`), 'seek escaped the end boundary');
+  await cdp.evaluate(`void document.querySelector('.trim-video').play()`);
+  await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');return !v.paused&&v.currentTime>=1.9&&v.currentTime<5})()`), 'play did not restart inside the selection');
+  await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');return v.paused&&Math.abs(v.currentTime-6)<0.3})()`), 'playback did not stop at the end boundary', 10000);
+  await cdp.evaluate(`document.querySelector('.trim-modal .modal-close').click()`);
   let discordEncoderShown = null;
   if (process.env.VICE_SMOKE_DISCORD_PROGRESS === '1') {
     await cdp.evaluate(`
@@ -524,7 +595,7 @@ esac
   console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, keyboardSeek, thumbnailRecovery, replayCache, codecSettings, deleteResponsiveness, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
-  if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,visibility:document.visibilityState,thumbnail:document.querySelector('.clip-card')?.getBoundingClientRect().toJSON(),body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }
+  if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,visibility:document.visibilityState,thumbnail:document.querySelector('.clip-card')?.getBoundingClientRect().toJSON(),body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,currentTime:v.currentTime,paused:v.paused,seeking:v.seeking,readyState:v.readyState,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }
   console.error('Daemon log:', daemonLog.slice(-5000));
   console.error('Browser log:', browserLog.slice(-3000));
   console.error('Browser activity:', JSON.stringify(activity));

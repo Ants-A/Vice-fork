@@ -765,6 +765,7 @@ kbd {
   height: 40px;
   display: flex;
   align-items: center;
+  cursor: pointer;
 }
 
 .trim-track {

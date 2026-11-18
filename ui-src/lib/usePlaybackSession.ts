@@ -16,11 +16,18 @@ export function usePlaybackSession(slug: string | undefined, source: string, ope
     if (!open || !slug || !source) return;
     let active = true;
     const lease = sessions.acquire(slug, source);
+    // Session creation is an optional optimisation; a stalled request must not
+    // prevent the player from attempting the original URL.
+    const fallback = window.setTimeout(() => {
+      if (active) setReady({source, url: source});
+    }, 5000);
     void lease.source.then(url => {
-      if (active) setReady({source, url});
+      window.clearTimeout(fallback);
+      if (active) setReady(previous => previous?.source === source ? previous : {source, url});
     });
     const release = () => {
       active = false;
+      window.clearTimeout(fallback);
       lease.release();
     };
     window.addEventListener('pagehide', release);

@@ -54,6 +54,7 @@ export function TrimModal({
   const [total, setTotal] = useState(0);
   const [selection, setSelection] = useState({start: 0, end: 0});
   const [playhead, setPlayhead] = useState(0);
+  const pendingSeek = useRef<number | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const source = usePlaybackSession(clip?.slug, playbackUrl(clip), clip !== null);
   const buffer = useVideoBuffer(videoRef, clip !== null, source, clip?.duration ?? 0);
@@ -97,6 +98,7 @@ export function TrimModal({
     setTotal(clip.duration ?? 0);
     setSelection({start: 0, end: clip.duration ?? 0});
     setPlayhead(0);
+    pendingSeek.current = null;
     setPreviewing(false);
     setSaving(false);
     setSaveProgress(null);
@@ -122,16 +124,14 @@ export function TrimModal({
       event.preventDefault();
       const video = videoRef.current;
       if (!video?.getAttribute('src')) return;
-      // Like pointer scrubbing, seeking can leave the selected interval.
-      // Stop its preview loop so it cannot immediately snap the seek back.
       if (previewingRef.current) {
         previewingRef.current = false;
         setPreviewing(false);
         video.pause();
       }
-      const duration = Number.isFinite(video.duration) ? video.duration : clip.duration ?? 0;
-      const seconds = Math.max(0, video.currentTime + (event.key === 'ArrowLeft' ? -5 : 5));
-      seekTo(video, duration > 0 ? Math.min(duration, seconds) : seconds, true);
+      const {start, end} = selectionRef.current;
+      const seconds = Math.max(start, Math.min(end, video.currentTime + (event.key === 'ArrowLeft' ? -5 : 5)));
+      seekTo(video, seconds, true);
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
@@ -161,9 +161,17 @@ export function TrimModal({
   const onTimeUpdate = () => {
     const video = videoRef.current;
     if (!video) return;
-    setPlayhead(video.currentTime);
-    if (!previewingRef.current || !total) return;
+    if (pendingSeek.current === null) setPlayhead(video.currentTime);
+    if (!total) return;
     const {start, end} = selectionRef.current;
+    if (!previewingRef.current) {
+      if (video.currentTime < start - 0.02) video.currentTime = start;
+      if (video.currentTime >= end && !video.paused) {
+        video.pause();
+        video.currentTime = end;
+      }
+      return;
+    }
     // Loop the selection. The tolerance on the lower bound is deliberate: a
     // scrub lands a little before the in point, and a tight comparison would
     // read every ordinary frame near the start as a scrub and stutter.
@@ -178,21 +186,23 @@ export function TrimModal({
     event.preventDefault();
     setDragging(handle);
     if (previewingRef.current) stopPreview();
+    else videoRef.current?.pause();
 
     const apply = (clientX: number) => {
       const rect = timelineRef.current?.getBoundingClientRect();
       const video = videoRef.current;
       if (!rect || !video) return;
       const at = (Math.max(0, Math.min(rect.width, clientX - rect.left)) / rect.width) * total;
-      setSelection(prev => {
-        const next =
-          handle === 'start'
-            ? {...prev, start: Math.max(0, Math.min(at, prev.end - MIN_SELECTION))}
-            : {...prev, end: Math.min(total, Math.max(at, prev.start + MIN_SELECTION))};
-        selectionRef.current = next;
-        video.currentTime = handle === 'start' ? next.start : next.end;
-        return next;
-      });
+      const prev = selectionRef.current;
+      const next = handle === 'start'
+        ? {...prev, start: Math.max(0, Math.min(at, prev.end - MIN_SELECTION))}
+        : {...prev, end: Math.min(total, Math.max(at, prev.start + MIN_SELECTION))};
+      selectionRef.current = next;
+      setSelection(next);
+      const target = handle === 'start' ? next.start : next.end;
+      pendingSeek.current = target;
+      setPlayhead(target);
+      video.currentTime = target;
     };
 
     const move = (e: PointerEvent) => apply(e.clientX);
@@ -202,7 +212,13 @@ export function TrimModal({
       window.removeEventListener('pointercancel', up, true);
       setDragging(null);
     };
-    apply(event.clientX);
+    const video = videoRef.current;
+    if (video) {
+      const target = selectionRef.current[handle];
+      pendingSeek.current = target;
+      setPlayhead(target);
+      video.currentTime = target;
+    }
     window.addEventListener('pointermove', move, true);
     window.addEventListener('pointerup', up, true);
     window.addEventListener('pointercancel', up, true);
@@ -292,6 +308,22 @@ export function TrimModal({
                 selectionRef.current = next;
               }}
               onTimeUpdate={onTimeUpdate}
+              onSeeked={e => {
+                pendingSeek.current = null;
+                setPlayhead(e.currentTarget.currentTime);
+              }}
+              onSeeking={e => {
+                const video = e.currentTarget;
+                const {start, end} = selectionRef.current;
+                if (end > start && (video.currentTime < start - 0.02 || video.currentTime > end + 0.02)) {
+                  video.currentTime = Math.max(start, Math.min(end, video.currentTime));
+                }
+              }}
+              onPlay={e => {
+                const video = e.currentTarget;
+                const {start, end} = selectionRef.current;
+                if (end > start && (video.currentTime < start || video.currentTime >= end - 0.05)) video.currentTime = start;
+              }}
               onEnded={() => {
                 const video = videoRef.current;
                 if (!previewingRef.current || !video) return;
@@ -329,7 +361,18 @@ export function TrimModal({
             </span>
           </div>
 
-          <div className="trim-timeline" ref={timelineRef}>
+          <div className="trim-timeline" ref={timelineRef} onPointerDown={event => {
+            if (event.button !== 0 || !total || (event.target as Element).closest('.trim-handle')) return;
+            const video = videoRef.current;
+            const rect = event.currentTarget.getBoundingClientRect();
+            if (!video || !rect.width) return;
+            const {start, end} = selectionRef.current;
+            const at = ((event.clientX - rect.left) / rect.width) * total;
+            const target = Math.max(start, Math.min(end, at));
+            pendingSeek.current = target;
+            setPlayhead(target);
+            video.currentTime = target;
+          }}>
             <div className="trim-track">
               {total > 0 ? buffer.ranges.map((range, index) => (
                 <div key={index} className="viewer-buffered" style={{left: `${pct(range.start)}%`, width: `${pct(range.end - range.start)}%`}} />
