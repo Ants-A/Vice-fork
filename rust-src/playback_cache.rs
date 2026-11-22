@@ -268,14 +268,20 @@ impl Sessions {
                         let (send, receive) = mpsc::channel(16);
                         // At most four producers allocate/read blocks for this player.
                         // Queued bytes allow the source to run ahead of HTTP writes.
-                        let permit = session.permits.clone().acquire_owned().await.ok()?;
+                        let runtime = tokio::runtime::Handle::current();
                         tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
                             let mut offset = offset;
                             let mut remaining = length;
                             while remaining > 0 && !send.is_closed() {
                                 let count = remaining.min(BLOCK - offset % BLOCK) as usize;
-                                match session.read(offset, count) {
+                                let Ok(permit) = runtime.block_on(session.permits.clone().acquire_owned()) else {
+                                    break;
+                                };
+                                let chunk = session.read(offset, count);
+                                // A slow client must not hold a read permit while
+                                // its response queue waits for it to consume data.
+                                drop(permit);
+                                match chunk {
                                     Ok(bytes) => {
                                         if send.blocking_send(Ok(Bytes::from(bytes))).is_err() {
                                             break;
@@ -479,6 +485,38 @@ mod tests {
         assert_eq!(session.permits.available_permits(), 4);
         assert!(session.source_bytes.load(Ordering::Relaxed) <= 18 * BLOCK);
         assert!(!session.path.exists());
+    }
+
+    #[tokio::test]
+    async fn stalled_responses_do_not_block_a_later_seek() {
+        use futures_util::StreamExt;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("clip.mp4");
+        File::create(&source)
+            .unwrap()
+            .set_len(24 * BLOCK)
+            .unwrap();
+        let sessions = Sessions::new(temp.path().join("cache"));
+        let id = sessions.create(source).await.unwrap();
+        let mut stalled = Vec::new();
+        for _ in 0..4 {
+            let mut body = get(&sessions, &id, None, Method::GET)
+                .await
+                .into_body()
+                .into_data_stream();
+            assert!(body.next().await.unwrap().is_ok());
+            stalled.push(body);
+        }
+        // Let the queues fill, reproducing clients that stop reading without
+        // closing their connections before requesting a different range.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seek = get(&sessions, &id, Some("bytes=23068672-23068735"), Method::GET).await;
+        let bytes = tokio::time::timeout(Duration::from_secs(3), to_bytes(seek.into_body(), 64))
+            .await
+            .expect("stalled readers blocked a seek")
+            .unwrap();
+        assert_eq!(bytes.len(), 64);
+        drop(stalled);
     }
 
     #[tokio::test]

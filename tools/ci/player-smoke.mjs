@@ -178,6 +178,10 @@ esac
     HTMLMediaElement.prototype.canPlayType = function(type) {return ${forceWebm ? '/mp4|avc1|hvc1|hev1/i.test(type)' : 'false'} ? '' : originalCanPlay.call(this, type);};
     localStorage.setItem('vice_tutorial_shown','1');localStorage.setItem('vice_whats_new_seen','2.17.0');localStorage.setItem('vice-muted','1');
     window.__viceSmoke={bufferObserved:false};
+    const NativeWebSocket = window.WebSocket;
+    window.WebSocket = class extends NativeWebSocket {
+      constructor(...args) { super(...args); window.__viceSmoke.socket = this; }
+    };
     new MutationObserver(()=>{const bar=document.querySelector('.viewer-buffered');if(bar&&bar.getBoundingClientRect().width>0)window.__viceSmoke.bufferObserved=true;}).observe(document,{childList:true,subtree:true,attributes:true});
   `});
   // Make the waiting state reproducible even on a fast CPU and local disk.
@@ -292,6 +296,7 @@ esac
   assert.equal(diagnostics.length, 0, JSON.stringify(diagnostics));
   await cdp.evaluate(`Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Trim').click()`);
   await until(() => cdp.evaluate(`document.querySelector('.trim-video')?.readyState >= 2`), 'trim video did not load');
+  await cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');window.__viceSmoke.seekEvents=[];for(const name of ['seeking','seeked','waiting','canplay','timeupdate'])v.addEventListener(name,()=>{window.__viceSmoke.seekEvents.push({name,time:v.currentTime,seeking:v.seeking,ready:v.readyState});if(window.__viceSmoke.seekEvents.length>40)window.__viceSmoke.seekEvents.shift()});})()`);
   const dragTrim = async (index, fraction) => {
     const points = await cdp.evaluate(`(()=>{const track=document.querySelector('.trim-timeline').getBoundingClientRect();const handle=document.querySelectorAll('.trim-handle')[${index}].getBoundingClientRect();return {from:{x:handle.x+handle.width/2,y:handle.y+handle.height/2},to:{x:track.x+track.width*${fraction},y:handle.y+handle.height/2}}})()`);
     await cdp.send('Input.dispatchMouseEvent', {type:'mouseMoved', ...points.from});
@@ -338,7 +343,73 @@ esac
   await cdp.evaluate(`void document.querySelector('.trim-video').play()`);
   await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');return !v.paused&&v.currentTime>=1.9&&v.currentTime<5})()`), 'play did not restart inside the selection');
   await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');return v.paused&&Math.abs(v.currentTime-6)<0.3})()`), 'playback did not stop at the end boundary', 10000);
-  await cdp.evaluate(`document.querySelector('.trim-modal .modal-close').click()`);
+  const initialViewport = await cdp.evaluate(`({width:innerWidth,height:innerHeight})`);
+  for (const [width, height] of [[1920, 1080], [1280, 820], [520, 800]]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: false});
+    await delay(400);
+    const layout = await cdp.evaluate(`(()=>{
+      const panel=document.querySelector('.trim-modal').getBoundingClientRect();
+      const viewer=document.querySelector('.viewer-stack').getBoundingClientRect();
+      const stage=document.querySelector('.trim-stage').getBoundingClientRect();
+      const track=document.querySelector('.trim-track').getBoundingClientRect();
+      const handles=Array.from(document.querySelectorAll('.trim-handle'), h=>h.getBoundingClientRect());
+      return {panel:{x:panel.x,width:panel.width,right:panel.right,bottom:panel.bottom},stage:{width:stage.width,height:stage.height},viewerWidth:viewer.width,handles:handles.map(h=>h.width),trackCenter:track.y+track.height/2,handleCenters:handles.map(h=>h.y+h.height/2)};
+    })()`);
+    assert(layout.panel.width <= layout.viewerWidth - 30, `trim needs extra margin at ${width}px: ${JSON.stringify(layout)}`);
+    assert(layout.panel.width >= layout.viewerWidth * 0.8, `trim panel is too small at ${width}px: ${JSON.stringify(layout)}`);
+    assert(layout.panel.x > 0 && layout.panel.right < width, `trim panel overflows at ${width}px: ${JSON.stringify(layout)}`);
+    assert(layout.panel.bottom <= height, `trim controls overflow at ${width}px: ${JSON.stringify(layout)}`);
+    assert(Math.abs(layout.stage.width / layout.stage.height - 16 / 9) < 0.02, `trim stage should match the viewer aspect ratio: ${JSON.stringify(layout)}`);
+    if (width === 1920) assert(layout.stage.height > height * 0.46, `trim stage should be taller: ${JSON.stringify(layout)}`);
+    assert.deepEqual(layout.handles, [4, 4], 'trim handles must be thin');
+    assert(layout.handleCenters.every(center=>Math.abs(center-layout.trackCenter)<1), `trim handles must align with the track: ${JSON.stringify(layout)}`);
+  }
+  await cdp.send('Emulation.setDeviceMetricsOverride', {...initialViewport, deviceScaleFactor: 1, mobile: false});
+  await cdp.evaluate(`document.querySelector('.trim-video').currentTime=4`);
+  await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');return !v.seeking && Math.abs(v.currentTime-4)<0.3})()`), 'trim video did not seek after resizing');
+  // Hold the replacement request open and feed a real socket listener a
+  // progress message. The rest of the interface must remain interactive.
+  await cdp.evaluate(`(()=>{
+    const originalFetch=window.fetch;
+    window.fetch=(url,init)=>String(url).endsWith('/trim')
+      ? new Promise(resolve=>{window.__viceSmoke.finishTrim=()=>resolve(new Response(JSON.stringify({slug:'smoke'}),{status:200,headers:{'Content-Type':'application/json'}}));})
+      : originalFetch(url,init);
+    window.__viceSmoke.restoreFetch=()=>{window.fetch=originalFetch;};
+    Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace original').click();
+  })()`);
+  await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace'))`), 'replace confirmation did not appear');
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace').click()`);
+  await until(() => cdp.evaluate(`!document.querySelector('.trim-modal') && !!document.querySelector('.trim-job')`), 'replacement did not open background progress');
+  await cdp.evaluate(`window.__viceSmoke.socket.onmessage({data:JSON.stringify({type:'trim_progress',slug:'smoke',phase:'encoding',encoder:'h264_nvenc',progress:0.42})})`);
+  await until(() => cdp.evaluate(`document.querySelector('.trim-job')?.textContent.includes('42%') && document.querySelector('.trim-job progress')?.value===0.42`), 'background trim progress did not update');
+  const progressStyle = await cdp.evaluate(`(()=>{const p=document.querySelector('.trim-job progress');const s=getComputedStyle(p);return {height:p.getBoundingClientRect().height,radius:parseFloat(s.borderRadius)};})()`);
+  assert.equal(progressStyle.height, 8, 'trim progress bar must use the themed height');
+  assert(progressStyle.radius >= 4, `trim progress bar must be rounded: ${JSON.stringify(progressStyle)}`);
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.textContent.includes('Settings')).click()`);
+  await until(() => cdp.evaluate(`Boolean(document.querySelector('select[aria-label="Theme"]'))`), 'navigation was blocked by background trim');
+  await cdp.evaluate(`window.__viceSmoke.restoreFetch(); window.__viceSmoke.finishTrim()`);
+  await until(() => cdp.evaluate(`!document.querySelector('.trim-job')`), 'completed trim progress remained visible');
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.textContent.toLowerCase().includes('all clips')).click()`);
+  await until(() => cdp.evaluate(`Boolean(document.querySelector('.clip-card .clip-thumb'))`), 'clip gallery did not reopen');
+  await cdp.evaluate(`document.querySelector('.clip-card .clip-thumb').click()`);
+  await until(() => cdp.evaluate(`document.querySelector('.viewer-video')?.readyState >= 2`), 'viewer did not reopen after background trim');
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Trim').click()`);
+  await until(() => cdp.evaluate(`document.querySelector('.trim-video')?.readyState >= 2`), 'trim did not reopen');
+  await cdp.evaluate(`(()=>{
+    const originalFetch=window.fetch;
+    window.fetch=(url,init)=>String(url).endsWith('/trim')
+      ? new Promise(resolve=>{window.__viceSmoke.failTrim=()=>resolve(new Response(JSON.stringify({error:'GPU unavailable'}),{status:500,headers:{'Content-Type':'application/json'}}));})
+      : originalFetch(url,init);
+    window.__viceSmoke.restoreFetch=()=>{window.fetch=originalFetch;};
+    Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace original').click();
+  })()`);
+  await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace'))`), 'failure test confirmation did not appear');
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace').click()`);
+  await until(() => cdp.evaluate(`Boolean(document.querySelector('.trim-job'))`), 'failure test did not start a background job');
+  await cdp.evaluate(`window.__viceSmoke.restoreFetch(); window.__viceSmoke.failTrim()`);
+  await until(() => cdp.evaluate(`!document.querySelector('.trim-job') && document.body.textContent.includes('GPU unavailable')`), 'trim failure was not reported or job did not clear');
+  await cdp.evaluate(`document.querySelector('.clip-card .clip-thumb').click()`);
+  await until(() => cdp.evaluate(`document.querySelector('.viewer-video')?.readyState >= 2`), 'viewer did not reopen after failed trim');
   let discordEncoderShown = null;
   if (process.env.VICE_SMOKE_DISCORD_PROGRESS === '1') {
     await cdp.evaluate(`
@@ -595,7 +666,7 @@ esac
   console.log(JSON.stringify({ok: true, originalQuality: original, firstFrameMs, discordEncoderShown, viewerLayouts, lifecycle, liveTags, keyboardSeek, thumbnailRecovery, replayCache, codecSettings, deleteResponsiveness, playedBeforeConversionFinished: !original, rangeRequests: true, ...result, screenshot}, null, 2));
 } catch (error) {
   console.error(error);
-  if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,visibility:document.visibilityState,thumbnail:document.querySelector('.clip-card')?.getBoundingClientRect().toJSON(),body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,currentTime:v.currentTime,paused:v.paused,seeking:v.seeking,readyState:v.readyState,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }
+  if (cdp) { try { console.error('Page state:', await cdp.evaluate(`({url:location.href,visibility:document.visibilityState,seekEvents:window.__viceSmoke?.seekEvents,thumbnail:document.querySelector('.clip-card')?.getBoundingClientRect().toJSON(),body:document.body.innerText.slice(0,3000),videos:Array.from(document.querySelectorAll('video')).map(v=>({src:v.currentSrc,width:v.videoWidth,duration:v.duration,currentTime:v.currentTime,paused:v.paused,seeking:v.seeking,readyState:v.readyState,error:v.error&&{code:v.error.code,message:v.error.message}}))})`)); } catch {} }
   console.error('Daemon log:', daemonLog.slice(-5000));
   console.error('Browser log:', browserLog.slice(-3000));
   console.error('Browser activity:', JSON.stringify(activity));

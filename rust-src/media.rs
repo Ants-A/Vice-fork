@@ -531,9 +531,12 @@ where
             if let Some(rate) = source_kbps {
                 let rate = rate.max(500);
                 args.extend([
-                    "-b:v".into(), format!("{rate}k"),
-                    "-maxrate".into(), format!("{}k", rate * 3 / 2),
-                    "-bufsize".into(), format!("{}k", rate * 2),
+                    "-b:v".into(),
+                    format!("{rate}k"),
+                    "-maxrate".into(),
+                    format!("{}k", rate * 3 / 2),
+                    "-bufsize".into(),
+                    format!("{}k", rate * 2),
                 ]);
             }
         } else {
@@ -548,29 +551,22 @@ where
         args.extend(["-y".into(), target.to_string_lossy().into_owned()]);
         args
     };
-    // Most slider cuts start between keyframes. Do not copy an entire large
-    // interval only to discover at validation that it needs encoding anyway.
-    if starts_on_keyframe(source, start).await
-        && run(make(None)).await.is_ok()
-        && let Some(info) = validated_trim(target, duration).await
-    {
-        return Ok(info);
-    }
-    let encoders = Command::new("ffmpeg")
-        .args(["-hide_banner", "-encoders"])
-        .output()
-        .await?;
-    let available = String::from_utf8_lossy(&encoders.stdout);
     let preferred = match before.vcodec.as_str() {
-        "hevc" | "h265" if available.contains("libx265") => "libx265",
-        "av1" if available.contains("libsvtav1") => "libsvtav1",
+        "hevc" | "h265" => "libx265",
+        "av1" => "libsvtav1",
+        "vp8" => "libvpx",
+        "vp9" => "libvpx-vp9",
         _ => "libx264",
     };
-    let mut reason = String::new();
-    // Hardware support is confirmed by a real encode, then the selected cut
-    // is decoded before accepting it. A runtime GPU failure can safely fall
-    // through to the original software command without touching the source.
-    for args in crate::encoding::trim_command_candidates(&make(Some(preferred))).await {
+    let mut reason = "no compatible GPU encoder is available".to_owned();
+    // Probe hardware with a real encode and validate the output. If this GPU
+    // cannot encode the source codec, try H.264 on the GPU where the container
+    // supports it. Never silently fall back to software encoding.
+    let mut candidates = crate::encoding::trim_command_candidates(&make(Some(preferred))).await;
+    if preferred != "libx264" && !target.extension().is_some_and(|ext| ext == "webm") {
+        candidates.extend(crate::encoding::trim_command_candidates(&make(Some("libx264"))).await);
+    }
+    for args in candidates {
         let encoder = crate::encoding::video_encoder(&args)
             .unwrap_or("unknown")
             .to_owned();
@@ -587,44 +583,6 @@ where
         }
     }
     bail!("trim failed: {reason}")
-}
-async fn starts_on_keyframe(path: &Path, start: f64) -> bool {
-    if start <= 0.000_001 {
-        return true;
-    }
-    let interval = format!("{start:.6}%+#1");
-    let Ok(output) = capture(
-        "ffprobe",
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-read_intervals",
-            &interval,
-            "-show_entries",
-            "packet=pts_time,flags",
-            "-of",
-            "json",
-        ],
-        path,
-        2.0,
-    )
-    .await
-    else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return false;
-    };
-    let packet = &value["packets"][0];
-    packet["flags"]
-        .as_str()
-        .is_some_and(|flags| flags.contains('K'))
-        && packet["pts_time"]
-            .as_str()
-            .and_then(|v| v.parse::<f64>().ok())
-            .is_some_and(|pts| (pts - start).abs() < 0.000_5)
 }
 async fn validated_trim(path: &Path, expected: f64) -> Option<MediaInfo> {
     let Ok(info) = probe_media(path).await else {
@@ -682,6 +640,102 @@ async fn validated_trim(path: &Path, expected: f64) -> Option<MediaInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn failed_gpu_trim_preserves_source_and_never_retries_software() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.mp4");
+        let target = dir.path().join("temporary.mp4");
+        let original = b"original recording remains untouched";
+        std::fs::write(&source, original).unwrap();
+        let before = MediaInfo {
+            duration: 5.0,
+            vcodec: "h264".into(),
+            ..Default::default()
+        };
+        let attempted = std::sync::Mutex::new(Vec::new());
+        let result = trim_range_with_runner(
+            &source, &target, 1.0, 3.0, &before, &HashMap::new(), |args| {
+                attempted.lock().unwrap().push(
+                    crate::encoding::video_encoder(&args).unwrap_or("").to_owned(),
+                );
+                async { bail!("simulated GPU failure") }
+            },
+        ).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert!(!target.exists());
+        assert!(attempted.lock().unwrap().iter().all(|name| name != "libx264"));
+    }
+
+    /// Run explicitly on an NVIDIA host with `cargo test --lib
+    /// nvidia_trim_encodes_and_decodes_a_real_cut -- --ignored`. Unlike a
+    /// capability-list check, this exercises and validates a real selected cut.
+    #[tokio::test]
+    #[ignore = "requires a working NVIDIA NVENC device"]
+    async fn nvidia_trim_encodes_and_decodes_a_real_cut() {
+        assert!(
+            crate::encoding::video_candidates()
+                .await
+                .iter()
+                .any(|candidate| candidate.name() == "h264_nvenc"),
+            "no working NVIDIA h264_nvenc encoder was detected"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.mp4");
+        let target = dir.path().join("trim.mp4");
+        let fixture = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30",
+                "-t",
+                "3",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&source)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let before = probe_media(&source).await.unwrap();
+        let used_nvenc = std::sync::atomic::AtomicBool::new(false);
+        let info = trim_range_with_runner(
+            &source,
+            &target,
+            0.35,
+            2.1,
+            &before,
+            &HashMap::new(),
+            |args| {
+                let used_nvenc = &used_nvenc;
+                async move {
+                    if crate::encoding::video_encoder(&args) != Some("h264_nvenc") {
+                        bail!("test requires NVIDIA NVENC");
+                    }
+                    let output = run_command(&args, 30.0).await?;
+                    if !output.status.success() {
+                        bail!("{}", String::from_utf8_lossy(&output.stderr));
+                    }
+                    used_nvenc.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("NVIDIA trim failed");
+        assert!(used_nvenc.load(std::sync::atomic::Ordering::Relaxed));
+        assert!((info.duration - 1.75).abs() < 0.2);
+        assert_eq!(info.vcodec, "h264");
+    }
     #[test]
     fn legacy_cache_reuses_tags_and_duration_but_rejects_changed_content() {
         let root = tempfile::tempdir().unwrap();

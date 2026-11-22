@@ -77,11 +77,11 @@ fn trim_uses_available_gpu_and_preserves_selected_frames_and_audio() -> Result<(
     run_case("actual")
 }
 #[test]
-fn unsupported_gpu_decode_retries_gpu_encoding_before_cpu() -> Result<()> {
+fn unsupported_gpu_decode_retries_with_gpu_encoding() -> Result<()> {
     run_case("decode-fails")
 }
 #[test]
-fn unavailable_gpu_encoder_falls_back_without_changing_source() -> Result<()> {
+fn unavailable_gpu_encoder_fails_without_changing_source() -> Result<()> {
     run_case("encode-fails")
 }
 
@@ -177,7 +177,12 @@ exec "$VICE_REAL_FFMPEG" "$@"
         attempts.iter().all(|args| encoder(args) != "copy"),
         "a cut between keyframes must skip stream copy"
     );
-    if mode == "decode-fails" {
+    if mode == "actual" && report["hardware"].as_array().unwrap().is_empty() {
+        assert!(
+            attempts.is_empty(),
+            "a missing GPU must not trigger software encoding"
+        );
+    } else if mode == "decode-fails" {
         assert_eq!(attempts.len(), 2);
         assert_eq!(encoder(&attempts[0]), "h264_nvenc");
         assert!(
@@ -196,10 +201,9 @@ exec "$VICE_REAL_FFMPEG" "$@"
                 .any(|arg| arg == "-hwaccel")
         );
     } else if mode == "encode-fails" {
-        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts.len(), 2);
         assert_eq!(encoder(&attempts[0]), "h264_nvenc");
         assert_eq!(encoder(&attempts[1]), "h264_nvenc");
-        assert_eq!(encoder(&attempts[2]), "libx264");
     } else if let Some(first) = report["hardware"].as_array().unwrap().first() {
         assert_eq!(encoder(&attempts[0]), first.as_str().unwrap());
         assert!(
@@ -246,7 +250,27 @@ async fn trim_child() -> Result<()> {
                 Ok(())
             }
         })
-        .await?;
+        .await;
+    let mode = std::env::var("VICE_TEST_TRIM_MODE")?;
+    let hardware: Vec<_> = encoding::video_candidates()
+        .await
+        .into_iter()
+        .filter(|encoder| encoder.is_hardware())
+        .map(|encoder| encoder.name().to_owned())
+        .collect();
+    if mode == "encode-fails" || (mode == "actual" && hardware.is_empty()) {
+        assert!(
+            result.is_err(),
+            "failed GPU encodes must not fall back to CPU"
+        );
+        assert!(!target.exists());
+        std::fs::write(
+            root.join("report.json"),
+            serde_json::to_vec(&json!({"attempts":*attempts.lock().unwrap(),"hardware":hardware}))?,
+        )?;
+        return Ok(());
+    }
+    let result = result?;
     assert!((result.duration - 1.5).abs() < 0.1, "{}", result.duration);
     assert_eq!(result.audio_streams, 2);
     assert_eq!((result.width, result.height), (320, 180));
@@ -325,12 +349,6 @@ async fn trim_child() -> Result<()> {
         (1.8..2.2).contains(&ratio),
         "both distinct audio tracks must survive: {crossings:?}"
     );
-    let hardware: Vec<_> = encoding::video_candidates()
-        .await
-        .into_iter()
-        .filter(|encoder| encoder.is_hardware())
-        .map(|encoder| encoder.name().to_owned())
-        .collect();
     std::fs::write(
         root.join("report.json"),
         serde_json::to_vec(
@@ -341,7 +359,7 @@ async fn trim_child() -> Result<()> {
 }
 
 #[tokio::test]
-async fn hevc_trim_keeps_codec_and_limits_reencode_bitrate() -> Result<()> {
+async fn hevc_trim_uses_gpu_and_limits_reencode_bitrate() -> Result<()> {
     let Some(ffmpeg) = vice::runtime::which("ffmpeg") else {
         return Ok(());
     };
@@ -361,7 +379,7 @@ async fn hevc_trim_keeps_codec_and_limits_reencode_bitrate() -> Result<()> {
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=160x90:rate=20:duration=3",
+            "testsrc2=size=320x180:rate=20:duration=3",
             "-c:v",
             "libx265",
             "-x265-params",
@@ -397,9 +415,19 @@ async fn hevc_trim_keeps_codec_and_limits_reencode_bitrate() -> Result<()> {
             }
         },
     )
-    .await?;
-    assert_eq!(info.vcodec, "hevc");
+    .await;
     let attempts = attempts.lock().unwrap();
+    if attempts.is_empty() {
+        assert!(info.is_err(), "trimming without a GPU must fail");
+        return Ok(());
+    }
+    let info = info?;
+    assert!(info.vcodec == "hevc" || info.vcodec == "h264");
+    assert!(
+        attempts
+            .iter()
+            .all(|args| !matches!(encoding::video_encoder(args), Some("libx264" | "libx265")))
+    );
     assert!(attempts.iter().any(
         |args| args.iter().any(|arg| arg == "-b:v") && args.iter().any(|arg| arg == "-maxrate")
     ));

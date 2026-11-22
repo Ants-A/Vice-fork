@@ -630,10 +630,10 @@ fn rewrite_discord_args(args: &[String], encoder: &VideoEncoder) -> Result<Vec<S
 
 /// Plain cuts have no software filters: keep decoded frames on the same GPU
 /// used by the encoder. Unsupported input codecs/bit depths retry GPU encoding
-/// with software decoding, then the original CPU command.
+/// with software decoding. Never append a software video encoder.
 pub async fn trim_command_candidates(args: &[String]) -> Vec<Vec<String>> {
     let Some(family) = job_family(args) else {
-        return vec![args.to_vec()];
+        return vec![];
     };
     let mut commands = vec![];
     for encoder in probed(family)
@@ -648,7 +648,6 @@ pub async fn trim_command_candidates(args: &[String]) -> Vec<Vec<String>> {
             commands.push(command);
         }
     }
-    commands.push(args.to_vec());
     commands
 }
 fn rewrite_trim_args(args: &[String], encoder: &VideoEncoder) -> Result<Vec<String>> {
@@ -1546,6 +1545,24 @@ mod tests {
         ] {
             assert!(!has_supported_video_codec(&args));
             assert_eq!(command_candidates(&args).await, vec![args]);
+        }
+    }
+    #[tokio::test]
+    async fn trim_candidates_never_include_a_software_encoder() {
+        let unsupported = strings(&["ffmpeg", "-i", "in.mp4", "-c:v", "copy", "out.mp4"]);
+        assert!(trim_command_candidates(&unsupported).await.is_empty());
+        for codec in ["libx264", "libx265", "libsvtav1", "libvpx", "libvpx-vp9"] {
+            let args = strings(&["ffmpeg", "-i", "in.mp4", "-c:v", codec, "out.mp4"]);
+            for command in trim_command_candidates(&args).await {
+                let name = video_encoder(&command).unwrap();
+                assert!(
+                    name.ends_with("_nvenc")
+                        || name.ends_with("_vaapi")
+                        || name.ends_with("_qsv")
+                        || name.ends_with("_vulkan"),
+                    "unexpected software candidate: {name}"
+                );
+            }
         }
     }
     #[tokio::test]

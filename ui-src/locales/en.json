@@ -369,7 +369,7 @@
     "errTrim": "Could not trim the clip",
     "preview": "Preview",
     "stop": "Stop",
-    "loopHelp": "Loops the selection. Cut bounds are lossless.",
+    "loopHelp": "Loops the selection.",
     "encodingProgress": "Encoding · {encoder}",
     "uploading": "Copying to library",
     "finishing": "Finishing…",

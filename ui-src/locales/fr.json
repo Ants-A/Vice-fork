@@ -340,7 +340,7 @@
     "errTrim": "Impossible de découper le clip",
     "preview": "Aperçu",
     "stop": "Arrêter",
-    "loopHelp": "Lit la sélection en boucle. Les bornes de coupe sont sans perte.",
+    "loopHelp": "Lit la sélection en boucle.",
     "saving": "Enregistrement",
     "preparingPreview": "Préparation de l’aperçu…",
     "openInPlayer": "Ouvrir dans le lecteur système",

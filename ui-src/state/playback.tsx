@@ -20,6 +20,7 @@ import {Viewer} from '../components/Viewer';
 import {useRenameClip} from './clipActions';
 import {useStore} from './store';
 import {t} from '../lib/i18n';
+import {onWsMessage} from '../lib/ws';
 
 interface Playback {
   thumbnailsPaused: boolean;
@@ -45,6 +46,12 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
   const [confirmDelete, setConfirmDelete] = useState<Clip | null>(null);
   const [manualCopy, setManualCopy] = useState<string | null>(null);
   const [shareSlug, setShareSlug] = useState<string | null>(null);
+  const [trimJobs, setTrimJobs] = useState<Record<string, {name: string; progress: number | null; phase?: string}>>({});
+  const trimJobsRef = useRef(new Set<string>());
+  useEffect(() => onWsMessage(msg => {
+    if (msg.type !== 'trim_progress' || !Number.isFinite(msg.progress)) return;
+    setTrimJobs(jobs => jobs[msg.slug] ? {...jobs, [msg.slug]: {...jobs[msg.slug], progress: Math.max(0, Math.min(1, msg.progress)), phase: msg.phase}} : jobs);
+  }), []);
 
   const viewerClip = clips.find(c => c.slug === viewerSlug) ?? null;
   const trimClip = clips.find(c => c.slug === trimSlug) ?? null;
@@ -67,7 +74,14 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
     return () => {live = false;};
   }, [viewerSlug, dispatch]);
 
-  const openTrim = useCallback((slug: string) => {stopHoverPreview(); setTrimSlug(slug);}, []);
+  const openTrim = useCallback((slug: string) => {
+    if (trimJobsRef.current.has(slug)) {
+      notify({kind: 'info', title: t('trim.saving'), tone: 'accent', holdMs: 3500});
+      return;
+    }
+    stopHoverPreview();
+    setTrimSlug(slug);
+  }, [notify]);
 
   // Highlights belong to the clip on screen, so they reload whenever it does.
   useEffect(() => {
@@ -138,6 +152,23 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
     [notify],
   );
 
+  const replaceTrim = useCallback((clip: Clip, start: number, end: number, name: string | null) => {
+    if (trimJobsRef.current.has(clip.slug)) return;
+    trimJobsRef.current.add(clip.slug);
+    setTrimJobs(jobs => ({...jobs, [clip.slug]: {name: clipTitle(clip), progress: null}}));
+    setTrimSlug(null);
+    setViewerSlug(null);
+    void api.trimClip(clip.slug, start, end, false).then(async () => {
+      if (name && name !== clipTitle(clip)) rename(clip, name);
+      say(t('trim.saved'), name ?? clipTitle(clip));
+      await refreshClips().catch(err => console.debug('Refreshing clips after trim failed', err));
+    }).catch((err: Error) => say(t('trim.errTrim'), err.message || t('trim.failed'), 'error'))
+      .finally(() => {
+        trimJobsRef.current.delete(clip.slug);
+        setTrimJobs(jobs => {const next = {...jobs}; delete next[clip.slug]; return next;});
+      });
+  }, [rename, say, refreshClips]);
+
   const reveal = useCallback(
     (clip: Clip) => void api.revealClip(clip.slug).catch(fail(t('viewer.errReveal'))),
     [fail],
@@ -178,6 +209,15 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
     <PlaybackContext.Provider value={value}>
       {children}
 
+      <div className="trim-jobs" aria-live="polite">
+        {Object.entries(trimJobs).map(([slug, job]) => (
+          <div className="trim-job" key={slug} role="status">
+            <span>{job.name} · {job.phase === 'uploading' ? t('trim.uploading') : t('trim.saving')}{job.progress !== null ? ` · ${Math.floor(job.progress * 100)}%` : ''}</span>
+            <progress max={1} value={job.progress ?? undefined} />
+          </div>
+        ))}
+      </div>
+
       <Viewer
         clip={viewerClip}
         clips={clips}
@@ -185,7 +225,7 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
         onHighlightsChange={setHighlights}
         onSelect={setViewerSlug}
         onClose={() => setViewerSlug(null)}
-        onTrim={clip => setTrimSlug(clip.slug)}
+        onTrim={clip => openTrim(clip.slug)}
         trimOpen={trimSlug !== null}
         onRename={rename}
         onShare={share}
@@ -213,6 +253,7 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
         onRename={rename}
         onReveal={reveal}
         onOpenExternally={openExternally}
+        onReplace={replaceTrim}
       />
 
       <Modal

@@ -15,6 +15,9 @@ fn available() -> bool {
             .is_ok()
 }
 async fn make_video(path: &Path, fragmented: bool) -> Result<()> {
+    make_video_size(path, fragmented, "128x72").await
+}
+async fn make_video_size(path: &Path, fragmented: bool, size: &str) -> Result<()> {
     let mut args = vec![
         "ffmpeg".into(),
         "-hide_banner".into(),
@@ -23,7 +26,7 @@ async fn make_video(path: &Path, fragmented: bool) -> Result<()> {
         "-f".into(),
         "lavfi".into(),
         "-i".into(),
-        "testsrc=duration=1:size=128x72:rate=10".into(),
+        format!("testsrc=duration=1:size={size}:rate=10"),
         "-f".into(),
         "lavfi".into(),
         "-i".into(),
@@ -148,8 +151,22 @@ async fn trim_between_keyframes_starts_at_selected_frame_and_keeps_audio() -> Re
     }
     let tmp = tempfile::tempdir()?;
     let input = tmp.path().join("input.mp4");
-    make_video(&input, false).await?;
+    make_video_size(&input, false, "320x180").await?;
     let output = tmp.path().join("trim.mp4");
+    if !vice::encoding::video_candidates()
+        .await
+        .iter()
+        .any(|encoder| encoder.is_hardware())
+    {
+        assert!(
+            media::trim_range(&input, &output, 0.25, 0.75)
+                .await
+                .is_err(),
+            "trim must not silently use a CPU encoder"
+        );
+        assert!(media::probe_media(&input).await?.duration > 0.9);
+        return Ok(());
+    }
     media::trim_range(&input, &output, 0.25, 0.75).await?;
     let info = media::probe_media(&output).await?;
     assert!(

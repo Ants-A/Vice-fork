@@ -38,6 +38,7 @@ export function TrimModal({
   onRename,
   onReveal,
   onOpenExternally,
+  onReplace,
 }: {
   clip: Clip | null;
   /** Shown on the timeline when they belong to this clip. */
@@ -48,6 +49,7 @@ export function TrimModal({
   onRename: (clip: Clip, name: string) => void;
   onReveal: (clip: Clip) => void;
   onOpenExternally: (clip: Clip) => void;
+  onReplace: (clip: Clip, start: number, end: number, name: string | null) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -226,6 +228,11 @@ export function TrimModal({
 
   const save = async (copy: boolean) => {
     if (previewing) stopPreview();
+    if (!copy) {
+      onReplace(clip, selection.start, selection.end, pendingName);
+      setPendingName(null);
+      return;
+    }
     setSaving(true);
     setSaveProgress(null);
     setError(null);
