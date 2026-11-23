@@ -5,6 +5,7 @@ import {useStore} from '../state/store';
 import {api} from '../lib/api';
 import {usePlaylistDropTarget} from '../lib/clipDrag';
 import {formatDuration} from '../lib/format';
+import {useFavorites} from '../lib/favorites';
 import {PlaylistModal, type PlaylistDraft} from './PlaylistModal';
 import {t} from '../lib/i18n';
 import {ContextMenu} from './ContextMenu';
@@ -62,6 +63,11 @@ export function SideNav({
   const [editing, setEditing] = useState<Playlist | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Playlist | null>(null);
   const {view, currentPlaylistId, searchQuery, playlists, clips, images, config} = state;
+  const favorites = useFavorites();
+  const favoriteClips = new Set(favorites.clips);
+  const favoriteImages = new Set(favorites.images);
+  const favoriteClipCount = clips.filter(clip => favoriteClips.has(clip.slug)).length;
+  const favoriteImageCount = images.filter(image => favoriteImages.has(image.slug)).length;
 
   const buffer = config?.recording?.buffer_duration as number | undefined;
 
@@ -109,6 +115,12 @@ export function SideNav({
                 ) : null}
                 {target === 'images' && images.length > 0 ? (
                   <span className="nav-count">{images.length}</span>
+                ) : null}
+                {target === 'favorite-clips' ? (
+                  <span className="nav-count">{favoriteClipCount}</span>
+                ) : null}
+                {target === 'favorite-images' ? (
+                  <span className="nav-count">{favoriteImageCount}</span>
                 ) : null}
               </button>
             </li>
