@@ -1,3 +1,4 @@
+import {useFavorites} from '../lib/favorites';
 import {useStore} from '../state/store';
 import {useImageActions} from '../state/imageActions';
 import {t} from '../lib/i18n';
@@ -9,10 +10,13 @@ import {ImageCard} from '../components/ImageCard';
  * moving between the two sections changes only what is on the tiles.
  */
 export function Images() {
-  const {state, visibleImages} = useStore();
+  const {state, visibleImages: allVisibleImages} = useStore();
+  const favorites = useFavorites();
+  const favoriteView = state.view === 'favorite-images';
+  const visibleImages = favoriteView ? allVisibleImages.filter(image => favorites.images.includes(image.slug)) : allVisibleImages;
   const {searchQuery, config} = state;
 
-  const {actions, overlays} = useImageActions();
+  const {actions, overlays} = useImageActions(favoriteView ? visibleImages : undefined);
 
   const count = visibleImages.length;
   const query = searchQuery.trim();
@@ -24,7 +28,7 @@ export function Images() {
     <div className="clips">
       <header className="clips-head">
         <div className="clips-title">
-          <h1>{t('images.heading')}</h1>
+          <h1>{t(favoriteView ? 'favorites.images' : 'images.heading')}</h1>
           <p>
             {query ? t('images.countMatches', {count, query}) : t('images.countImages', {count})}
           </p>
@@ -35,7 +39,9 @@ export function Images() {
         <p className="home-empty">
           {query
             ? t('images.emptySearch', {query})
-            : bound
+            : favoriteView
+              ? t('favorites.emptyImages')
+              : bound
               ? t('images.emptyLibrary', {hotkey: hotkeyLabel(bound)})
               : t('images.emptyNoKey')}
         </p>

@@ -24,6 +24,7 @@ import {
   IconPlus,
   IconSearch,
   IconSettings,
+  IconStar,
 } from './Icons';
 
 // Keys rather than text: this is module level, so a t() call here would be
@@ -31,7 +32,9 @@ import {
 const NAV: {view: ViewName; labelKey: string; Icon: typeof IconHome}[] = [
   {view: 'home', labelKey: 'nav.home', Icon: IconHome},
   {view: 'clips', labelKey: 'nav.allClips', Icon: IconClips},
+  {view: 'favorite-clips', labelKey: 'favorites.clips', Icon: IconStar},
   {view: 'images', labelKey: 'nav.images', Icon: IconImages},
+  {view: 'favorite-images', labelKey: 'favorites.images', Icon: IconStar},
   {view: 'editor', labelKey: 'nav.editor', Icon: IconEditor},
   {view: 'settings', labelKey: 'nav.settings', Icon: IconSettings},
   {view: 'about', labelKey: 'nav.about', Icon: IconAbout},
@@ -78,7 +81,7 @@ export function SideNav({
           aria-label={t('nav.search')}
           onChange={e => {
             dispatch({type: 'setSearch', query: e.target.value});
-            if (e.target.value && view !== 'clips') dispatch({type: 'setView', view: 'clips'});
+            if (e.target.value && !['clips', 'images', 'favorite-clips', 'favorite-images'].includes(view)) dispatch({type: 'setView', view: 'clips'});
           }}
         />
       </div>
@@ -90,7 +93,7 @@ export function SideNav({
             <li key={target}>
               <button
                 type="button"
-                className="nav-item"
+                className={`nav-item${target.startsWith('favorite-') ? ' nav-subitem' : ''}`}
                 aria-current={active ? 'page' : undefined}
                 onClick={() =>
                   dispatch({

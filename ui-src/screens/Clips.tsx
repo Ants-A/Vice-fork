@@ -1,3 +1,4 @@
+import {useFavorites} from '../lib/favorites';
 import {PlaylistMark} from '../components/PlaylistMark';
 import {useEffect, useRef, useState} from 'react';
 
@@ -20,7 +21,7 @@ export function Clips() {
   const {
     state,
     dispatch,
-    visibleClips,
+    visibleClips: allVisibleClips,
     visibleImages,
     hotkey,
     notify,
@@ -28,6 +29,9 @@ export function Clips() {
     refreshImages,
     refreshPlaylists,
   } = useStore();
+  const favorites = useFavorites();
+  const favoriteView = state.view === 'favorite-clips';
+  const visibleClips = favoriteView ? allVisibleClips.filter(clip => favorites.clips.includes(clip.slug)) : allVisibleClips;
   const {playlists, currentPlaylistId, searchQuery, recentNew, status, config} = state;
 
   const playlist = currentPlaylistId
@@ -52,12 +56,12 @@ export function Clips() {
 
   useEffect(() => {
     setClipLimit(CLIP_PAGE);
-  }, [currentPlaylistId, searchQuery]);
+  }, [currentPlaylistId, searchQuery, state.view]);
 
   useEffect(() => {
     // Kept-alive galleries have zero bounds when another screen is visible.
     // Treating those bounds as a near-bottom scroll builds the entire library.
-    if (state.view !== 'clips') return;
+    if (state.view !== 'clips' && state.view !== 'favorite-clips') return;
     const node = loadMoreRef.current;
     if (!node) return;
     const root = node.closest('.frame-content');
@@ -149,7 +153,7 @@ export function Clips() {
     setEditingPlaylist(null);
   };
 
-  const title = playlist ? playlist.name : t('clips.allClips');
+  const title = favoriteView ? t('favorites.clips') : playlist ? playlist.name : t('clips.allClips');
   const count = visibleClips.length;
   const query = searchQuery.trim();
   const subtitle = query
@@ -220,7 +224,9 @@ export function Clips() {
         <p className="home-empty">
           {query
             ? t('clips.emptySearch', {query})
-            : playlist
+            : favoriteView
+              ? t('favorites.emptyClips')
+              : playlist
               ? t('clips.emptyPlaylist')
               : t('clips.emptyLibrary', {
                   hotkey,

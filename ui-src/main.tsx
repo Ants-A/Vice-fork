@@ -132,19 +132,19 @@ function Screen({view}: {view: string}) {
   // not throw the whole grid away and build it again on every visit.
   const [clipsMounted, setClipsMounted] = useState(view === 'clips');
   useEffect(() => {
-    if (view === 'clips') setClipsMounted(true);
+    if (view === 'clips' || view === 'favorite-clips') setClipsMounted(true);
   }, [view]);
 
-  const known = ['home', 'clips', 'images', 'settings', 'editor'];
+  const known = ['home', 'clips', 'favorite-clips', 'images', 'favorite-images', 'settings', 'editor'];
   return (
     <>
       {view === 'home' ? <Home /> : null}
-      {clipsMounted || view === 'clips' ? (
-        <div className="screen-keepalive" hidden={view !== 'clips'}>
+      {clipsMounted || view === 'clips' || view === 'favorite-clips' ? (
+        <div className="screen-keepalive" hidden={view !== 'clips' && view !== 'favorite-clips'}>
           <Clips />
         </div>
       ) : null}
-      {view === 'images' ? <Images /> : null}
+      {view === 'images' || view === 'favorite-images' ? <Images /> : null}
       {view === 'settings' ? <Settings /> : null}
       {view === 'editor' ? <Editor /> : null}
       {!known.includes(view) ? <About /> : null}

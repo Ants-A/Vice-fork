@@ -203,7 +203,7 @@ export type WsMessage =
   | ({type: 'gsr_install'} & GsrInstall)
   | {type: 'config_changed'};
 
-export type ViewName = 'home' | 'clips' | 'images' | 'editor' | 'settings' | 'about';
+export type ViewName = 'home' | 'clips' | 'favorite-clips' | 'images' | 'favorite-images' | 'editor' | 'settings' | 'about';
 
 /** The filename without its extension, which is what every screen shows. */
 export function clipTitle(clip: Clip): string {

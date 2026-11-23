@@ -1,3 +1,4 @@
+import {moveFavorite} from '../lib/favorites';
 import {applyPlaylistGames} from '../lib/playlistGames';
 import {ListSnapshots} from '../lib/listSnapshots';
 import {PendingDeletes} from '../lib/pendingDeletes';
@@ -691,6 +692,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
   const deleteClip = useCallback((slug: string) => {
     stopHoverPreview();
     return deletions.current!.run(`clip:${slug}`, () => api.deleteClip(slug), () => {
+      moveFavorite('clips', slug, null);
       clipSnapshots.current.observe(slug, null);
       dispatch({type: 'ws', msg: {type: 'clip_deleted', slug}});
     });
@@ -698,6 +700,7 @@ export function StoreProvider({children}: {children: ReactNode}) {
 
   const deleteImage = useCallback((slug: string) =>
     deletions.current!.run(`image:${slug}`, () => api.deleteImage(slug), () => {
+      moveFavorite('images', slug, null);
       imageSnapshots.current.observe(slug, null);
       dispatch({type: 'ws', msg: {type: 'image_deleted', slug}});
     }), []);

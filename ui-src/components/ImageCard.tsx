@@ -1,3 +1,5 @@
+import {useFavorites, toggleFavorite} from '../lib/favorites';
+import {IconStar} from './Icons';
 import {useThumbnail} from '../lib/useThumbnail';
 import {useState} from 'react';
 
@@ -35,6 +37,7 @@ export function ImageCard({
   actions?: ImageActionSet;
   draggable?: boolean;
 }) {
+  const favorite = useFavorites().images.includes(image.slug);
   const [renamingHere, setRenamingHere] = useState(false);
   const thumbnail = useThumbnail(image.thumb_url ?? undefined);
   const renaming = renamingHere || actions.renamingSlug === image.slug;
@@ -85,6 +88,13 @@ export function ImageCard({
         <span className="clip-badges">
           {isNew ? <span className="clip-badge clip-badge-new">{t('common.new')}</span> : null}
         </span>
+      </button>
+
+      <button type="button" className="favorite-button" aria-pressed={favorite}
+        aria-label={t(favorite ? 'favorites.remove' : 'favorites.add')}
+        title={t(favorite ? 'favorites.remove' : 'favorites.add')}
+        onClick={() => toggleFavorite('images', image.slug)}>
+        <IconStar size={18} />
       </button>
 
       <div className="clip-body">

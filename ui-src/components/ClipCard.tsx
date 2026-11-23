@@ -1,3 +1,5 @@
+import {useFavorites, toggleFavorite} from '../lib/favorites';
+import {IconStar} from './Icons';
 import {useThumbnail} from '../lib/useThumbnail';
 import {startHoverPreview, stopHoverPreview} from '../lib/hoverPreview';
 import {memo, useEffect, useRef, useState} from 'react';
@@ -49,6 +51,7 @@ export const ClipCard = memo(function ClipCard({
   const [previewFailed, setPreviewFailed] = useState(false);
   const [hovered, setHovered] = useState(false);
   const [previewReady, setPreviewReady] = useState(false);
+  const favorite = useFavorites().clips.includes(clip.slug);
   const [renamingHere, setRenamingHere] = useState(false);
   const thumbnail = useThumbnail(clip.thumb_url, !clip.unreadable);
   const renaming = renamingHere || actions.renamingSlug === clip.slug;
@@ -159,6 +162,13 @@ export const ClipCard = memo(function ClipCard({
         {clip.duration && !broken ? (
           <span className="clip-duration">{formatDuration(Math.round(clip.duration), true)}</span>
         ) : null}
+      </button>
+
+      <button type="button" className="favorite-button" aria-pressed={favorite}
+        aria-label={t(favorite ? 'favorites.remove' : 'favorites.add')}
+        title={t(favorite ? 'favorites.remove' : 'favorites.add')}
+        onClick={() => toggleFavorite('clips', clip.slug)}>
+        <IconStar size={18} />
       </button>
 
       <div className="clip-body">

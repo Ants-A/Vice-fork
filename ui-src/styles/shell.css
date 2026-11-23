@@ -666,3 +666,5 @@
   line-height: 1.5;
   color: var(--color-text-disabled);
 }
+
+.nav-subitem { padding-left: calc(var(--spacing-3) + 16px); font-size: 13px; }
