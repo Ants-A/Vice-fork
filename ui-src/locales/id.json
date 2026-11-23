@@ -341,6 +341,7 @@
     "shrinkHint": "Kembali ke ukuran normal (F, atau Esc)"
   },
   "trim": {
+    "queued": "Dalam antrean",
     "saved": "Klip dipangkas dan disimpan",
     "failed": "Pemangkasan gagal",
     "errTrim": "Tidak dapat memangkas klip",

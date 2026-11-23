@@ -34,6 +34,8 @@ const post = <T>(path: string, body?: unknown) =>
  * (#138); the daemon builds `video_url` and `thumb_url` already encoded.
  */
 const enc = (segment: string) => encodeURIComponent(segment);
+let trimJobSequence = 0;
+export const newTrimJobId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${++trimJobSequence}`;
 
 export const api = {
   matugenColor: () => request<{color: string}>('/api/matugen-color'),
@@ -105,8 +107,8 @@ export const api = {
       `/api/clips/${enc(slug)}/discord`,
     ),
   /** With `copy` the selection becomes a new clip and the original is kept. */
-  trimClip: (slug: string, start: number, end: number, copy = false) =>
-    post<{slug: string; copy?: boolean}>(`/api/clips/${enc(slug)}/trim`, {start, end, copy}),
+  trimClip: (slug: string, start: number, end: number, copy = false, jobId?: string) =>
+    post<{slug: string; copy?: boolean}>(`/api/clips/${enc(slug)}/trim`, {start, end, copy, job_id: jobId}),
   markViewed: (slug: string) => post<{ok?: boolean; views: number}>(`/api/clips/${enc(slug)}/view`),
   /** Save the frame at `time` as a screenshot. Also puts it on the clipboard. */
   saveFrame: (slug: string, time: number) =>

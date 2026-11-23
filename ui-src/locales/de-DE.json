@@ -335,6 +335,7 @@
     "shrinkHint": "Zurück zur normalen Größe (F oder Esc)"
   },
   "trim": {
+    "queued": "In Warteschlange",
     "saved": "Clip gekürzt und gespeichert",
     "failed": "Kürzen fehlgeschlagen",
     "errTrim": "Clip konnte nicht gekürzt werden",

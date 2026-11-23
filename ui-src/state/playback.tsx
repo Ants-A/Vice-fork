@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from 'react';
 
-import {api} from '../lib/api';
+import {api, newTrimJobId} from '../lib/api';
 import {copyShareLink, shareButtonLabel, shareClip as runShare} from '../lib/share';
 import {clipTitle, type Clip, type Highlight} from '../lib/types';
 import {Modal} from '../components/Modal';
@@ -46,11 +46,11 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
   const [confirmDelete, setConfirmDelete] = useState<Clip | null>(null);
   const [manualCopy, setManualCopy] = useState<string | null>(null);
   const [shareSlug, setShareSlug] = useState<string | null>(null);
-  const [trimJobs, setTrimJobs] = useState<Record<string, {name: string; progress: number | null; phase?: string}>>({});
-  const trimJobsRef = useRef(new Set<string>());
+  const [trimJobs, setTrimJobs] = useState<Record<string, {name: string; progress: number | null; phase?: string; encoder?: string}>>({});
   useEffect(() => onWsMessage(msg => {
-    if (msg.type !== 'trim_progress' || !Number.isFinite(msg.progress)) return;
-    setTrimJobs(jobs => jobs[msg.slug] ? {...jobs, [msg.slug]: {...jobs[msg.slug], progress: Math.max(0, Math.min(1, msg.progress)), phase: msg.phase}} : jobs);
+    if (msg.type !== 'trim_progress' || !msg.job_id || !Number.isFinite(msg.progress)) return;
+    const id = msg.job_id;
+    setTrimJobs(jobs => jobs[id] ? {...jobs, [id]: {...jobs[id], progress: Math.max(0, Math.min(1, msg.progress)), phase: msg.phase, encoder: msg.encoder}} : jobs);
   }), []);
 
   const viewerClip = clips.find(c => c.slug === viewerSlug) ?? null;
@@ -74,14 +74,7 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
     return () => {live = false;};
   }, [viewerSlug, dispatch]);
 
-  const openTrim = useCallback((slug: string) => {
-    if (trimJobsRef.current.has(slug)) {
-      notify({kind: 'info', title: t('trim.saving'), tone: 'accent', holdMs: 3500});
-      return;
-    }
-    stopHoverPreview();
-    setTrimSlug(slug);
-  }, [notify]);
+  const openTrim = useCallback((slug: string) => {stopHoverPreview(); setTrimSlug(slug);}, []);
 
   // Highlights belong to the clip on screen, so they reload whenever it does.
   useEffect(() => {
@@ -153,19 +146,17 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
   );
 
   const replaceTrim = useCallback((clip: Clip, start: number, end: number, name: string | null) => {
-    if (trimJobsRef.current.has(clip.slug)) return;
-    trimJobsRef.current.add(clip.slug);
-    setTrimJobs(jobs => ({...jobs, [clip.slug]: {name: clipTitle(clip), progress: null}}));
+    const jobId = newTrimJobId();
+    setTrimJobs(jobs => ({...jobs, [jobId]: {name: clipTitle(clip), progress: null, phase: 'queued'}}));
     setTrimSlug(null);
     setViewerSlug(null);
-    void api.trimClip(clip.slug, start, end, false).then(async () => {
+    void api.trimClip(clip.slug, start, end, false, jobId).then(async () => {
       if (name && name !== clipTitle(clip)) rename(clip, name);
       say(t('trim.saved'), name ?? clipTitle(clip));
       await refreshClips().catch(err => console.debug('Refreshing clips after trim failed', err));
     }).catch((err: Error) => say(t('trim.errTrim'), err.message || t('trim.failed'), 'error'))
       .finally(() => {
-        trimJobsRef.current.delete(clip.slug);
-        setTrimJobs(jobs => {const next = {...jobs}; delete next[clip.slug]; return next;});
+        setTrimJobs(jobs => {const next = {...jobs}; delete next[jobId]; return next;});
       });
   }, [rename, say, refreshClips]);
 
@@ -210,10 +201,10 @@ export function PlaybackProvider({children}: {children: ReactNode}) {
       {children}
 
       <div className="trim-jobs" aria-live="polite">
-        {Object.entries(trimJobs).map(([slug, job]) => (
-          <div className="trim-job" key={slug} role="status">
-            <span>{job.name} · {job.phase === 'uploading' ? t('trim.uploading') : t('trim.saving')}{job.progress !== null ? ` · ${Math.floor(job.progress * 100)}%` : ''}</span>
-            <progress max={1} value={job.progress ?? undefined} />
+        {Object.entries(trimJobs).map(([jobId, job]) => (
+          <div className="trim-job" key={jobId} role="status">
+            <span>{job.name} · {job.phase === 'queued' ? t('trim.queued') : job.phase === 'uploading' ? t('trim.uploading') : job.encoder ? t('trim.encodingProgress', {encoder: job.encoder}) : t('trim.saving')}{job.phase !== 'queued' && job.progress !== null ? ` · ${Math.floor(job.progress * 100)}%` : ''}</span>
+            <progress max={1} value={job.phase === 'queued' ? undefined : job.progress ?? undefined} />
           </div>
         ))}
       </div>

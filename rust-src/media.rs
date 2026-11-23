@@ -562,24 +562,26 @@ where
     // Probe hardware with a real encode and validate the output. If this GPU
     // cannot encode the source codec, try H.264 on the GPU where the container
     // supports it. Never silently fall back to software encoding.
-    let mut candidates = crate::encoding::trim_command_candidates(&make(Some(preferred))).await;
+    let mut families = vec![preferred];
     if preferred != "libx264" && !target.extension().is_some_and(|ext| ext == "webm") {
-        candidates.extend(crate::encoding::trim_command_candidates(&make(Some("libx264"))).await);
+        families.push("libx264");
     }
-    for args in candidates {
-        let encoder = crate::encoding::video_encoder(&args)
-            .unwrap_or("unknown")
-            .to_owned();
-        tracing::info!(%encoder, gpu_decode=args.iter().any(|arg| arg == "-hwaccel"), "Trimming video");
-        match run(args).await {
-            Ok(()) => {
-                if let Some(info) = validated_trim(target, duration).await {
-                    return Ok(info);
+    for family in families {
+        for args in crate::encoding::trim_command_candidates(&make(Some(family))).await {
+            let encoder = crate::encoding::video_encoder(&args)
+                .unwrap_or("unknown")
+                .to_owned();
+            tracing::info!(%encoder, gpu_decode=args.iter().any(|arg| arg == "-hwaccel"), "Trimming video");
+            match run(args).await {
+                Ok(()) => {
+                    if let Some(info) = validated_trim(target, duration).await {
+                        return Ok(info);
+                    }
+                    reason =
+                        "the trimmed file does not decode correctly; the original has been kept".into();
                 }
-                reason =
-                    "the trimmed file does not decode correctly; the original has been kept".into();
+                Err(error) => reason = error.to_string(),
             }
-            Err(error) => reason = error.to_string(),
         }
     }
     bail!("trim failed: {reason}")

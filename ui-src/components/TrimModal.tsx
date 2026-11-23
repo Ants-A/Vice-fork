@@ -1,6 +1,6 @@
 import {useEffect, useRef, useState} from 'react';
 
-import {api} from '../lib/api';
+import {api, newTrimJobId} from '../lib/api';
 import {useVideoBuffer} from '../lib/useVideoBuffer';
 import {usePlaybackSession} from '../lib/usePlaybackSession';
 import {onWsMessage} from '../lib/ws';
@@ -62,12 +62,13 @@ export function TrimModal({
   const buffer = useVideoBuffer(videoRef, clip !== null, source, clip?.duration ?? 0);
   const [dragging, setDragging] = useState<'start' | 'end' | null>(null);
   const [saving, setSaving] = useState(false);
+  const saveJobId = useRef<string | null>(null);
   const [saveProgress, setSaveProgress] = useState<Extract<WsMessage, {type: 'trim_progress'}> | null>(null);
   useEffect(() => onWsMessage(msg => {
-    if (saving && msg.type === 'trim_progress' && msg.slug === clip?.slug && Number.isFinite(msg.progress)) {
+    if (saveJobId.current && msg.type === 'trim_progress' && msg.job_id === saveJobId.current && Number.isFinite(msg.progress)) {
       setSaveProgress({...msg, progress: Math.max(0, Math.min(1, msg.progress))});
     }
-  }), [saving, clip?.slug]);
+  }), []);
   const [error, setError] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState(false);
   // Held until the dialog closes. Renaming the file straight away swapped the
@@ -234,23 +235,27 @@ export function TrimModal({
       return;
     }
     setSaving(true);
+    const jobId = newTrimJobId();
+    saveJobId.current = jobId;
     setSaveProgress(null);
     setError(null);
     setConfirmReplace(false);
     try {
-      const result = await api.trimClip(clip.slug, selection.start, selection.end, copy);
+      const result = await api.trimClip(clip.slug, selection.start, selection.end, copy, jobId);
       const name = pendingName && pendingName !== clipTitle(clip) ? pendingName : null;
       setPendingName(null);
       // A name typed while saving a copy belongs to the copy: the original is
       // the clip being kept as it was.
       if (name) onRename(copy && result.slug ? {...clip, slug: result.slug} : clip, name);
       notify(copy ? t('trim.savedCopy') : t('trim.saved'), name ?? clipTitle(clip), 'accent');
+      saveJobId.current = null;
       onClose();
       await onSaved();
     } catch (err) {
       const message = (err as Error).message || t('trim.failed');
       setError(message);
       notify(t('trim.errTrim'), message, 'error');
+      saveJobId.current = null;
       setSaving(false);
     }
   };
@@ -434,10 +439,10 @@ export function TrimModal({
             role={saving ? 'status' : undefined} aria-live="polite">
             {error ?? (saving ? (
               <>
-                {saveProgress?.phase === 'uploading' ? t('trim.uploading')
+                {saveProgress?.phase === 'queued' ? t('trim.queued') : saveProgress?.phase === 'uploading' ? t('trim.uploading')
                   : saveProgress?.encoder ? t('trim.encodingProgress', {encoder: saveProgress.encoder}) : t('trim.finishing')}
-                {saveProgress ? ` · ${Math.floor(saveProgress.progress * 100)}%` : ''}
-                <progress className="trim-save-progress" max={1} value={saveProgress?.progress} />
+                {saveProgress && saveProgress.phase !== 'queued' ? ` · ${Math.floor(saveProgress.progress * 100)}%` : ''}
+                <progress className="trim-save-progress" max={1} value={saveProgress?.phase === 'queued' ? undefined : saveProgress?.progress} />
               </>
             ) : confirmReplace ? t('trim.replaceWarning') : t('trim.loopHelp'))}
           </span>

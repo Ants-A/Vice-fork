@@ -335,6 +335,7 @@
     "shareDiscordSize": "Prêt pour Discord · {size}"
   },
   "trim": {
+    "queued": "En attente",
     "saved": "Clip découpé et enregistré",
     "failed": "Le découpage a échoué",
     "errTrim": "Impossible de découper le clip",

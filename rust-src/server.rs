@@ -72,6 +72,8 @@ pub struct AppState {
     status_cache: std::sync::Mutex<Option<Value>>,
     managed_names: RwLock<crate::media_names::Names>,
     pub transcodes: Semaphore,
+    trim_slots: Semaphore,
+    trim_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     pub preview_jobs: Mutex<HashMap<PathBuf, Arc<crate::stream_preview::PreviewJob>>>,
     pub discord_validated: Mutex<HashSet<(u64, u128, u64)>>,
     pub playback_sessions: crate::playback_cache::Sessions,
@@ -296,6 +298,8 @@ impl AppState {
             status_cache: std::sync::Mutex::new(None),
             managed_names: RwLock::new(managed_names),
             transcodes: Semaphore::new(1),
+            trim_slots: Semaphore::new(2),
+            trim_locks: Mutex::new(HashMap::new()),
             preview_jobs: Mutex::new(HashMap::new()),
             discord_validated: Mutex::new(HashSet::new()),
             playback_sessions: crate::playback_cache::Sessions::new(cache_dir().join("playback")),
@@ -1686,7 +1690,7 @@ async fn run_media_attempt(
     seconds: u64,
     event: &str,
 ) -> Result<()> {
-    run_media_attempt_for(state, source, args, seconds, event, None).await
+    run_media_attempt_for(state, source, args, seconds, event, None, None).await
 }
 async fn run_media_attempt_for(
     state: &Shared,
@@ -1695,6 +1699,7 @@ async fn run_media_attempt_for(
     seconds: u64,
     event: &str,
     expected_duration: Option<f64>,
+    job_id: Option<&str>,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let slug = state.media_id(source, false).await;
@@ -1721,7 +1726,7 @@ async fn run_media_attempt_for(
     let mut lines = BufReader::new(child.stdout.take().context("preview stdout")?).lines();
     let mut stderr = child.stderr.take().context("preview stderr")?;
     state.emit(
-        json!({"type":event,"slug":slug,"encoder":encoder,"phase":"encoding","progress":0.0}),
+        json!({"type":event,"slug":slug,"job_id":job_id,"encoder":encoder,"phase":"encoding","progress":0.0}),
     );
     let advanced = std::sync::Mutex::new(Instant::now());
     let progress = async {
@@ -1735,7 +1740,7 @@ async fn run_media_attempt_for(
                 }
                 if last.elapsed() >= Duration::from_millis(200) {
                     state.emit(
-                        json!({"type":event,"slug":slug,"encoder":encoder,"phase":"encoding","progress":fraction}),
+                        json!({"type":event,"slug":slug,"job_id":job_id,"encoder":encoder,"phase":"encoding","progress":fraction}),
                     );
                     last = Instant::now();
                 }
@@ -1782,7 +1787,7 @@ async fn run_media_attempt_for(
         );
     }
     state.emit(
-        json!({"type":event,"slug":slug,"encoder":encoder,"phase":"encoding","progress":1.0}),
+        json!({"type":event,"slug":slug,"job_id":job_id,"encoder":encoder,"phase":"encoding","progress":1.0}),
     );
     Ok(())
 }
@@ -2106,7 +2111,7 @@ async fn media_api(
     headers: &HeaderMap,
 ) -> ApiResult {
     let _edit = if *method == Method::DELETE
-        || (*method == Method::POST && matches!(rest, ["rename"] | ["trim"] | ["annotate"]))
+        || (*method == Method::POST && matches!(rest, ["rename"] | ["annotate"]))
     {
         Some(s.edits.lock().await)
     } else {
@@ -2324,6 +2329,27 @@ async fn media_api(
                 return Err(bad("invalid trim range"));
             }
             let copy = body["copy"].as_bool().unwrap_or(false);
+            let job_id = body["job_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128);
+            let identity = cache_key(&path);
+            s.emit(json!({"type":"trim_progress", "slug":slug, "job_id":job_id, "phase":"queued", "progress":0.0}));
+            let clip_lock = {
+                let mut locks = s.trim_locks.lock().await;
+                locks.retain(|_, lock| lock.strong_count() > 0);
+                match locks.get(slug).and_then(std::sync::Weak::upgrade) {
+                    Some(lock) => lock,
+                    None => {
+                        let lock = Arc::new(Mutex::new(()));
+                        locks.insert(slug.to_owned(), Arc::downgrade(&lock));
+                        lock
+                    }
+                }
+            };
+            let _clip_guard = clip_lock.lock().await;
+            let slot = s.trim_slots.acquire().await.map_err(anyhow::Error::from)?;
+            if cache_key(&path) != identity {
+                return Err(bad("the clip changed while this trim was queued; select the range again"));
+            }
+            s.emit(json!({"type":"trim_progress", "slug":slug, "job_id":job_id, "phase":"preparing", "progress":0.0}));
             let before: media::MediaInfo =
                 serde_json::from_value(s.meta(&path).await).map_err(anyhow::Error::from)?;
             if !copy && start <= 0.000_001 && (end - before.duration).abs() < 0.001 {
@@ -2346,13 +2372,15 @@ async fn media_api(
                 .await
                 .map_err(anyhow::Error::from)?;
             let work = MediaTemp(work_dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext)));
-            let identity = cache_key(&path);
-            let info =
+            let info = retry_trim_when_gpu_busy(&s, slug, job_id, &path, &identity, slot, || {
                 media::trim_range_with_runner(&path, &work.0, start, end, &before, &tags, |args| {
-                    run_media_attempt_for(&s, &path, args, 900, "trim_progress", Some(end - start))
+                    run_media_attempt_for(&s, &path, args, 900, "trim_progress", Some(end - start), job_id)
                 })
-                .await?;
-            stage_trim(&s, slug, &work.0, &tmp.0).await?;
+            }).await?;
+            stage_trim(&s, slug, job_id, &work.0, &tmp.0).await?;
+            // Encoding and staging can overlap, but publication must not
+            // race the final identity check with another file edit.
+            let _edit = s.edits.lock().await;
             if cache_key(&path) != identity {
                 return Err(bad("the clip changed while it was being trimmed; retry"));
             }
@@ -2814,13 +2842,52 @@ async fn discord_copy(s: &Shared, path: &FsPath) -> Result<PathBuf> {
     }
     bail!("could not fit the encoded clip under Discord's file limit; trim it shorter")
 }
+fn gpu_capacity_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["out of memory", "cannot allocate memory", "resource temporarily unavailable", "too many concurrent", "encoder busy"]
+        .iter().any(|reason| message.contains(reason))
+}
+
+async fn retry_trim_when_gpu_busy<'a, T, F, Fut>(
+    state: &'a Shared,
+    slug: &str,
+    job_id: Option<&str>,
+    path: &FsPath,
+    identity: &str,
+    mut slot: tokio::sync::SemaphorePermit<'a>,
+    mut run: F,
+) -> std::result::Result<T, ApiError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut retried_exclusively = false;
+    loop {
+        match run().await {
+            Ok(value) => return Ok(value),
+            Err(error) if !retried_exclusively && gpu_capacity_error(&error.to_string()) => {
+                // Some GPUs or drivers allow just one encoder session.
+                state.emit(json!({"type":"trim_progress", "slug":slug, "job_id":job_id, "phase":"queued", "progress":0.0}));
+                drop(slot);
+                slot = state.trim_slots.acquire_many(2).await.map_err(anyhow::Error::from)?;
+                if cache_key(path) != identity {
+                    return Err(bad("the clip changed while this trim was queued; select the range again"));
+                }
+                state.emit(json!({"type":"trim_progress", "slug":slug, "job_id":job_id, "phase":"preparing", "progress":0.0}));
+                retried_exclusively = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// Avoid copying a locally stored trim onto the same filesystem. Cross-device
 /// libraries (including mounted shares) receive one sequential upload, with
 /// progress distinct from encoding so the remaining wait is visible.
-async fn stage_trim(state: &Shared, slug: &str, source: &FsPath, target: &FsPath) -> Result<()> {
+async fn stage_trim(state: &Shared, slug: &str, job_id: Option<&str>, source: &FsPath, target: &FsPath) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let progress = |done: u64, total: u64| {
-        state.emit(json!({"type":"trim_progress", "slug":slug,
+        state.emit(json!({"type":"trim_progress", "slug":slug, "job_id":job_id,
         "encoder":"", "phase":"uploading", "progress":done as f64 / total.max(1) as f64, "bytes":done, "total":total}))
     };
     match tokio::fs::rename(source, target).await {
@@ -3352,6 +3419,124 @@ async fn start_export(s: Shared, body: Value) -> ApiResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_session_capacity_errors_are_retryable() {
+        assert!(gpu_capacity_error("Cannot open encode session: out of memory (10)"));
+        assert!(gpu_capacity_error("Resource temporarily unavailable"));
+        assert!(!gpu_capacity_error("unsupported pixel format"));
+    }
+    #[tokio::test]
+    async fn gpu_capacity_failure_waits_for_other_trim_before_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, b"fixture").unwrap();
+        let state = AppState::new(Config::default());
+        let identity = cache_key(&path);
+        let other = state.trim_slots.acquire().await.unwrap();
+        let mut events = state.events.subscribe();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_state = state.clone();
+        let task_attempts = attempts.clone();
+        let task = tokio::spawn(async move {
+            let slot = task_state.trim_slots.acquire().await.unwrap();
+            retry_trim_when_gpu_busy(&task_state, "clip", Some("job"), &path, &identity, slot, || {
+                let attempt = task_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if attempt == 0 { bail!("Cannot open encode session: out of memory"); }
+                    Ok(42)
+                }
+            }).await
+        });
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+        assert_eq!(event["phase"], "queued");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!task.is_finished());
+        drop(other);
+        assert_eq!(task.await.unwrap().unwrap(), 42);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(state.trim_slots.available_permits(), 2);
+    }
+    #[tokio::test]
+    async fn trims_run_two_at_a_time_and_queue_without_blocking_other_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.output.directory = dir.path().to_string_lossy().into();
+        cfg.output.image_directory = dir.path().join("images").to_string_lossy().into();
+        let state = AppState::new(cfg);
+        for slug in ["one", "two", "three"] {
+            let path = dir.path().join(format!("{slug}.mp4"));
+            std::fs::write(&path, b"fixture").unwrap();
+            state.files.write().await.insert(slug.into(), path);
+        }
+        // Hold metadata probes so admitted jobs remain active while we check
+        // the queue. The requests still pass through the real API handler.
+        let probes = state.probes.acquire_many(2).await.unwrap();
+        let mut events = state.events.subscribe();
+        let mut tasks = Vec::new();
+        for slug in ["one", "two", "three"] {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move {
+                media_api(state, "clips", slug, &["trim"], &Method::POST,
+                    json!({"start":0.1,"end":1.0,"job_id":slug}), "", &[], &HeaderMap::new()).await
+            }));
+        }
+        let mut queued = HashSet::new();
+        let mut started = HashSet::new();
+        while queued.len() < 3 || started.len() < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+            if event["type"] != "trim_progress" { continue; }
+            let id = event["job_id"].as_str().unwrap().to_owned();
+            if event["phase"] == "queued" { queued.insert(id); }
+            else if event["phase"] == "preparing" { started.insert(id); }
+        }
+        assert_eq!(started.len(), 2);
+        assert!(tokio::time::timeout(Duration::from_millis(100), events.recv()).await.is_err(), "a third trim started while both slots were occupied");
+        assert!(state.edits.try_lock().is_ok(), "queued and encoding trims must not lock unrelated edits");
+        drop(probes);
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event["type"] == "trim_progress" && event["phase"] == "preparing" && !started.contains(event["job_id"].as_str().unwrap()) { break event; }
+            }
+        }).await.expect("queued trim did not start when a slot became free");
+        assert!(queued.contains(event["job_id"].as_str().unwrap()));
+        for task in tasks { let _ = task.await; }
+    }
+    #[tokio::test]
+    async fn queued_trim_rejects_a_clip_changed_while_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.output.directory = dir.path().to_string_lossy().into();
+        cfg.output.image_directory = dir.path().join("images").to_string_lossy().into();
+        let state = AppState::new(cfg);
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, b"original").unwrap();
+        state.files.write().await.insert("clip".into(), path.clone());
+        let probes = state.probes.acquire_many(2).await.unwrap();
+        let mut events = state.events.subscribe();
+        let start = |state: Shared, id: &'static str| tokio::spawn(async move {
+            media_api(state, "clips", "clip", &["trim"], &Method::POST,
+                json!({"start":0.1,"end":1.0,"job_id":id}), "", &[], &HeaderMap::new()).await
+        });
+        let first = start(state.clone(), "first");
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+            if event["job_id"] == "first" && event["phase"] == "preparing" { break; }
+        }
+        let second = start(state.clone(), "second");
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+            if event["job_id"] == "second" && event["phase"] == "queued" { break; }
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(100), events.recv()).await.is_err(), "same clip must not start twice");
+        std::fs::write(&path, b"changed while waiting").unwrap();
+        drop(probes);
+        let _ = first.await;
+        let response = second.await.unwrap().unwrap_err().into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("changed while this trim was queued"));
+        assert_eq!(std::fs::read(path).unwrap(), b"changed while waiting");
+    }
     #[tokio::test]
     async fn status_stays_responsive_during_clip_finalization() {
         let dir = tempfile::tempdir().unwrap();
@@ -3393,7 +3578,7 @@ mod tests {
         cfg.output.directory = dir.path().join("clips").to_string_lossy().into();
         cfg.output.image_directory = dir.path().join("images").to_string_lossy().into();
         let state = AppState::new(cfg);
-        stage_trim(&state, "clip", &source, &target).await.unwrap();
+        stage_trim(&state, "clip", None, &source, &target).await.unwrap();
         assert!(!source.exists());
         assert_eq!(target.metadata().unwrap().ino(), inode);
         assert_eq!(std::fs::read(&target).unwrap(), b"finished trim");
@@ -3417,7 +3602,7 @@ mod tests {
         cfg.output.image_directory = local.path().join("images").to_string_lossy().into();
         let state = AppState::new(cfg);
         let mut events = state.events.subscribe();
-        stage_trim(&state, "clip", &source, &target).await.unwrap();
+        stage_trim(&state, "clip", None, &source, &target).await.unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), data);
         assert!(source.exists());
         let mut finished = false;

@@ -310,6 +310,7 @@
     "shrinkHint": "Voltar ao tamanho normal (F, ou Esc)"
   },
   "trim": {
+    "queued": "Na fila",
     "saved": "Clipe recortado e salvo",
     "failed": "O recorte falhou",
     "errTrim": "Não foi possível recortar o clipe",

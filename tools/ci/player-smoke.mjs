@@ -297,6 +297,7 @@ esac
   await cdp.evaluate(`Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Trim').click()`);
   await until(() => cdp.evaluate(`document.querySelector('.trim-video')?.readyState >= 2`), 'trim video did not load');
   await cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');window.__viceSmoke.seekEvents=[];for(const name of ['seeking','seeked','waiting','canplay','timeupdate'])v.addEventListener(name,()=>{window.__viceSmoke.seekEvents.push({name,time:v.currentTime,seeking:v.seeking,ready:v.readyState});if(window.__viceSmoke.seekEvents.length>40)window.__viceSmoke.seekEvents.shift()});})()`);
+  if (process.env.VICE_SMOKE_QUEUE_ONLY !== '1') {
   const dragTrim = async (index, fraction) => {
     const points = await cdp.evaluate(`(()=>{const track=document.querySelector('.trim-timeline').getBoundingClientRect();const handle=document.querySelectorAll('.trim-handle')[${index}].getBoundingClientRect();return {from:{x:handle.x+handle.width/2,y:handle.y+handle.height/2},to:{x:track.x+track.width*${fraction},y:handle.y+handle.height/2}}})()`);
     await cdp.send('Input.dispatchMouseEvent', {type:'mouseMoved', ...points.from});
@@ -367,12 +368,14 @@ esac
   await cdp.send('Emulation.setDeviceMetricsOverride', {...initialViewport, deviceScaleFactor: 1, mobile: false});
   await cdp.evaluate(`document.querySelector('.trim-video').currentTime=4`);
   await until(() => cdp.evaluate(`(()=>{const v=document.querySelector('.trim-video');return !v.seeking && Math.abs(v.currentTime-4)<0.3})()`), 'trim video did not seek after resizing');
+  }
   // Hold the replacement request open and feed a real socket listener a
   // progress message. The rest of the interface must remain interactive.
   await cdp.evaluate(`(()=>{
     const originalFetch=window.fetch;
+    window.__viceSmoke.trimRequests=[];
     window.fetch=(url,init)=>String(url).endsWith('/trim')
-      ? new Promise(resolve=>{window.__viceSmoke.finishTrim=()=>resolve(new Response(JSON.stringify({slug:'smoke'}),{status:200,headers:{'Content-Type':'application/json'}}));})
+      ? new Promise(resolve=>{window.__viceSmoke.trimRequests.push({id:JSON.parse(init.body).job_id,finish:()=>resolve(new Response(JSON.stringify({slug:'smoke'}),{status:200,headers:{'Content-Type':'application/json'}}))});})
       : originalFetch(url,init);
     window.__viceSmoke.restoreFetch=()=>{window.fetch=originalFetch;};
     Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace original').click();
@@ -380,14 +383,23 @@ esac
   await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace'))`), 'replace confirmation did not appear');
   await cdp.evaluate(`Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace').click()`);
   await until(() => cdp.evaluate(`!document.querySelector('.trim-modal') && !!document.querySelector('.trim-job')`), 'replacement did not open background progress');
-  await cdp.evaluate(`window.__viceSmoke.socket.onmessage({data:JSON.stringify({type:'trim_progress',slug:'smoke',phase:'encoding',encoder:'h264_nvenc',progress:0.42})})`);
-  await until(() => cdp.evaluate(`document.querySelector('.trim-job')?.textContent.includes('42%') && document.querySelector('.trim-job progress')?.value===0.42`), 'background trim progress did not update');
+  await cdp.evaluate(`window.__viceSmoke.socket.onmessage({data:JSON.stringify({type:'trim_progress',slug:'smoke',job_id:window.__viceSmoke.trimRequests[0].id,phase:'encoding',encoder:'h264_nvenc',progress:0.42})})`);
+  await until(() => cdp.evaluate(`document.querySelector('.trim-job')?.textContent.includes('42%') && document.querySelector('.trim-job')?.textContent.includes('h264_nvenc') && document.querySelector('.trim-job progress')?.value===0.42`), 'background trim progress and encoder did not update');
   const progressStyle = await cdp.evaluate(`(()=>{const p=document.querySelector('.trim-job progress');const s=getComputedStyle(p);return {height:p.getBoundingClientRect().height,radius:parseFloat(s.borderRadius)};})()`);
   assert.equal(progressStyle.height, 8, 'trim progress bar must use the themed height');
   assert(progressStyle.radius >= 4, `trim progress bar must be rounded: ${JSON.stringify(progressStyle)}`);
+  await cdp.evaluate(`document.querySelector('.clip-card .clip-thumb').click()`);
+  await until(() => cdp.evaluate(`document.querySelector('.viewer-video')?.readyState >= 2`), 'viewer did not open while trimming');
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.viewer-foot-btns button')).find(b=>b.textContent==='Trim').click()`);
+  await until(() => cdp.evaluate(`document.querySelector('.trim-video')?.readyState >= 2`), 'second trim did not open');
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace original').click()`);
+  await until(() => cdp.evaluate(`Boolean(Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace'))`), 'second replace confirmation did not appear');
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.trim-modal button')).find(b=>b.textContent==='Replace').click()`);
+  await until(() => cdp.evaluate(`document.querySelectorAll('.trim-job').length===2 && window.__viceSmoke.trimRequests.length===2`), 'second trim was not queued');
+  assert(await cdp.evaluate(`Array.from(document.querySelectorAll('.trim-job')).some(j=>j.textContent.includes('Queued')) && Array.from(document.querySelectorAll('.trim-job')).some(j=>j.textContent.includes('42%'))`), 'jobs for the same clip must have independent progress');
   await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.textContent.includes('Settings')).click()`);
   await until(() => cdp.evaluate(`Boolean(document.querySelector('select[aria-label="Theme"]'))`), 'navigation was blocked by background trim');
-  await cdp.evaluate(`window.__viceSmoke.restoreFetch(); window.__viceSmoke.finishTrim()`);
+  await cdp.evaluate(`window.__viceSmoke.restoreFetch(); window.__viceSmoke.trimRequests.forEach(request=>request.finish())`);
   await until(() => cdp.evaluate(`!document.querySelector('.trim-job')`), 'completed trim progress remained visible');
   await cdp.evaluate(`Array.from(document.querySelectorAll('.nav-item')).find(b=>b.textContent.toLowerCase().includes('all clips')).click()`);
   await until(() => cdp.evaluate(`Boolean(document.querySelector('.clip-card .clip-thumb'))`), 'clip gallery did not reopen');

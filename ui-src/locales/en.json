@@ -374,6 +374,7 @@
     "uploading": "Copying to library",
     "finishing": "Finishing…",
     "saving": "Saving",
+    "queued": "Queued",
     "saveCopy": "Save as new clip",
     "savedCopy": "Trim saved as a new clip",
     "replaceOriginal": "Replace original",
