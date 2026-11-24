@@ -1071,6 +1071,7 @@
     "add": "Add to favorites",
     "remove": "Remove from favorites",
     "emptyClips": "No favorite clips yet. Use the star on a clip to add it here.",
-    "emptyImages": "No favorite images yet. Use the star on an image to add it here."
+    "emptyImages": "No favorite images yet. Use the star on an image to add it here.",
+    "saveFailed": "Could not save favorite to the file"
   }
 }

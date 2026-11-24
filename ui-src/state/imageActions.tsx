@@ -1,4 +1,3 @@
-import {moveFavorite} from '../lib/favorites';
 import {PlaylistMark} from '../components/PlaylistMark';
 import {useCallback, useMemo, useState, type ReactNode} from 'react';
 
@@ -91,7 +90,6 @@ export function useImageActions(collection?: Image[]): {actions: ImageActionSet;
         // Renaming changes the slug, so the viewer has to follow it or the
         // picture the user just named disappears from under them.
         if (updated?.slug) {
-          moveFavorite('images', image.slug, updated.slug);
           setPendingRename(updated);
           setViewing(current => (current === image.slug ? updated.slug : current));
           setSequence(current => current?.map(slug => slug === image.slug ? updated.slug : slug) ?? null);

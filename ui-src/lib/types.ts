@@ -6,6 +6,7 @@
  */
 
 export interface Clip {
+  favorite?: boolean | null;
   slug: string;
   /** The filename, extension included. Use clipTitle() for display. */
   name: string;
@@ -37,6 +38,7 @@ export interface Clip {
  * would have to be special-cased at the point of use.
  */
 export interface Image {
+  favorite?: boolean | null;
   slug: string;
   /** The filename, extension included. Use imageTitle() for display. */
   name: string;

@@ -316,7 +316,7 @@ pub async fn write_metadata_tags(
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if requested.is_empty() || !["mp4", "mkv"].contains(&ext.as_str()) {
+    if requested.is_empty() || !["mp4", "mkv", "mov", "webm"].contains(&ext.as_str()) {
         return Ok(false);
     }
     let before = std::fs::metadata(path)?;
@@ -332,7 +332,7 @@ pub async fn write_metadata_tags(
     for (k, v) in requested {
         cmd.arg("-metadata").arg(format!("{k}={v}"));
     }
-    if ext == "mp4" {
+    if ext == "mp4" || ext == "mov" {
         cmd.args([
             "-metadata",
             "major_brand=",
@@ -343,10 +343,10 @@ pub async fn write_metadata_tags(
             "-movflags",
             "+faststart+use_metadata_tags",
             "-f",
-            "mp4",
+            if ext == "mov" { "mov" } else { "mp4" },
         ]);
     } else {
-        cmd.args(["-f", "matroska"]);
+        cmd.args(["-f", if ext == "webm" { "webm" } else { "matroska" }]);
     }
     cmd.arg(&tmp.0)
         .stdin(std::process::Stdio::null())

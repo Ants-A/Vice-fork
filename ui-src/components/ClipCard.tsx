@@ -1,4 +1,4 @@
-import {useFavorites, toggleFavorite} from '../lib/favorites';
+import {useFavoriteToggle} from '../lib/favorites';
 import {IconStar} from './Icons';
 import {useThumbnail} from '../lib/useThumbnail';
 import {startHoverPreview, stopHoverPreview} from '../lib/hoverPreview';
@@ -51,7 +51,8 @@ export const ClipCard = memo(function ClipCard({
   const [previewFailed, setPreviewFailed] = useState(false);
   const [hovered, setHovered] = useState(false);
   const [previewReady, setPreviewReady] = useState(false);
-  const favorite = useFavorites().clips.includes(clip.slug);
+  const favorite = Boolean(clip.favorite);
+  const {toggle: toggleFavorite, pending: favoritePending} = useFavoriteToggle();
   const [renamingHere, setRenamingHere] = useState(false);
   const thumbnail = useThumbnail(clip.thumb_url, !clip.unreadable);
   const renaming = renamingHere || actions.renamingSlug === clip.slug;
@@ -164,10 +165,10 @@ export const ClipCard = memo(function ClipCard({
         ) : null}
       </button>
 
-      <button type="button" className="favorite-button" aria-pressed={favorite}
+      <button type="button" className="favorite-button" aria-pressed={favorite} disabled={favoritePending} aria-busy={favoritePending || undefined}
         aria-label={t(favorite ? 'favorites.remove' : 'favorites.add')}
         title={t(favorite ? 'favorites.remove' : 'favorites.add')}
-        onClick={() => toggleFavorite('clips', clip.slug)}>
+        onClick={() => void toggleFavorite('clips', clip.slug, !favorite)}>
         <IconStar size={18} />
       </button>
 

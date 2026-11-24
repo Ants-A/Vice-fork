@@ -1,4 +1,3 @@
-import {moveFavorite} from '../lib/favorites';
 import {useCallback, useMemo, useRef, useState, type ReactNode} from 'react';
 
 import {api} from '../lib/api';
@@ -32,7 +31,6 @@ export function useRenameClip(): (clip: Clip, name: string) => Promise<Clip | nu
     async (clip: Clip, name: string) => {
       try {
         const updated = await api.renameClip(clip.slug, name);
-        if (updated?.slug) moveFavorite('clips', clip.slug, updated.slug);
         await refreshClips();
         return updated ?? null;
       } catch (err) {

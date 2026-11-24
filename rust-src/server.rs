@@ -308,7 +308,7 @@ impl AppState {
     pub fn emit(&self, value: Value) {
         let _ = self.events.send(value);
     }
-    pub async fn rescan(&self) -> usize {
+    pub async fn rescan(self: &Arc<Self>) -> usize {
         if self.clip_writing.load(std::sync::atomic::Ordering::Acquire) {
             return 0;
         }
@@ -366,6 +366,20 @@ impl AppState {
             identities.remove(&active);
         }
         identities.extend(image_identities);
+        // A portable metadata edit replaces the file while preserving its date.
+        // Drop cached probes when its inode changes, even if size and date match.
+        let previous = self.identities.read().await.clone();
+        let mut changed = HashSet::new();
+        for (path, identity) in &identities {
+            if previous.get(path).is_some_and(|old| old != identity) {
+                self.forget_media_metadata(path).await;
+                changed.insert(path.clone());
+            }
+        }
+        let changed_clips = files.values().any(|path| changed.contains(path));
+        let changed_images: Vec<_> = images.iter()
+            .filter(|(_, path)| changed.contains(*path))
+            .map(|(slug, path)| (slug.clone(), path.clone())).collect();
         let mut old = self.files.write().await;
         let added = files.keys().filter(|s| !old.contains_key(*s)).count();
         *old = files;
@@ -379,6 +393,11 @@ impl AppState {
             }
         }
         let _ = write_json(&data_dir().join("share_tokens.json"), &tokens);
+        drop(tokens);
+        if changed_clips { self.queue_metadata(); }
+        for (slug, path) in changed_images {
+            self.emit(json!({"type":"image_saved", "image":self.image_json(&slug, &path).await}));
+        }
         added
     }
     /// Recover portable playlist membership before seeding filename game tags.
@@ -438,7 +457,7 @@ impl AppState {
             .lock()
             .await
             .get(path)
-            .filter(|(size, mtime, _)| *size == identity.size && *mtime == identity.mtime_ns)
+            .filter(|(size, mtime, value)| *size == identity.size && *mtime == identity.mtime_ns && (value["tags"].is_object() || value["unreadable"] == true))
             .map(|(_, _, v)| v.clone())
     }
     pub async fn flush_metadata(&self, force: bool) {
@@ -831,9 +850,13 @@ impl AppState {
     pub async fn image_json(&self, slug: &str, path: &FsPath) -> Value {
         let (size, mtime) = revision(path);
         let meta = self.meta(path).await;
+        let image_path = path.to_path_buf();
+        let favorite = tokio::task::spawn_blocking(move || crate::favorites::read_image(&image_path))
+            .await.ok().and_then(Result::ok).unwrap_or(false);
         json!({"slug":slug,"name":path.file_name().unwrap_or_default().to_string_lossy(),"size":size,
             "created_at":chrono::DateTime::<chrono::Local>::from(std::fs::metadata(path).ok().and_then(|m|m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH)).to_rfc3339(),
             "game":self.playlists.lock().await.game_for(&format!("img:{slug}")),"width":meta["width"],"height":meta["height"],
+            "favorite":favorite,
             "image_url":format!("/i/{}?v={size}-{mtime}",enc(slug)),"thumb_url":format!("/it/{}?v={size}-{mtime}",enc(slug))})
     }
     async fn remember_name(
@@ -1049,7 +1072,8 @@ fn clip_record(
     .to_rfc3339();
     json!({"slug":slug,"name":path.file_name().unwrap_or_default().to_string_lossy(),"size":size,"created_at":stamp,
         "game":game,"views":views,"keys":keys_dir.join(format!("{slug}.json")).exists(),
-        "metadata_pending":meta["duration"].is_null()&&meta["unreadable"]!=true,"duration":meta.get("duration"),"width":meta.get("width"),"height":meta.get("height"),"vcodec":meta.get("vcodec"),
+        "favorite":if meta.is_null() || meta.get("tags").is_none() { Value::Null } else { json!(meta["tags"]["vice_favorite"].as_str() == Some("1")) },
+        "metadata_pending":(meta["duration"].is_null() || !meta["tags"].is_object())&&meta["unreadable"]!=true,"duration":meta.get("duration"),"width":meta.get("width"),"height":meta.get("height"),"vcodec":meta.get("vcodec"),
         "audio_tracks":meta.get("audio_tracks").cloned().unwrap_or(json!([])),"unreadable":meta["unreadable"].as_bool().unwrap_or(false),"unreadable_reason":meta["unreadable_reason"].as_str().unwrap_or(""),
         "share_url":format!("{base}/c/{token}"),"share_is_public":public,"video_url":format!("/v/{}?v={size}-{mtime}",enc(slug)),"thumb_url":format!("/t/{}?v={size}-{mtime}",enc(slug))})
 }
@@ -1981,7 +2005,7 @@ async fn api(State(s): State<Shared>, Path(path): Path<String>, req: Request<Bod
             clips.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
             let pending = clips
                 .iter()
-                .any(|c| c["duration"].is_null() && c["unreadable"] != true);
+                .any(|c| c["metadata_pending"] == true);
             if pending {
                 s.queue_metadata();
             }
@@ -2111,7 +2135,7 @@ async fn media_api(
     headers: &HeaderMap,
 ) -> ApiResult {
     let _edit = if *method == Method::DELETE
-        || (*method == Method::POST && matches!(rest, ["rename"] | ["annotate"]))
+        || (*method == Method::POST && matches!(rest, ["rename"] | ["annotate"] | ["favorite"]))
     {
         Some(s.edits.lock().await)
     } else {
@@ -2131,6 +2155,27 @@ async fn media_api(
     };
     let highlights = data_dir().join("highlights").join(format!("{slug}.json"));
     match (method.as_str(), rest) {
+        ("POST", ["favorite"]) => {
+            let favorite = body["favorite"].as_bool().ok_or_else(|| bad("favorite must be a boolean"))?;
+            if image {
+                let target = path.clone();
+                tokio::task::spawn_blocking(move || crate::favorites::write_image(&target, favorite))
+                    .await.map_err(anyhow::Error::from)??;
+            } else {
+                let tags = HashMap::from([("vice_favorite".to_string(), if favorite { "1" } else { "0" }.to_string())]);
+                if !media::write_metadata_tags(&path, &tags, 600.0, None).await? {
+                    return Err(bad("Could not save favorite in video metadata"));
+                }
+            }
+            let target = path.clone();
+            let identity = tokio::task::spawn_blocking(move || media::FileIdentity::read(&target))
+                .await.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from)?;
+            s.identities.write().await.insert(path.clone(), identity);
+            s.forget_media_metadata(&path).await;
+            let record = if image { s.image_json(slug, &path).await } else { s.clip_json(slug, &path, true).await };
+            s.emit(json!({"type": if image {"image_saved"} else {"clip_saved"}, if image {"image"} else {"clip"}: record.clone()}));
+            ok(record)
+        }
         ("POST", ["playback-session"]) if !image => {
             let id = s.playback_sessions.create(path).await?;
             ok(json!({"id":id}))
@@ -2499,7 +2544,9 @@ async fn media_api(
             }
             let target = path.clone();
             let tmp = target.with_file_name(format!(".{}.png", uuid::Uuid::new_v4().simple()));
-            tokio::fs::write(&tmp, raw)
+            let favorite = crate::favorites::read_image(&path).unwrap_or(false);
+            let (_, annotated) = crate::favorites::image_marker(raw, Some(favorite))?;
+            tokio::fs::write(&tmp, annotated)
                 .await
                 .map_err(anyhow::Error::from)?;
             media::probe_media(&tmp).await?;
@@ -3053,6 +3100,7 @@ async fn playlist_api(s: Shared, parts: &[&str], method: &Method, body: &Value) 
             if *s.shutdown.borrow() {
                 break;
             }
+            let _edit = s.edits.lock().await;
             let tag = s.playlists.lock().await.metadata_for(&slug, None);
             let existing = media::probe_container_tags(&path).await.unwrap_or_default();
             let old = existing

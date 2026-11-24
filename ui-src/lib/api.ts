@@ -63,6 +63,8 @@ export const api = {
 
   // The list endpoints wrap their payload in an envelope. Unwrapped here so
   // callers only ever see the list.
+  setFavorite: (kind: 'clips' | 'images', slug: string, favorite: boolean) =>
+    post<Clip | Image>(`/api/${kind}/${enc(slug)}/favorite`, {favorite}),
   clipInfo: (slug: string) => request<Clip>(`/api/clips/${enc(slug)}`),
   createPlaybackSession: (slug: string) => post<{id: string}>(`/api/clips/${enc(slug)}/playback-session`),
   touchPlaybackSession: (id: string) => post<void>(`/api/playback/${enc(id)}/touch`),

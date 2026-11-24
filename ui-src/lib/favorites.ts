@@ -1,39 +1,28 @@
-import {useSyncExternalStore} from 'react';
+import {useState} from 'react';
+import {useStore} from '../state/store';
+import {api} from './api';
+import {t} from './i18n';
+import type {Clip, Image} from './types';
 
-type Kind = 'clips' | 'images';
-type Favorites = Record<Kind, string[]>;
-const key = 'vice-favorites';
-const empty: Favorites = {clips: [], images: []};
-function read(): Favorites {
-  try {
-    const value = JSON.parse(localStorage.getItem(key) || '{}');
-    return {
-      clips: Array.isArray(value.clips) ? value.clips.filter((v: unknown) => typeof v === 'string') : [],
-      images: Array.isArray(value.images) ? value.images.filter((v: unknown) => typeof v === 'string') : [],
-    };
-  } catch { return empty; }
-}
-let current = read();
-const listeners = new Set<() => void>();
-function publish(next: Favorites) {
-  localStorage.setItem(key, JSON.stringify(next));
-  current = next;
-  listeners.forEach(fn => fn());
-}
-window.addEventListener('storage', event => {
-  if (event.key === key || event.key === null) {
-    current = read();
-    listeners.forEach(fn => fn());
-  }
-});
 export function useFavorites() {
-  return useSyncExternalStore(fn => { listeners.add(fn); return () => { listeners.delete(fn); }; }, () => current);
+  const {state} = useStore();
+  return {clips: state.clips.filter(c => c.favorite).map(c => c.slug),
+    images: state.images.filter(i => i.favorite).map(i => i.slug)};
 }
-export function toggleFavorite(kind: Kind, slug: string) {
-  const items = current[kind];
-  publish({...current, [kind]: items.includes(slug) ? items.filter(item => item !== slug) : [...items, slug]});
-}
-export function moveFavorite(kind: Kind, from: string, to: string | null) {
-  if (!current[kind].includes(from)) return;
-  publish({...current, [kind]: [...new Set(current[kind].filter(item => item !== from).concat(to ? [to] : []))]});
+
+export function useFavoriteToggle() {
+  const {dispatch, notify} = useStore();
+  const [pending, setPending] = useState(false);
+  const toggle = async (kind: 'clips' | 'images', slug: string, favorite: boolean) => {
+    if (pending) return;
+    setPending(true);
+    try {
+      const item = await api.setFavorite(kind, slug, favorite);
+      if (kind === 'clips') dispatch({type: 'ws', msg: {type: 'clip_saved', clip: item as Clip}});
+      else dispatch({type: 'ws', msg: {type: 'image_saved', image: item as Image}});
+    } catch (err) {
+      notify({kind: 'error', title: t('favorites.saveFailed'), detail: (err as Error).message, tone: 'error', holdMs: 7000});
+    } finally { setPending(false); }
+  };
+  return {toggle, pending};
 }

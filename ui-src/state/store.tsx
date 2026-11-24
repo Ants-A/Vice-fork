@@ -1,4 +1,3 @@
-import {moveFavorite} from '../lib/favorites';
 import {applyPlaylistGames} from '../lib/playlistGames';
 import {ListSnapshots} from '../lib/listSnapshots';
 import {PendingDeletes} from '../lib/pendingDeletes';
@@ -633,6 +632,40 @@ export function StoreProvider({children}: {children: ReactNode}) {
     return () => window.clearInterval(timer);
   }, [state.ready, state.clips.length]);
 
+  // Migrate favorites saved by older versions only after the corresponding file
+  // has been loaded. Leave failed or unavailable entries for a later retry.
+  const migratingFavorites = useRef(new Set<string>());
+  useEffect(() => {
+    if (!state.ready) return;
+    let legacy: {clips?: unknown; images?: unknown};
+    try { legacy = JSON.parse(localStorage.getItem('vice-favorites') || '{}'); }
+    catch { return; }
+    for (const kind of ['clips', 'images'] as const) {
+      const saved = legacy[kind];
+      if (!Array.isArray(saved)) continue;
+      for (const item of state[kind]) {
+        const key = `${kind}:${item.slug}`;
+        if (!saved.includes(item.slug) || item.favorite == null || migratingFavorites.current.has(key)) continue;
+        migratingFavorites.current.add(key);
+        void (item.favorite ? Promise.resolve(item) : api.setFavorite(kind, item.slug, true))
+          .then(updated => {
+            if (kind === 'clips') dispatch({type: 'ws', msg: {type: 'clip_saved', clip: updated as Clip}});
+            else dispatch({type: 'ws', msg: {type: 'image_saved', image: updated as Image}});
+            try {
+              const latest = JSON.parse(localStorage.getItem('vice-favorites') || '{}');
+              if (Array.isArray(latest[kind])) latest[kind] = latest[kind].filter((slug: unknown) => slug !== item.slug);
+              localStorage.setItem('vice-favorites', JSON.stringify(latest));
+            } catch (err) { console.error('Could not finish favorite migration', err); }
+          })
+          .catch(err => {
+            console.error('Could not migrate favorite', err);
+            dispatch({type: 'event', event: {kind: 'error', title: t('favorites.saveFailed'),
+              detail: (err as Error).message, tone: 'error', holdMs: 7000}});
+          });
+      }
+    }
+  }, [state.ready, state.clips, state.images]);
+
   // Recover metadata updates even when hydration finishes before the socket opens.
   const metadataPending = state.clips.some(clip => clip.metadata_pending || (clip.duration === null && !clip.unreadable));
   useEffect(() => {
@@ -692,7 +725,6 @@ export function StoreProvider({children}: {children: ReactNode}) {
   const deleteClip = useCallback((slug: string) => {
     stopHoverPreview();
     return deletions.current!.run(`clip:${slug}`, () => api.deleteClip(slug), () => {
-      moveFavorite('clips', slug, null);
       clipSnapshots.current.observe(slug, null);
       dispatch({type: 'ws', msg: {type: 'clip_deleted', slug}});
     });
@@ -700,7 +732,6 @@ export function StoreProvider({children}: {children: ReactNode}) {
 
   const deleteImage = useCallback((slug: string) =>
     deletions.current!.run(`image:${slug}`, () => api.deleteImage(slug), () => {
-      moveFavorite('images', slug, null);
       imageSnapshots.current.observe(slug, null);
       dispatch({type: 'ws', msg: {type: 'image_deleted', slug}});
     }), []);
